@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# Same-terminal fresh-session fallback. Put initial prompt arguments after --.
+set -uo pipefail
+umask 077
+pi_bin=${PI_SESSION_PI:-pi}
+marker_dir=${PI_SESSION_MARKER_DIR:-${PI_CODING_AGENT_DIR:-${HOME}/.pi/agent}/relaunch}
+max=${PI_SESSION_MAX_RELAUNCHES_PER_HOUR:-5}
+[[ $max =~ ^[1-9][0-9]*$ ]] || { printf 'pi-session: invalid hourly limit\n' >&2; exit 2; }
+mkdir -p "$marker_dir" || exit 2
+marker_dir=$(cd "$marker_dir" && pwd -P) || exit 2
+export PI_SESSION_WRAPPER=1 PI_SESSION_MARKER_DIR="$marker_dir"
+original=() separated=0
+for arg in "$@"; do
+  if [[ $arg == -- && $separated == 0 ]]; then separated=1; else original+=("$arg"); fi
+done
+opts=() msgs=()
+# Known value-taking pi options. Use -- for prompts or custom extension options.
+while (($#)); do
+  case "$1" in
+    --) shift; msgs=("$@"); break ;;
+    --session|--session-id|--fork) shift; (($#)) || exit 2; shift ;;
+    -c|--continue|-r|--resume) shift ;;
+    --provider|--model|--api-key|--system-prompt|--append-system-prompt|--thinking|--mode|-n|--name|--session-dir|--models|-t|--tools|-xt|--exclude-tools|-e|--extension|--skill|--prompt-template|--theme|--use-theme|--tui-mode)
+      opts+=("$1"); shift; (($#)) || exit 2; opts+=("$1"); shift ;;
+    -*) opts+=("$1"); shift ;;
+    *) msgs+=("$1"); shift ;;
+  esac
+done
+# The first invocation is exactly the original argument vector, except -- is a wrapper separator.
+# Session-selection flags are deliberately retained initially, but never on relaunch.
+initial=("${original[@]}")
+relaunch_times=()
+child=0 interrupted=0
+forward() {
+  interrupted=1
+  if ((child > 0)); then kill -"$1" "$child" 2>/dev/null || true; else exit "$2"; fi
+}
+trap 'forward TERM 143' TERM
+trap 'forward INT 130' INT
+while :; do
+  # exec preserves this helper's PID as pi's PID. Explicit stdin keeps the terminal usable.
+  bash -c 'export PI_RELAUNCH_MARKER="$PI_SESSION_MARKER_DIR/$$.json"; exec "$@"' pi-session "$pi_bin" "${initial[@]}" <&0 &
+  child=$!
+  marker="$marker_dir/$child.json"
+  wait "$child"; code=$?
+  # A signal interrupts bash wait before the child has actually exited.
+  if ((interrupted)); then wait "$child"; code=$?; interrupted=0; fi
+  child=0
+  [[ -f $marker ]] || exit "$code"
+  if ((code != 0)); then
+    printf 'pi-session: pi exited %s; marker retained at %s; not relaunching\n' "$code" "$marker" >&2
+    exit "$code"
+  fi
+  now=$(date +%s)
+  recent=()
+  for t in "${relaunch_times[@]}"; do ((now - t < 3600)) && recent+=("$t"); done
+  relaunch_times=("${recent[@]}")
+  if ((${#relaunch_times[@]} >= max)); then
+    printf 'pi-session: hourly relaunch limit reached; marker retained at %s\n' "$marker" >&2
+    exit 3
+  fi
+  # Parse JSON without eval or shell interpolation. NUL delimiters preserve spaces/newlines.
+  fields=()
+  parsed="${marker}.parsed"
+  node -e '
+    const fs = require("node:fs"), path = require("node:path");
+    const m = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    for (const k of ["cwd", "handoff"]) if (typeof m[k] !== "string" || !path.isAbsolute(m[k]) || m[k].includes("\0")) throw Error("invalid " + k);
+    if (m.launchPrompt != null && (typeof m.launchPrompt !== "string" || !path.isAbsolute(m.launchPrompt) || m.launchPrompt.includes("\0"))) throw Error("invalid launchPrompt");
+    if (!fs.statSync(m.cwd).isDirectory() || !fs.statSync(m.handoff).isFile()) throw Error("missing cwd/handoff");
+    if (m.launchPrompt && !fs.statSync(m.launchPrompt).isFile()) throw Error("missing launchPrompt");
+    process.stdout.write([m.cwd, m.launchPrompt || "", m.handoff].join("\0") + "\0");
+  ' "$marker" > "$parsed" || { printf 'pi-session: invalid marker retained: %s\n' "$marker" >&2; exit 4; }
+  while IFS= read -r -d '' field; do fields+=("$field"); done < "$parsed"
+  rm -f "$parsed"
+  ((${#fields[@]} == 3)) || exit 4
+  cd "${fields[0]}" || exit 5
+  # Consumed only after validation. Never replay the old initial prompt or --resume flags.
+  rm -- "$marker" || exit 4
+  relaunch_times+=("$now")
+  initial=("${opts[@]}")
+  [[ -z ${fields[1]} ]] || initial+=("@${fields[1]}")
+  initial+=("continue from ${fields[2]}")
+  printf 'pi-session: relaunch %s from %s\n' "${#relaunch_times[@]}" "${fields[2]}" >&2
+done
