@@ -16,10 +16,13 @@ function run(kind = "once", extra: string[] = []) {
 import fs from 'node:fs';
 const log = process.env.FAKE_LOG, args = process.argv.slice(2);
 let calls = []; try { calls = JSON.parse(fs.readFileSync(log, 'utf8')); } catch {}
-calls.push({args, cwd: process.cwd(), marker: process.env.PI_RELAUNCH_MARKER, wrapped: process.env.PI_SESSION_WRAPPER, pid: process.pid});
+calls.push({args, cwd: process.cwd(), marker: process.env.PI_RELAUNCH_MARKER, wrapped: process.env.PI_SESSION_WRAPPER, ownerPid: process.env.PI_SESSION_WRAPPER_PID, nonce: process.env.PI_SESSION_LAUNCH_ID, pid: process.pid});
 fs.writeFileSync(log, JSON.stringify(calls));
 const kind = process.env.FAKE_KIND;
-if ((calls.length === 1 || kind === 'loop') && kind !== 'none') {
+if (kind === 'stale') {
+  fs.writeFileSync(process.env.PI_RELAUNCH_MARKER.replace(process.env.PI_SESSION_LAUNCH_ID, 'f'.repeat(32)), '{}');
+}
+if ((calls.length === 1 || kind === 'loop') && !['none', 'stale'].includes(kind)) {
   fs.writeFileSync(process.env.PI_RELAUNCH_MARKER, kind === 'bad' ? '{}' : JSON.stringify({cwd: process.env.FAKE_CWD, handoff: process.env.FAKE_HANDOFF, launchPrompt: process.env.FAKE_LAUNCH, sessionFile: null}));
 }
 process.exit(kind === 'error' ? 7 : 0);
@@ -31,7 +34,7 @@ process.exit(kind === 'error' ? 7 : 0);
   assert.ok(result.status !== 126 && result.status !== 127 && result.status !== 1, result.stderr);
   return { ...result, dir, cwd, handoff, launch, calls: JSON.parse(readFileSync(env.FAKE_LOG, "utf8")), markers: readdirSync(env.PI_SESSION_MARKER_DIR) };
 }
-test("wrapper relaunch once in same cwd with original options, exact pid marker, no old prompt", () => {
+test("wrapper relaunch once in same cwd with original options, PID/nonce-owned marker, no old prompt", () => {
   const r = run("once", ["--session", "/old.jsonl"]);
   assert.equal(r.status, 0, r.stderr);
   assert.equal(r.calls.length, 2);
@@ -39,7 +42,10 @@ test("wrapper relaunch once in same cwd with original options, exact pid marker,
   assert.deepEqual(r.calls[1].args, ["--model", "test/model", `@${r.launch}`, `continue from ${r.handoff}`]);
   assert.equal(r.calls[1].cwd, r.cwd);
   assert.equal(r.calls[0].wrapped, "1");
-  assert.match(r.calls[0].marker, new RegExp(`/${r.calls[0].pid}\\.json$`));
+  assert.match(r.calls[0].nonce, /^[a-f0-9]{32}$/);
+  assert.equal(r.calls[0].ownerPid, String(r.calls[0].pid));
+  assert.match(r.calls[0].marker, new RegExp(`/${r.calls[0].pid}-${r.calls[0].nonce}\\.json$`));
+  assert.notEqual(r.calls[0].nonce, r.calls[1].nonce);
   assert.equal(r.markers.length, 0);
 });
 test("built-in short value flags and tui mode survive relaunch intact", () => {
@@ -52,6 +58,12 @@ test("no marker preserves pi exit code; provider error never relaunches and reta
   assert.equal(run("none").calls.length, 1);
   const r = run("error");
   assert.equal(r.status, 7); assert.equal(r.calls.length, 1); assert.equal(r.markers.length, 1);
+});
+test("a retained marker for the same PID but another launch nonce is never consumed", () => {
+  const stale = run("stale");
+  assert.equal(stale.status, 0); assert.equal(stale.calls.length, 1);
+  assert.equal(stale.markers.length, 1);
+  assert.match(stale.markers[0], /-f{32}\.json$/);
 });
 test("hourly cap and invalid marker stop safely without consuming recovery evidence", () => {
   const loop = run("loop");

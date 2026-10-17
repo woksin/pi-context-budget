@@ -2,6 +2,46 @@
 
 Staging only; no global installation, repository creation or publication. Runtime files and runner state are isolated under this checkout's `.ai-work/`. No live agent configuration or external source checkout was modified.
 
+## Round-1 structural revision (current)
+
+The lifecycle policy is now the pure immutable state machine in `src/core.ts`; `extension.ts` translates pi events and executes explicit effects. Observe/off/guard-off leave native compaction untouched. A valid hard-limit handoff recovers in-process; cap/loop fallback remains independent. Wrapper ownership is bound to PID, primary hosting identity and a fresh per-launch nonce.
+
+Current local results (Node 26.8.1, pi 1.2.0):
+- `npm test`: **exit 0**, 151 tests: 150 passed, one CI-only presence assertion skipped. The real-runtime tests ran, not skipped.
+- `npm run typecheck`: **exit 0**.
+- `npm run check:shell`: **exit 0**.
+- `npm pack --dry-run`: **exit 0**, seven generic files, ~22.9 KB packed / 69.2 KB unpacked.
+- No Node 22/24 or independent review pass is claimed; those existing parent-owned gates remain outstanding.
+
+The transition table covers every named state, inactive-mode action barriers, hard handoff recovery with/without a wrapper, continuation bounds, idle-only storage, failure classes, bounded retries, callback correlation, mode/guard disarming and cap/loop protection. Offline real-pi tests verify actual internal `agent_start` continuations, native observe/off summaries, cancellation and Nothing-to-compact routing, plus primary/SDK-child hosting. They inject deterministic token observations to isolate lifecycle ordering from faux-provider bootstrap estimates; the paid tests below use actual provider usage.
+
+### Verified source contracts
+
+- Pi `dist/core/agent-session-runtime.js:205–237` sets ancestry for main forks and tears down the previous runtime before binding its replacement. `parentSession` therefore cannot identify a child.
+- Installed pi-subagents `src/agent-runner.ts:1059–1074` permits in-memory children without ancestry; `1106–1123` creates/binds SDK sessions while the parent runtime remains alive. `agent-manager.ts:828–868` attaches the child after binding. The package's process-local hosting registry follows this lifecycle, independently of UI and ancestry. The primary must load the package before its SDK children; child-only installation is unsupported and documented.
+- Pi `dist/core/agent-session.js:884–886` forwards internal `agent_start`; the run/prepare boundaries at `1391–1473` distinguish external `before_agent_start` from settle continuation. Only `before_agent_start` resets external-run continuation intent.
+- Pi `agent-session.js:2201–2321` emits `session_compact_failed` before rethrowing a manual failure; `2802–2811` routes that through compact's callback. Attempt ids prevent hook plus `onError` from counting one failure twice. Cancelled/no-op failures are benign; transient owned/automatic failures retry at the next eligible input/automatic boundary at most twice; persistent or exhausted failures arm fallback. Success or a mode/guard change disarms it.
+
+### Haiku rerun — exactly once per scenario this round
+
+```sh
+python3 -B scripts/phase.py run --kind integration --label 'round-1 Haiku enforce E2E' --timeout 280 --queue-timeout 10 -- python3 -B scripts/e2e.py enforce r1
+python3 -B scripts/phase.py run --kind integration --label 'round-1 Haiku observe E2E' --timeout 280 --queue-timeout 10 -- python3 -B scripts/e2e.py observe r1
+python3 -B scripts/phase.py run --kind integration --label 'round-1 Haiku wrapper E2E' --timeout 280 --queue-timeout 10 -- python3 -B scripts/e2e.py wrapper r1
+```
+
+| Scenario | Exit | Result | USD |
+|---|---:|---|---:|
+| (a) enforce | 0 | 3 retain-none commits, 4 blocked calls, same session, six correct code words + DONE | 0.01392757 |
+| (b) observe | 0 | No blocks, handoffs, compactions or relaunches; would-do events and completed task | 0.00946479 |
+| (c) wrapper | 0 | 1 in-process commit then cap fallback; exactly 1 relaunch, 2 sessions, consumed nonce marker + WRAPPER-DONE | 0.00256616 |
+
+**Round spend: $0.02595852**, under $5. The wrapper scenario now deliberately uses a one-handoff cap, not a hard limit: hard plus a valid handoff must recover in-process. Credentials, session/log/status paths and phase state remain isolated as described below; no live agent/source directory was written and nothing was installed or published.
+
+## Initial implementation results (historical)
+
+The sections below record the original build, before this structural revision. Their initial test counts, budgets, costs and limitations are historical; the current behavior and current gates are above.
+
 ## Local gate
 
 - `npm test`: exit **0** (portable suite before the last wrapper-alias test: 29 tests, 28 passed; only the CI-only runtime-presence assertion skipped).

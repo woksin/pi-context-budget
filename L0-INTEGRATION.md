@@ -55,7 +55,8 @@ assert s.get('wrapper') is True and s.get('role') == 'main', 'Not a wrapper-owne
 pid = s['pid']
 assert isinstance(pid, int) and pid > 1 and pid != os.getpid()
 marker = Path(s['relaunchMarker'])
-assert marker.is_absolute() and marker.name == f'{pid}.json'
+assert marker.is_absolute() and marker.name.startswith(f'{pid}-') and marker.suffix == '.json'
+assert len(marker.stem.split('-', 1)[1]) == 32  # exact marker comes from fresh wrapper-owned status
 assert prompt.is_absolute() and prompt.is_file()
 assert handoff.is_absolute() and handoff.is_file()
 cwd = Path(s['cwd'])
@@ -92,7 +93,7 @@ Restore any lane-specific CLI/environment settings from the original reviewed la
 
 In-process handoffs preserve children/jobs/watches and issue_work session claims. Relaunch does not: shutdown kills in-flight work and creates a new sessionId. The successor must inspect jobs/CI/PR/issue state and re-establish claims rather than trusting stale handoff claims or auto-retrying a still-running external action.
 
-Current pi-subagents binds children without a shutdown action. They inherit the root process environment, but are **not** independent wrapper processes. This extension refuses to write the root marker for a child. If a child reaches hard/loop/cap, L0/parent receives `relaunch_unavailable`; stop/replace that child using the parent integration after saving/reviewing its handoff. Do not kill the main lane PID on behalf of a child. Registry enumeration limitations are recorded in each handoff (README.md).
+Current pi-subagents binds children without a shutdown action. They inherit the root process environment, but are **not** independent wrapper processes. This extension refuses to write the root marker for a child. A child's valid hard-limit handoff now commits in-process. For exhausted loop/cap or unrecoverable compaction failure, L0/parent receives `relaunch_unavailable`; stop/replace that child using the parent integration after saving/reviewing its handoff. Do not kill the main lane PID on behalf of a child. Registry enumeration limitations are recorded in each handoff (README.md).
 
 ## Trial acceptance
 

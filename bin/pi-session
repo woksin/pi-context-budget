@@ -38,10 +38,12 @@ forward() {
 trap 'forward TERM 143' TERM
 trap 'forward INT 130' INT
 while :; do
-  # exec preserves this helper's PID as pi's PID. Explicit stdin keeps the terminal usable.
-  bash -c 'export PI_RELAUNCH_MARKER="$PI_SESSION_MARKER_DIR/$$.json"; exec "$@"' pi-session "$pi_bin" "${initial[@]}" <&0 &
+  # PID ownership prevents descendant theft; a nonce prevents reuse of retained PID markers.
+  export PI_SESSION_LAUNCH_ID
+  PI_SESSION_LAUNCH_ID=$(node -e 'process.stdout.write(require("node:crypto").randomBytes(16).toString("hex"))') || exit 2
+  bash -c 'export PI_SESSION_WRAPPER_PID=$$ PI_RELAUNCH_MARKER="$PI_SESSION_MARKER_DIR/$$-$PI_SESSION_LAUNCH_ID.json"; exec "$@"' pi-session "$pi_bin" "${initial[@]}" <&0 &
   child=$!
-  marker="$marker_dir/$child.json"
+  marker="$marker_dir/$child-$PI_SESSION_LAUNCH_ID.json"
   wait "$child"; code=$?
   # A signal interrupts bash wait before the child has actually exited.
   if ((interrupted)); then wait "$child"; code=$?; interrupted=0; fi

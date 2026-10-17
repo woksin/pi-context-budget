@@ -138,7 +138,7 @@ export PI_SESSION_PI="$(command -v pi)"
 alias pi="$HOME/.local/bin/pi-session"
 ```
 
-The alias applies only to this shell; adding it to shell configuration is an explicit parent choice. Markers default to the configured agent root's `relaunch/<childpid>.json`; the wrapper honors `PI_CODING_AGENT_DIR` and `PI_SESSION_MARKER_DIR`. Already-running sessions without the wrapper will never be shut down by this package.
+The alias applies only to this shell; adding it to shell configuration is an explicit parent choice. Markers default to the configured agent root's `relaunch/<childpid>-<launch-nonce>.json`; the wrapper honors `PI_CODING_AGENT_DIR` and `PI_SESSION_MARKER_DIR`. Already-running sessions without the wrapper will never be shut down by this package.
 
 ## Enable the overflow backstop last
 
@@ -165,7 +165,7 @@ p.write_text(json.dumps(s, indent=2) + '\n')
 PY
 ```
 
-For a verified 1M window and 600k hard, reserve=380k and threshold=620k. Per-model pi settings cannot express distinct main/child reserves. Children hit their own hard guard earlier and need parent intervention if they lack an owned wrapper. Observe/off cancel all built-in compaction, even `/compact`; enforced sessions supply the handoff/mechanical backstop.
+For a verified 1M window and 600k hard, reserve=380k and threshold=620k. Per-model pi settings cannot express distinct main/child reserves. Children can recover hard limits through a fresh in-process handoff; cap/loop recovery needs parent intervention if no owned wrapper exists. Observe/off and guard-off leave all native compaction untouched, including `/compact`, default summaries and overflow recovery; only enforce supplies the handoff/mechanical backstop. Scope compaction settings to enforced trials if native summarizer cost is not wanted in observe sessions.
 
 ## Trial and rollback
 

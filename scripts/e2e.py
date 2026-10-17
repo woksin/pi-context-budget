@@ -27,6 +27,8 @@ env = dict(os.environ)
 # A nested test process must not inherit ownership of the invoking session's marker.
 env.pop("PI_SESSION_WRAPPER", None)
 env.pop("PI_RELAUNCH_MARKER", None)
+env.pop("PI_SESSION_WRAPPER_PID", None)
+env.pop("PI_SESSION_LAUNCH_ID", None)
 env.update(PI_CODING_AGENT_DIR=str(agent), PI_CODING_AGENT_SESSION_DIR=str(work / "sessions"),
            PI_CONTEXT_BUDGET_CONFIG=str(work / "config.json"), PI_CONTEXT_BUDGET_STATE_DIR=str(work / "state"),
            PI_JOBS_DIR=str(work / "jobs"), PI_SESSION_MARKER_DIR=str(work / "markers"),
@@ -35,7 +37,8 @@ config = {"mode": "observe" if scenario == "observe" else "enforce",
           "main": {"soft": 9000, "handoff": 12000, "hard": 100000, "minProgress": 1000},
           "maxHandoffsPerSession": 10}
 if scenario == "wrapper":
-    config["main"] = {"soft": 9000, "handoff": 11000, "hard": 13000, "minProgress": 1000}
+    # A valid handoff now recovers hard limits. Exercise the independent cap fallback.
+    config["maxHandoffsPerSession"] = 1
 (work / "config.json").write_text(json.dumps(config))
 (agent / "settings.json").write_text(json.dumps({"compaction": {"enabled": True, "keepRecentTokens": 1000}}))
 for n in range(1, 7):
@@ -59,7 +62,7 @@ else:
     launch = work / "launch.md"
     launch.write_text("Work ONLY in this cwd. Continue from the supplied handoff, then write done.txt containing WRAPPER-DONE. Do not read the part files again. End when done.txt is written.")
     prompt = (
-        "Work ONLY in this cwd. Read part1.txt then part2.txt then part3.txt, one at a time. "
+        "Work ONLY in this cwd. Read part1.txt only. "
         "Then call context_handoff with goal='wrapper fallback test', facts containing the verified code words, "
         "next_step='write done.txt containing WRAPPER-DONE without re-reading parts', "
         f"launch_prompt='{launch}', and user_constraints='Work only in this cwd; never re-read parts'. "

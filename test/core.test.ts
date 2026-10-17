@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { Budget, parseConfig, effectiveMode, isSubagent, modelThresholds, renderHandoff, shouldBlock, MAX_HANDOFF_BYTES } from "../src/core.ts";
-import { atomicJson, issueClaims, runningState, writeHandoff, writeMarker } from "../src/storage.ts";
+import { parseConfig, effectiveMode, isSubagent, ownsWrapper, modelThresholds, renderHandoff, MAX_HANDOFF_BYTES } from "../src/core.ts";
+import { atomicJson, issueClaims, runningState, writeHandoff, writeMarker, SessionHosts } from "../src/storage.ts";
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
@@ -14,8 +14,8 @@ test("defaults, model overrides, roles and validated config", () => {
   assert.equal(config.mode, "observe");
   assert.equal(t.handoff, 400000);
   assert.equal(config.subagent.hard, 300000);
-  assert.equal(isSubagent({ parentSession: "/parent.jsonl" }), true);
-  for (const header of [undefined, {}, { parentSession: "" }]) assert.equal(isSubagent(header), false);
+  assert.equal(isSubagent({ sessionId: "child", primarySessionId: "main" }), true);
+  assert.equal(isSubagent({ sessionId: "forked-main", primarySessionId: "forked-main" }), false);
   const c = parseConfig({ mode: "enforce", models: { "x/y": { main: { handoff: 350000 } } } });
   assert.equal(modelThresholds(c, "x/y", false).handoff, 350000);
   assert.equal(modelThresholds(c, "x/y", true).handoff, 200000);
@@ -33,38 +33,28 @@ test("enforceCwds prefix boundaries, globs, empty list, guard opt-out", () => {
   assert.equal(effectiveMode(c, "/repo/one", true), "off");
   assert.equal(effectiveMode(parseConfig({ mode: "enforce", enforceCwds: [] }), "/repo"), "observe");
 });
-test("threshold equality, unknown/null floor, floor-relative progress and hard fallback", () => {
-  const b = new Budget();
-  assert.equal(b.action(450000, t, config), "none");
-  b.measureUsage(410000);
-  assert.equal(b.action(450000, t, config), "none");
-  assert.equal(b.action(460000, t, config), "handoff");
-  b.resetFloor();
-  assert.equal(b.action(null, t, config), "none");
-  assert.equal(b.action(600000, t, config), "relaunch");
-  b.measureUsage(100000);
-  assert.equal(b.action(399999, t, config), "none");
-  assert.equal(b.action(400000, t, config), "handoff");
+test("process hosting distinguishes live SDK children from forked/resumed primary sessions", () => {
+  const hosts = new SessionHosts();
+  const main = hosts.acquire("main-with-parentSession");
+  assert.equal(main.subagent, false);
+  const child = hosts.acquire("in-memory-child-without-parentSession");
+  assert.equal(child.subagent, true);
+  child.release();
+  const resumed = hosts.acquire("resumed-child");
+  assert.equal(resumed.subagent, true);
+  resumed.release(); main.release();
+  const fork = hosts.acquire("fork-with-parentSession");
+  assert.equal(fork.subagent, false);
+  fork.release();
+  assert.equal(hosts.acquire("resumed-main-with-parentSession").subagent, false);
 });
-test("loop/cap guard, progress reset and turn window", () => {
-  const b = new Budget();
-  for (let n = 0; n < 3; n++) { b.turn++; b.committed(); }
-  assert.equal(b.action(null, t, config), "relaunch");
-  b.progressed();
-  assert.equal(b.action(null, t, config), "none");
-  b.handoffTurns = [1, 2, 3]; b.turn = 20;
-  assert.equal(b.looped(config), false);
-  b.count = config.maxHandoffsPerSession;
-  assert.equal(b.action(null, t, config), "relaunch");
-});
-test("blocking only in enforce, only context_handoff exempt; wrapper-backed fallback stops blocking", () => {
-  for (const mode of ["observe", "off"] as const) for (const action of ["none", "handoff", "relaunch"] as const) {
-    assert.equal(shouldBlock(mode, "write", action, true, false), false);
-  }
-  assert.equal(shouldBlock("enforce", "context_handoff", "handoff", true, false), false);
-  assert.equal(shouldBlock("enforce", "read", "handoff", false, false), true);
-  assert.equal(shouldBlock("enforce", "Agent", "relaunch", false, false), true);
-  assert.equal(shouldBlock("enforce", "read", "relaunch", false, true), false);
+test("wrapper ownership binds process, hosting and unique launch nonce", () => {
+  const id = "a".repeat(32);
+  const env = { PI_SESSION_WRAPPER: "1", PI_SESSION_WRAPPER_PID: "123", PI_SESSION_LAUNCH_ID: id, PI_RELAUNCH_MARKER: `/markers/123-${id}.json` };
+  assert.equal(ownsWrapper(123, env, false), true);
+  assert.equal(ownsWrapper(456, env, false), false); // inherited subprocess env
+  assert.equal(ownsWrapper(123, env, true), false); // in-process SDK child
+  assert.equal(ownsWrapper(123, { ...env, PI_SESSION_LAUNCH_ID: "b".repeat(32) }, false), false);
 });
 const input = { goal: "task", next_step: "read files", facts: "HEAD unknown", hypotheses: "untested theory", user_constraints: "Never push." };
 const auto = { cwd: "/repo", root: "/repo", branch: "main", head: "abc", jobs: [], subagents: [], claims: [], unavailable: [] };
@@ -81,6 +71,12 @@ test("handoff rendering, validation, byte cap, uniqueness and exclusive persiste
   assert.equal(readFileSync(h.path, "utf8"), h.text);
   assert.equal(JSON.parse(readFileSync(h.path.replace(/md$/, "json"), "utf8")).auto.head, "abc");
   assert.throws(() => writeHandoff(h, auto), /EEXIST/);
+});
+test("automatic metadata has a fixed budget independent of pending-work volume", () => {
+  const records = Array.from({ length: 1000 }, () => ({ command: "字".repeat(50000) }));
+  const rendered = renderHandoff(input, { ...auto, jobs: records, subagents: records, claims: records }, "session", 1, "/handoff.md", "2026-10-17");
+  assert.ok(Buffer.byteLength(rendered.text) < MAX_HANDOFF_BYTES);
+  assert.match(rendered.text, /omitted/);
 });
 test("atomic markers have exact absolute paths and no temporary data in final file", () => {
   const path = join(dir(), "99.json");

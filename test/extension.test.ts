@@ -3,17 +3,19 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, unlinkSync, existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { createContextBudgetExtension } from "../src/extension.ts";
+import { SessionHosts } from "../src/storage.ts";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 const base = resolve(import.meta.dirname, "../.ai-work/hooks");
 mkdirSync(base, { recursive: true });
 const required = { goal: "finish", next_step: "write result", facts: "Read part one" };
-async function harness(mode = "enforce", overrides: Record<string, unknown> = {}, withGuard = false) {
+async function harness(mode = "enforce", overrides: Record<string, unknown> = {}, withGuard = false, hosts = new SessionHosts()) {
   const dir = mkdtempSync(join(base, "case-"));
   process.env.PI_CODING_AGENT_DIR = join(dir, "agent");
   process.env.PI_CONTEXT_BUDGET_CONFIG = join(dir, "config.json");
   process.env.PI_CONTEXT_BUDGET_STATE_DIR = join(dir, "state");
   delete process.env.PI_SESSION_WRAPPER; delete process.env.PI_RELAUNCH_MARKER;
+  delete process.env.PI_SESSION_WRAPPER_PID; delete process.env.PI_SESSION_LAUNCH_ID;
   if (withGuard) {
     mkdirSync(join(process.env.PI_CODING_AGENT_DIR, "lib"), { recursive: true });
     writeFileSync(join(process.env.PI_CODING_AGENT_DIR, "lib/guards.ts"), 'export const isGuardOff = () => globalThis[Symbol.for("context-budget:test-guard")] === true;');
@@ -30,9 +32,14 @@ async function harness(mode = "enforce", overrides: Record<string, unknown> = {}
     sessionManager: { getSessionId: () => sid, getSessionFile: () => join(dir, "session.jsonl"), getHeader: () => ({}), getBranch: () => branch },
     getContextUsage: () => ({ tokens: usage }), shutdown: () => { shutdown++; },
     ui: { notify: (text: string) => notifications.push(text) },
-    compact: (opts: any) => { compact++; opts.onError(new Error("Nothing to compact (session too small)")); },
+    compact: (opts: any) => {
+      compact++;
+      // Real pi ordering: failed hook is awaited BEFORE compact's onError callback.
+      void handlers.get("session_compact_failed")!({ reason: "manual", errorMessage: "Nothing to compact (session too small)", aborted: false, fromExtension: false }, ctx)
+        .then(() => opts.onError(new Error("Nothing to compact (session too small)")));
+    },
   } as unknown as ExtensionContext;
-  await createContextBudgetExtension({ agentDir: process.env.PI_CODING_AGENT_DIR! })(pi);
+  await createContextBudgetExtension({ agentDir: process.env.PI_CODING_AGENT_DIR!, hosts })(pi);
   const emit = (name: string, event = {}) => handlers.get(name)!(event, ctx);
   await emit("session_start");
   const turn = async (tokens = 300) => { usage = tokens; return emit("turn_end", { message: { role: "assistant", usage: { input: tokens, output: 0, cacheRead: 0, cacheWrite: 0 } } }); };
@@ -69,38 +76,41 @@ test("observe mode logs would-do events but no blocking, handoff files, continua
   const result = await h.handoff();
   assert.equal(result.details.handoff, undefined);
   await h.emit("agent_settled", { aborted: false });
-  assert.deepEqual(await h.emit("session_before_compact", { reason: "threshold" }), { cancel: true });
+  assert.equal(await h.emit("session_before_compact", { reason: "threshold" }), undefined);
   assert.equal(h.notifications.length, 0);
   assert.deepEqual(h.counters(), { shutdown: 0, compact: 0 });
   assert.ok(h.events().some(e => e.event === "would_relaunch"));
   assert.ok(h.events().some(e => e.event === "would_block"));
   assert.equal(h.status().mode, "observe");
 });
-test("handoff continuation once; hard fallback never shuts down without wrapper", async () => {
+test("hard without wrapper commits a valid handoff and resumes instead of trapping tools", async () => {
   const h = await harness();
   await h.turn(100); await h.turn(1200);
   assert.equal((await h.emit("agent_before_settle")).continue, true);
   assert.equal(await h.emit("agent_before_settle"), undefined);
   await h.handoff();
-  await h.turn(1200);
+  const committed = await h.turn(1200);
+  assert.equal(committed.entries[0].type, "compaction");
+  h.setTokens(null);
   await h.emit("agent_settled", { aborted: false });
   assert.equal(h.counters().shutdown, 0);
-  assert.equal((await h.emit("tool_call", { toolName: "bash" })).block, true);
-  assert.ok(h.events().some(e => e.event === "relaunch_unavailable"));
+  assert.equal(await h.emit("tool_call", { toolName: "bash" }), undefined);
 });
 test("hard fallback writes marker before shutdown only in wrapper; provider errors do not relaunch", async () => {
-  const h = await harness();
+  const h = await harness("enforce", { maxHandoffsPerSession: 1 });
+  const nonce = "a".repeat(32);
   process.env.PI_SESSION_WRAPPER = "1";
-  process.env.PI_RELAUNCH_MARKER = join(h.dir, "relaunch", "42.json");
-  await h.turn(1200);
-  await h.handoff(); await h.turn(1200);
+  process.env.PI_SESSION_WRAPPER_PID = String(process.pid); process.env.PI_SESSION_LAUNCH_ID = nonce;
+  process.env.PI_RELAUNCH_MARKER = join(h.dir, "relaunch", `${process.pid}-${nonce}.json`);
+  await h.turn(100); await h.handoff(); await h.turn(1200);
   await h.emit("agent_settled", { aborted: false });
   assert.equal(h.counters().shutdown, 1);
   const m = JSON.parse(readFileSync(process.env.PI_RELAUNCH_MARKER, "utf8"));
   assert.equal(m.cwd, h.dir); assert.ok(existsSync(m.handoff)); assert.equal(m.launchPrompt, null);
   const err = await harness();
   process.env.PI_SESSION_WRAPPER = "1";
-  process.env.PI_RELAUNCH_MARKER = join(err.dir, "marker.json");
+  process.env.PI_SESSION_WRAPPER_PID = String(process.pid); process.env.PI_SESSION_LAUNCH_ID = nonce;
+  process.env.PI_RELAUNCH_MARKER = join(err.dir, `${process.pid}-${nonce}.json`);
   await err.turn(1200);
   await err.emit("turn_end", { message: { role: "assistant", stopReason: "error" } });
   await err.emit("agent_settled", { aborted: false });
@@ -127,6 +137,7 @@ test("idle requires pending work, stores only, tolerates Nothing to compact, inv
   global[key] = new Set([{ list: () => [{ id: "watch", status: "running", kind: "watch" }] }]);
   try {
     assert.equal((await h.emit("agent_before_settle")).continue, true);
+    await h.emit("agent_start"); // Internal continuation: must NOT erase the idle request.
     await h.handoff();
     assert.equal(await h.turn(100), undefined); // Store only, not turn_end compaction.
     await h.emit("agent_settled", { aborted: false });
@@ -135,7 +146,10 @@ test("idle requires pending work, stores only, tolerates Nothing to compact, inv
     try { assert.deepEqual(await h.emit("input", { source: "rpc", text: "next" }), { action: "continue" }); }
     finally { Date.now = now; }
     assert.equal(h.counters().compact, 1);
-    assert.ok(h.events().some(e => e.event === "idle_compact" && e.outcome.includes("Nothing to compact")));
+    assert.ok(h.events().some(e => e.event === "compaction_ignored" && e.data?.classification === "nothing-to-compact" || e.classification === "nothing-to-compact"));
+    await h.emit("before_agent_start");
+    h.setTokens(100);
+    assert.equal(await h.emit("tool_call", { toolName: "read", toolCallId: "after-idle-noop" }), undefined);
   } finally { delete global[key]; }
 });
 test("blocked sibling keeps pending handoff; already-running sibling invalidates it", async () => {
@@ -156,25 +170,30 @@ test("shared guard opt-out disables blocks, handoffs and backstop, including an 
   try {
     assert.equal(await h.emit("tool_call", { toolName: "read" }), undefined);
     assert.equal((await h.handoff()).details.handoff, undefined);
-    assert.deepEqual(await h.emit("session_before_compact", {}), { cancel: true });
+    assert.equal(await h.emit("session_before_compact", {}), undefined);
     assert.equal(await h.emit("agent_before_settle"), undefined);
     await h.emit("agent_settled", { aborted: false });
     assert.equal(h.counters().shutdown, 0);
   } finally { delete global[key]; }
 });
 test("in-process subagent never writes the inherited parent marker", async () => {
-  const h = await harness("enforce", { subagent: { soft: 100, handoff: 200, hard: 1000, minProgress: 50 } });
-  (h.ctx.sessionManager as any).getHeader = () => ({ parentSession: "/parent.jsonl" });
-  process.env.PI_SESSION_WRAPPER = "1"; process.env.PI_RELAUNCH_MARKER = join(h.dir, "parent-marker.json");
+  const hosts = new SessionHosts();
+  const parent = hosts.acquire("real-primary");
+  const h = await harness("enforce", { subagent: { soft: 100, handoff: 200, hard: 1000, minProgress: 50 } }, false, hosts);
+  (h.ctx.sessionManager as any).getHeader = () => ({}); // In-memory children have NO parentSession.
+  const nonce = "b".repeat(32);
+  process.env.PI_SESSION_WRAPPER = "1"; process.env.PI_SESSION_WRAPPER_PID = String(process.pid); process.env.PI_SESSION_LAUNCH_ID = nonce;
+  process.env.PI_RELAUNCH_MARKER = join(h.dir, `${process.pid}-${nonce}.json`);
   await h.turn(1200); await h.handoff(); await h.turn(1200);
   await h.emit("agent_settled", { aborted: false });
   assert.equal(h.counters().shutdown, 0);
   assert.equal(existsSync(process.env.PI_RELAUNCH_MARKER), false);
   assert.equal(h.status().role, "subagent");
+  await h.emit("session_shutdown"); parent.release();
 });
 test("new external runs clear the idle-only request; invalid config falls back to observe", async () => {
   const h = await harness();
-  await h.emit("agent_start");
+  await h.emit("before_agent_start");
   await h.handoff();
   assert.equal((await h.turn()).continue, true);
   writeFileSync(process.env.PI_CONTEXT_BUDGET_CONFIG!, "{broken");
@@ -204,6 +223,60 @@ test("telemetry write failure cannot discard a prepared compaction boundary", as
   const draft = await h.turn();
   assert.equal(draft.entries[0].type, "compaction");
   assert.ok(h.events().some(e => e.event === "status_error"));
+});
+for (const reason of ["manual", "threshold", "overflow"]) for (const mode of ["observe", "off"]) {
+  test(`${mode} preserves native ${reason} compaction without a summary or cancellation`, async () => {
+    const h = await harness(mode);
+    assert.equal(await h.emit("session_before_compact", { reason }), undefined);
+    assert.deepEqual(h.counters(), { shutdown: 0, compact: 0 });
+  });
+}
+for (const failure of [
+  { reason: "manual", aborted: true },
+  { reason: "manual", errorMessage: "Nothing to compact (session too small)" },
+  { reason: "manual", errorMessage: "Already compacted" },
+  { reason: "overflow", errorMessage: "Compaction cancelled", aborted: true },
+]) test(`benign failure leaves ordinary tools available: ${JSON.stringify(failure)}`, async () => {
+  const h = await harness(); await h.turn(100);
+  await h.emit("session_compact_failed", failure);
+  assert.equal(await h.emit("tool_call", { toolName: "read", toolCallId: "after-cancel" }), undefined);
+});
+test("an inherited parent PID/nonce cannot authorize marker writing or shutdown", async () => {
+  const h = await harness("enforce", { maxHandoffsPerSession: 1 });
+  process.env.PI_SESSION_WRAPPER = "1";
+  process.env.PI_SESSION_WRAPPER_PID = String(process.pid + 1);
+  process.env.PI_SESSION_LAUNCH_ID = "c".repeat(32);
+  process.env.PI_RELAUNCH_MARKER = join(h.dir, `${process.pid + 1}-${process.env.PI_SESSION_LAUNCH_ID}.json`);
+  await h.turn(100); await h.handoff(); await h.turn(300);
+  h.setTokens(null);
+  await h.emit("agent_settled", { aborted: false });
+  assert.equal(existsSync(process.env.PI_RELAUNCH_MARKER), false);
+  assert.equal(h.counters().shutdown, 0);
+});
+test("fork ancestry does not reduce the main budget or remove wrapper ownership", async () => {
+  const h = await harness();
+  (h.ctx.sessionManager as any).getHeader = () => ({ parentSession: "/main-before-fork.jsonl" });
+  process.env.PI_SESSION_WRAPPER = "1"; process.env.PI_SESSION_WRAPPER_PID = String(process.pid);
+  process.env.PI_SESSION_LAUNCH_ID = "d".repeat(32);
+  process.env.PI_RELAUNCH_MARKER = join(h.dir, `${process.pid}-${process.env.PI_SESSION_LAUNCH_ID}.json`);
+  await h.emit("session_start", { reason: "fork" });
+  assert.equal(h.status().role, "main"); assert.equal(h.status().wrapper, true);
+});
+test("emergency backstop stays bounded even when automatic registries are enormous", async () => {
+  const h = await harness();
+  h.branch.push(...Array.from({ length: 4 }, () => ({ type: "message", message: { role: "user", content: "字".repeat(50000) } })));
+  const key = Symbol.for("pi-jobs.liveManagers"), global = globalThis as Record<symbol, unknown>, previous = global[key];
+  global[key] = new Set([{ list: () => Array.from({ length: 1000 }, () => ({ status: "running", command: "x".repeat(50000) })) }]);
+  try {
+    const result = await h.emit("session_before_compact", { reason: "overflow" });
+    assert.ok(Buffer.byteLength(result.compaction.summary) < 12288);
+    assert.match(result.compaction.summary, /Emergency handoff/);
+  } finally { global[key] = previous; }
+});
+test("inactive backstop remains inert even when context observation fails", async () => {
+  const h = await harness("observe");
+  (h.ctx as any).getContextUsage = () => { throw new Error("probe failed"); };
+  assert.equal(await h.emit("session_before_compact", { reason: "manual" }), undefined);
 });
 test("hook I/O failures are logged, backstop cancels instead of default summarizer", async () => {
   const h = await harness();

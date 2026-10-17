@@ -2,7 +2,34 @@ import { execFileSync } from "node:child_process";
 import { appendFileSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
-import type { AutoState, Handoff } from "./core.ts";
+import { boundedAutoState, isSubagent, type AutoState, type Handoff } from "./core.ts";
+
+/** A CLI process has one primary runtime; SDK children bind while it remains alive.
+ * Fork/resume tear down that primary BEFORE binding its replacement. No ancestry inference.
+ */
+export class SessionHosts {
+  private primary?: string;
+  private refs = new Map<string, number>();
+  acquire(sessionId: string): { subagent: boolean; release: () => void } {
+    this.primary ??= sessionId;
+    const subagent = isSubagent({ sessionId, primarySessionId: this.primary });
+    this.refs.set(sessionId, (this.refs.get(sessionId) ?? 0) + 1);
+    let released = false;
+    return { subagent, release: () => {
+      if (released) return;
+      released = true;
+      const count = (this.refs.get(sessionId) ?? 1) - 1;
+      if (count) this.refs.set(sessionId, count);
+      else { this.refs.delete(sessionId); if (this.primary === sessionId) this.primary = undefined; }
+    } };
+  }
+}
+export function processSessionHosts(): SessionHosts {
+  const key = Symbol.for("pi-context-budget.session-hosts");
+  const shared = globalThis as Record<symbol, unknown>;
+  shared[key] ??= new SessionHosts();
+  return shared[key] as SessionHosts;
+}
 
 export function atomicJson(path: string, data: unknown): void {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
@@ -17,7 +44,7 @@ export function appendEvent(dir: string, data: unknown): void {
 export function writeHandoff(h: Handoff, auto: AutoState): void {
   mkdirSync(dirname(h.path), { recursive: true, mode: 0o700 });
   writeFileSync(h.path, h.text, { flag: "wx", mode: 0o600 });
-  writeFileSync(h.path.replace(/\.md$/, ".json"), JSON.stringify({ ...h, auto }) + "\n", { flag: "wx", mode: 0o600 });
+  writeFileSync(h.path.replace(/\.md$/, ".json"), JSON.stringify({ ...h, auto: boundedAutoState(auto) }) + "\n", { flag: "wx", mode: 0o600 });
 }
 export interface Marker { cwd: string; launchPrompt: string | null; handoff: string; sessionFile: string | null }
 export function writeMarker(path: string, marker: Marker): void {

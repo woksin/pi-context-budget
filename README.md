@@ -35,7 +35,7 @@ Restart pi or use `/reload` **when safe for your other extensions**. Installing 
 
 Requires Node.js **22.19+**, Bash and a POSIX system; Windows is not supported. Developed against pi **1.2.0**. The host peer uses `"*"` as recommended for pi packages; this is not a compatibility guarantee for every pi version. Pi supplies its own runtime; the package bundles none of it.
 
-Subagent integrations with explicit extension allowlists must include **`pi-context-budget`** (the package short name), and expose the `context_handoff` tool. A parent-only `-e` option is not necessarily inherited by children. Child detection uses the session header's `parentSession`, never UI availability.
+Subagent integrations with explicit extension allowlists must include **`pi-context-budget`** (the package short name), and expose the `context_handoff` tool. A parent-only `-e` option is not necessarily inherited by children. Load this package in the primary session **before** starting SDK children. A process-local hosting marker identifies the primary runtime and its concurrently bound SDK children; it is released at primary shutdown so forked/resumed main sessions remain main. Ancestry (`parentSession`) and UI availability are not child signals. Child-only loading without an instrumented primary is unsupported.
 
 ## Configure
 
@@ -80,15 +80,15 @@ All numbers must be positive and finite; count limits must be integers; require 
 
 The package optionally reads `getAgentDir()/lib/guards.ts` if your setup provides a shared `isGuardOff(name)` API and a `context` guard. In that integration, `/guards off context` disables enforcement for the session. The package does not install or modify another extension's guard library. Without that integration, change the configuration to `off` or `observe` and submit the next input. Only the user/operator should disable enforcement, never a model following a chat instruction.
 
-**In off/observe, pi compaction is cancelled**, including manual `/compact`, so the never-compact guarantee also covers built-in automatic compaction. Removing this package restores pi's own compaction behavior; review those settings before removing it.
+**Off/observe and guard-off leave native pi compaction unchanged**: the hook returns no summary and no cancellation for manual, threshold or overflow compaction. The package initiates nothing; pi can still compact using its own configured behavior and summarizer. Only enforce mode intercepts compaction.
 
 ## Handoff policy
 
 1. **Soft:** one UI advisory per crossing: finish the current step first, then hand off at a natural boundary. No model steer or extra provider call.
 2. **Handoff:** block every tool except `context_handoff` when `tokens >= handoff` **and** `tokens - floor >= minProgress`. The floor is the first assistant usage after bootstrap/compaction; an unknown floor never triggers handoff blocking. Null usage after compaction means fresh context.
 3. **Commit:** the handoff tool writes a unique structured summary; the same `turn_end` commits a retain-none compaction and requests automatic continuation. No process/session-id change. A sibling tool that actually finishes after the handoff invalidates it; a blocked sibling does not.
-4. **Settle:** one continuation asks for a handoff if the agent tries to stop while handoff is required. Repeated settle calls cannot create an unbounded continuation loop.
-5. **Fallback:** hard limit, handoff cap, loop guard or compaction failure arms fresh-process recovery. With an owned wrapper, stop threshold blocking, write the marker and request shutdown at `agent_settled`. Without one, **never shut down**: keep the protective block and report recovery unavailable.
+4. **Settle:** one continuation asks for a handoff if the agent tries to stop while handoff is required. Internal `agent_start` events do not reset this bound or an idle handoff request; only a genuinely new `before_agent_start` resets external-run state.
+5. **Fallback:** hard limit **without a usable handoff**, cap, loop guard or classified persistent/exhausted compaction failure arms recovery. Non-handoff tools remain blocked, even with a wrapper, with accurate end-turn instructions. A valid handoff at hard commits in-process with or without a wrapper; it cannot bypass the cap/loop guards. With an owned wrapper, write the marker and request shutdown only at `agent_settled`; without one, never shut down.
 
 ### `context_handoff`
 
@@ -109,15 +109,15 @@ Optional: `decisions` (and why), `user_constraints`, `open_items`, `hypotheses`,
 
 Automatic metadata: timestamp, cwd/repository root, git branch/HEAD, pending jobs/watches/subagents, and this session's issue claims when the corresponding integrations are present. Agent-written facts remain claims until rechecked; automatic git state is recorded separately.
 
-Files: `<repo-root or cwd>/.ai-work/handoffs/<sessionId>-<n>.md` plus JSON sidecar. Markdown is capped at **12,288 UTF-8 bytes**, including automatic state. Oversize is a clear tool error, never silent truncation. Each summary has a unique heading; retain-none compaction replaces previous summaries instead of stacking them. Read the handoff, verify HEAD and external state, then continue from Next step without asking the user to restate the task.
+Files: `<repo-root or cwd>/.ai-work/handoffs/<sessionId>-<n>.md` plus JSON sidecar. Markdown is capped at **12,288 UTF-8 bytes**, including automatic state. Automatic observations have separate fixed budgets with explicit truncation/omission counts, so unbounded job or claim volume cannot consume the whole narrative budget; user constraints are never truncated. Oversize is a clear tool error, never silent truncation. Each summary has a unique heading; retain-none compaction replaces previous summaries instead of stacking them. Read the handoff, verify HEAD and external state, then continue from Next step without asking the user to restate the task.
 
 ### Idle reset
 
-At the last actionable settle boundary, if context is large **and work remains pending** (jobs, watches or subagents), request a warm-cache handoff and store it **without compacting**. On the next input after `idleMinutes`, await compaction before the new prompt is sent. Skip small/already-compacted history; tolerate pi's `Nothing to compact` error and pass the prompt through unchanged. New tool calls and externally started runs invalidate old stored handoffs. Other compaction failures arm fallback.
+At the last actionable settle boundary, if context is large **and work remains pending** (jobs, watches or subagents), request a warm-cache handoff and store it **without compacting**. On the next input after `idleMinutes`, await compaction before the new prompt is sent. Skip small/already-compacted history; tolerate pi's `Nothing to compact` error and pass the prompt through unchanged. Actual non-handoff tool activity and externally started runs invalidate old stored handoffs; blocked calls cannot make a snapshot stale. Cancellation, `Nothing to compact` and `Already compacted` are benign in both the hook and callback paths. Transient failures retry only at the next eligible input/automatic compaction boundary, at most twice; a third failure or a persistent owned/automatic error arms fallback. Unowned manual errors are ignored. Successful compaction or a mode/guard change disarms compaction-failure fallback.
 
 ### Overflow backstop
 
-The package supplies a still-valid handoff, or a short mechanical summary of recent user requests plus instructions to re-establish state from files/git. It **never delegates to pi's default summarizer**. Backstop errors cancel compaction rather than falling through.
+In enforce mode the package supplies a still-valid handoff, or a short, bounded mechanical summary of recent user requests plus instructions to re-establish state from files/git. The emergency summary needs neither writable handoff storage nor automatic metadata. **Enforce mode never delegates to pi's default summarizer**; backstop errors cancel rather than fall through. Inactive modes leave native behavior alone.
 
 To restore automatic overflow recovery, enable pi compaction and choose model-specific reserves. Example for a **1,000,000-token window** with main hard limit 600,000:
 
@@ -158,9 +158,9 @@ Initial arguments are preserved (the wrapper's `--` separator is removed). After
 | `PI_SESSION_PI` | Real pi executable, default `pi` |
 | `PI_SESSION_MARKER_DIR` | Marker directory; default `<PI_CODING_AGENT_DIR or standard agent dir>/relaunch` |
 | `PI_SESSION_MAX_RELAUNCHES_PER_HOUR` | Rolling-hour limit per wrapper invocation, default 5 |
-| `PI_RELAUNCH_MARKER`, `PI_SESSION_WRAPPER` | Set by wrapper; do not forge them in ordinary sessions |
+| `PI_RELAUNCH_MARKER`, `PI_SESSION_WRAPPER`, `PI_SESSION_WRAPPER_PID`, `PI_SESSION_LAUNCH_ID` | Set by wrapper; ownership requires the current PID, exact nonce-bearing marker filename and the primary hosting identity. Do not forge these. |
 
-Markers are child-PID-specific JSON with `cwd`, nullable `launchPrompt`, `handoff`, nullable `sessionFile`. Invalid markers, provider/non-zero exits or limit exhaustion stop without relaunch and retain evidence. Custom value-taking extension options should use `--flag=value`; built-in value-taking flags are parsed explicitly.
+Markers are `<pid>-<random-launch-nonce>.json` with `cwd`, nullable `launchPrompt`, `handoff`, nullable `sessionFile`. Descendant processes inherit the environment but fail the PID check; in-process SDK children fail the hosting check. Fresh nonces prevent retained markers from being mistaken for a later launch after PID reuse. Invalid markers, provider/non-zero exits or limit exhaustion stop without relaunch and retain evidence. Custom value-taking extension options should use `--flag=value`; built-in value-taking flags are parsed explicitly.
 
 **SIGTERM is not an automatic recovery authorization.** A signal exit is commonly 143; the zero-exit contract intentionally refuses to relaunch it. Deliberate crash recovery requires inspecting the marker and starting a new wrapper after verifying the old process is gone. Relaunch tears down jobs/subagents and changes session-id claims.
 
@@ -171,8 +171,12 @@ Markers are child-PID-specific JSON with `cwd`, nullable `launchPrompt`, `handof
 - Status files survive exit: check PID/session identity before assuming liveness. Hook failures log and continue; telemetry write failures must not prevent a handoff commit.
 - Read committed session JSONL entries (`type: "compaction"`, `details.kind: "handoff"`) rather than expecting `session_compact` for turn-end drafts. A file write/commit-intent event alone is not proof that pi appended the boundary.
 - Optional integrations use the `pi-jobs.liveManagers` and `pi-subagents:manager` Symbol registries, and `<agentDir>/issue-work/registry.jsonl`. Missing data is labelled unavailable. Job managers are process-wide and can include sibling sessions. The current subagent registry cannot enumerate: known tool-result ids are captured; unknown running work is explicitly reported.
-- In-process subagents inherit the root environment but **do not own its wrapper**; current child sessions have no shutdown binding. They never write the parent's marker. Hard/loop/cap fallback requires parent/operator intervention; normal in-process compaction still works.
+- In-process subagents inherit the root environment but **do not own its wrapper**; current child sessions have no shutdown binding. They never write the parent's marker. Hard-limit handoffs can still recover in-process; loop/cap or unrecoverable fallback requires parent/operator intervention.
 - No automatic event-log rotation or handoff deletion. Files may contain sensitive user constraints, paths and task state; keep them private.
+
+## Lifecycle model
+
+`src/core.ts` contains a pure immutable transition function with named idle, soft-notified, handoff-required, handoff-pending-commit, compacting and fallback-armed states. Pi hooks only translate observations and execute its explicit effects. Inactive modes can emit telemetry only, by construction. Attempt ids deduplicate pi's failure hook followed by `compact`'s `onError`, and success/mode changes clear failure recovery. Table-driven tests cover the transition matrix; offline real-pi tests cover internal continuations, native compaction pass-through, cancellation, no-op failures and SDK hosting.
 
 ## Limits and development
 
