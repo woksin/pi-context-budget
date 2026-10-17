@@ -87,6 +87,7 @@ export function modelThresholds(config: Config, model: string, sub: boolean): Th
 }
 export type Phase = "idle" | "soft-notified" | "handoff-required" | "handoff-pending-commit" | "compacting" | "fallback-armed";
 export type Fallback = "hard" | "loop" | "cap" | "compaction";
+type BudgetAction = "none" | "handoff" | "relaunch";
 export type FailureClass = "cancelled" | "nothing-to-compact" | "transient" | "persistent";
 export const MAX_COMPACTION_RETRIES = 2;
 export interface MachineState {
@@ -98,7 +99,9 @@ export interface MachineState {
   compaction?: { id: number; origin: "idle" | "backstop" };
   attempt: number; blockedCalls: string[]; lastSettled: number; observedIdle: boolean;
   providerFailure: "none" | "error" | "overflow" | "aborted";
-  relaunchSent: boolean;
+  relaunchSent: boolean; lastAction: BudgetAction;
+  /** Counterfactual policy state only; never mixed into actual history or action execution. */
+  observation?: MachineState;
 }
 export interface Frame { mode: Mode; tokens: number | null; thresholds: Thresholds; config: Config; wrapped: boolean }
 export type MachineEvent =
@@ -129,10 +132,11 @@ export type Effect =
   | { type: "backstop"; handoff?: Handoff; tokensBefore: number }
   | { type: "relaunch"; handoff?: Handoff }
   | { type: "cancel_compaction" };
+type LogEffect = Extract<Effect, { type: "log" }>;
 export function initialState(mode: Mode = "observe"): MachineState {
   return { phase: "idle", mode, tokens: null, floor: null, turn: 0, count: 0, handoffTurns: [], softNotified: false,
     settleRequest: "none", failures: 0, compactionFallback: false, attempt: 0, blockedCalls: [], lastSettled: 0,
-    observedIdle: false, providerFailure: "none", relaunchSent: false };
+    observedIdle: false, providerFailure: "none", relaunchSent: false, lastAction: "none" };
 }
 export function classifyFailure(e: { aborted?: boolean; errorMessage?: string }): FailureClass {
   if (e.aborted || /cancelled|canceled|aborted/i.test(e.errorMessage ?? "")) return "cancelled";
@@ -159,26 +163,70 @@ function committed(s: MachineState): void {
 function resetEnforcement(s: MachineState): void {
   s.pending = s.stored = undefined; s.compaction = undefined; s.blockedCalls = [];
   s.settleRequest = "none"; s.failures = 0; s.compactionFallback = s.relaunchSent = false;
+  s.lastAction = "none";
 }
 const REQUIRED = "Call context_handoff now with goal, next_step and verified facts; preserve user_constraints verbatim and hypotheses separately. Then end the turn without further tools. Only the user may disable enforcement via config or the optional /guards off context.";
 function phase(s: MachineState, f: Frame): Phase {
-  if (s.mode !== "enforce") return "idle";
+  if (s.mode === "off") return "idle";
+  if (s.mode === "observe" && s.observation) s = s.observation;
   if (s.compaction) return "compacting";
   if (fallbackFor(s, f)) return "fallback-armed";
   if (s.pending) return "handoff-pending-commit";
   if (handoffRequired(s, f)) return "handoff-required";
   return s.softNotified ? "soft-notified" : "idle";
 }
-function observe(s: MachineState, e: MachineEvent, f: Frame): Effect[] {
-  if (s.mode !== "observe") return [];
-  const log = (event: string): Effect[] => [{ type: "log", event }];
-  if (e.type === "session_before_compact") return log("would_backstop");
-  if (e.type === "handoff_prepare") return log("would_handoff");
-  if (e.type === "turn_end" && fallbackFor(s, f)) return log("would_relaunch");
-  if (e.type === "tool_call" && (fallbackFor(s, f) || handoffRequired(s, f))) return log("would_block");
-  if (e.type === "agent_settled" && e.pendingWork && (s.tokens ?? 0) >= f.config.idleMinTokens) return log("would_idle_handoff");
-  if (e.type === "input" && s.observedIdle && e.now - s.lastSettled >= f.config.idleMinutes * 60000) return log("would_idle_compact");
-  return [];
+function budgetAction(s: MachineState, f: Frame): BudgetAction {
+  return fallbackFor(s, f) ? "relaunch" : handoffRequired(s, f) ? "handoff" : "none";
+}
+/** Status uses the same policy view as decisions, not the inactive actual-state shell. */
+export function policyStatus(s: MachineState, f: Frame) {
+  if (f.mode === "off") return { phase: "idle" as Phase, action: "none", fallbackReason: null };
+  const view = f.mode === "observe" ? s.observation ?? s : { ...s, mode: "enforce" as const, observation: undefined };
+  const current = phase(view, f);
+  const actions = { idle: "none", "soft-notified": "soft", "handoff-required": "handoff", "handoff-pending-commit": "handoff", compacting: "compact", "fallback-armed": "relaunch" };
+  return { phase: current, action: actions[current], fallbackReason: fallbackFor(view, f) ?? null };
+}
+function policyTrace(s: MachineState, e: MachineEvent, f: Frame): LogEffect[] {
+  const action = budgetAction(s, f), effects: LogEffect[] = [];
+  if (action !== s.lastAction && action !== "none") {
+    effects.push({ type: "log", event: `${action}_crossing`, data: { policy: true, from: s.lastAction, to: action } });
+  }
+  if (e.type === "turn_end" && action !== "none") effects.push({ type: "log", event: `${action}_required`, data: { policy: true } });
+  s.lastAction = action;
+  return effects;
+}
+/** Exhaustive projection: every real decision becomes exactly one would_* log. */
+function wouldLog(effect: Effect, s: MachineState, f: Frame): LogEffect {
+  let event: string;
+  switch (effect.type) {
+    case "log": {
+      const aliases: Record<string, string> = { handoff_required: "would_handoff", relaunch_required: "would_relaunch", idle_compact_requires_handoff: "would_idle_compact" };
+      event = aliases[effect.event] ?? `would_${effect.event}`; break;
+    }
+    case "notify": event = "would_soft_notice"; break;
+    case "write_handoff": event = effect.idleOnly ? "would_idle_handoff_write" : "would_handoff_write"; break;
+    case "reject_handoff": event = "would_handoff_rejected"; break;
+    case "block": event = "would_block"; break;
+    case "steer": event = effect.idleOnly ? "would_idle_handoff" : "would_handoff"; break;
+    case "commit": event = "would_handoff_commit"; break;
+    case "compact": event = "would_idle_compact"; break;
+    case "backstop": event = "would_backstop"; break;
+    case "relaunch": event = "would_relaunch"; break;
+    case "cancel_compaction": event = "would_cancel_compaction"; break;
+    default: { const exhaustive: never = effect; throw new Error(`Unmapped effect: ${exhaustive}`); }
+  }
+  return { type: "log", event, data: { ...(effect.type === "log" ? effect.data : {}),
+    effect: effect.type === "log" ? `log:${effect.event}` : effect.type, tokens: f.tokens, floor: s.floor, phase: s.phase } };
+}
+function observe(previous: MachineState, event: MachineEvent, frame: Frame): { state: MachineState; effects: LogEffect[] } {
+  // Actual state follows real events without policy actions; the separate copy retains
+  // enforce latches but cannot supply pending work, counts or recovery to an active session.
+  const actual = transition({ ...previous, observation: undefined }, event, { ...frame, mode: "off" });
+  const seed = { ...(previous.observation ?? previous), observation: undefined };
+  if (previous.mode !== "observe") resetEnforcement(seed);
+  const projected = transition({ ...seed, mode: "enforce" }, event, { ...frame, mode: "enforce" });
+  const state: MachineState = { ...actual.state, mode: "observe", observation: projected.state, phase: projected.state.phase };
+  return { state, effects: projected.effects.map(effect => wouldLog(effect, projected.state, frame)) };
 }
 function startCompaction(s: MachineState, origin: "idle" | "backstop"): void {
   if (!s.compaction) s.compaction = { id: ++s.attempt, origin };
@@ -244,9 +292,10 @@ function active(s: MachineState, e: MachineEvent, f: Frame): Effect[] {
       return [{ type: "relaunch", handoff: s.pending ?? s.stored }];
     case "input":
       s.settleRequest = "none";
-      if (s.stored && !e.streaming && s.lastSettled > 0 && e.now - s.lastSettled >= f.config.idleMinutes * 60000
+      if (!e.streaming && s.lastSettled > 0 && e.now - s.lastSettled >= f.config.idleMinutes * 60000
         && (s.tokens ?? 0) > f.config.keepRecentTokens && !e.alreadyCompacted) {
-        startCompaction(s, "idle"); return [{ type: "compact", attempt: s.compaction!.id }];
+        if (s.stored) { startCompaction(s, "idle"); return [{ type: "compact", attempt: s.compaction!.id }]; }
+        if (s.observedIdle) return [{ type: "log", event: "idle_compact_requires_handoff", data: { requiresHandoff: true } }];
       }
       return [];
     case "session_before_compact":
@@ -260,7 +309,8 @@ function active(s: MachineState, e: MachineEvent, f: Frame): Effect[] {
 }
 /** Pure, immutable policy boundary. Inactive modes can emit ONLY telemetry, never action effects. */
 export function transition(previous: MachineState, event: MachineEvent, frame: Frame): { state: MachineState; effects: Effect[] } {
-  const s: MachineState = { ...previous, handoffTurns: [...previous.handoffTurns], blockedCalls: [...previous.blockedCalls], tokens: frame.tokens };
+  if (frame.mode === "observe") return observe(previous, event, frame);
+  const s: MachineState = { ...previous, observation: undefined, handoffTurns: [...previous.handoffTurns], blockedCalls: [...previous.blockedCalls], tokens: frame.tokens };
   if (s.mode !== frame.mode) { resetEnforcement(s); s.mode = frame.mode; }
   if ((event.type === "session_compact" || event.type === "session_compact_failed") && event.attempt !== undefined && s.compaction?.id !== event.attempt) {
     s.phase = phase(s, frame);
@@ -277,13 +327,13 @@ export function transition(previous: MachineState, event: MachineEvent, frame: F
     if (event.owned && s.mode === "enforce") committed(s);
     else { s.tokens = s.floor = null; s.compaction = undefined; s.compactionFallback = false; s.failures = 0; s.relaunchSent = false; }
   }
-  const effects = s.mode === "enforce" ? active(s, event, frame) : observe(s, event, frame);
+  const effects = s.mode === "enforce" ? active(s, event, frame) : [];
   if (event.type === "agent_settled") {
     s.lastSettled = event.now; s.observedIdle = event.pendingWork && (s.tokens ?? 0) >= frame.config.idleMinTokens;
   }
   if (event.type === "input") s.observedIdle = false;
   s.phase = phase(s, frame);
-  return { state: s, effects };
+  return { state: s, effects: s.mode === "enforce" ? [...policyTrace(s, event, frame), ...effects] : effects };
 }
 
 export type HistoryItem = { type: "input" } | { type: "usage"; tokens: number } | { type: "compaction"; owned: boolean }

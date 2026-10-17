@@ -6,7 +6,7 @@ const config = parseConfig({ mode: "enforce", main: { soft: 100, handoff: 200, h
 const f: Frame = { mode: "enforce", tokens: 300, thresholds: config.main, config, wrapped: false };
 const h = { text: "# Handoff unique", path: "/handoff.md", n: 1, at: "2026-10-17T00:00:00Z" };
 const base = (values: Partial<MachineState> = {}): MachineState => ({ ...initialState("enforce"), floor: 100, ...values });
-const kinds = (effects: Effect[]) => effects.map(e => e.type);
+const kinds = (effects: Effect[]) => effects.filter(e => e.type !== "log" || e.data?.policy !== true).map(e => e.type);
 const turn: MachineEvent = { type: "turn_end", usage: 300 };
 const cases: { name: string; state?: Partial<MachineState>; event: MachineEvent; frame?: Partial<Frame>; phase: string; effects: string[] }[] = [
   { name: "soft crossing", event: turn, frame: { tokens: 100 }, phase: "soft-notified", effects: ["notify"] },

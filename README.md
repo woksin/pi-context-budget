@@ -78,6 +78,8 @@ All numbers must be positive and finite; count limits must be integers; require 
 - **observe:** telemetry and `would_*` events; the handoff tool is a no-op. No blocks, forced continuations, compactions or relaunches.
 - **enforce:** the policy below, restricted by `enforceCwds` when supplied.
 
+Observe runs the **same enforce transition on a separate copy**, then converts every effect 1:1 to a `would_*` log. Soft notices, action crossings, handoff/settle/block decisions, hard recovery and idle decisions use the same latches as enforcement. Status `phase`/`action` describe that preview (`projected: true`), not actual activity; measured tokens and handoff counts remain actual. Preview-only commits and latches are discarded when enforcement is activated.
+
 The package optionally reads `getAgentDir()/lib/guards.ts` if your setup provides a shared `isGuardOff(name)` API and a `context` guard. In that integration, `/guards off context` disables enforcement for the session. The package does not install or modify another extension's guard library. Without that integration, change the configuration to `off` or `observe` and submit the next input. Only the user/operator should disable enforcement, never a model following a chat instruction.
 
 **Off/observe and guard-off leave native pi compaction unchanged**: the hook returns no summary and no cancellation for manual, threshold or overflow compaction. The package initiates nothing; pi can still compact using its own configured behavior and summarizer. Only enforce mode intercepts compaction.
@@ -113,7 +115,7 @@ Files: `<repo-root or cwd>/.ai-work/handoffs/<sessionId>-<n>.md` plus JSON sidec
 
 ### Idle reset
 
-At the last actionable settle boundary, if context is large **and work remains pending** (jobs, watches or subagents), request a warm-cache handoff and store it **without compacting**. On the next input after `idleMinutes`, await compaction before the new prompt is sent. Skip small/already-compacted history; tolerate pi's `Nothing to compact` error and pass the prompt through unchanged. Actual non-handoff tool activity and externally started runs invalidate old stored handoffs; blocked calls cannot make a snapshot stale. Cancellation, `Nothing to compact` and `Already compacted` are benign in both the hook and callback paths. Transient failures retry only at the next eligible input/automatic compaction boundary, at most twice; a third failure or a persistent owned/automatic error arms fallback. Unowned manual errors are ignored. Successful compaction or a mode/guard change disarms compaction-failure fallback.
+At the last actionable settle boundary, if context is large **and work remains pending** (jobs, watches or subagents), request a warm-cache handoff and store it **without compacting**. On the next input after `idleMinutes`, await compaction before the new prompt is sent. Skip small/already-compacted history; tolerate pi's `Nothing to compact` error and pass the prompt through unchanged. Actual non-handoff tool activity and externally started runs invalidate old stored handoffs; blocked calls cannot make a snapshot stale. Cancellation, `Nothing to compact` and `Already compacted` are benign in both the hook and callback paths. Transient failures retry only at the next eligible input/automatic compaction boundary, at most twice; a third failure or a persistent owned/automatic error arms fallback. Unowned manual errors are ignored. Successful compaction or a mode/guard change disarms compaction-failure fallback. An idle preview without a prepared handoff is marked `requiresHandoff: true`; this records the missing prerequisite, not an actual compaction request.
 
 ### Overflow backstop
 
@@ -166,7 +168,7 @@ Markers are `<pid>-<random-launch-nonce>.json` with `cwd`, nullable `launchPromp
 
 ## Telemetry and integration limits
 
-- Atomic status: `getAgentDir()/context-budget/status/<sessionId>.json` (cwd, model, main/child role, tokens, floor, thresholds, last handoff path/time, count, effective/configured mode, fallback and wrapper ownership).
+- Atomic status: `getAgentDir()/context-budget/status/<sessionId>.json` (cwd, model, main/child role, tokens, floor, thresholds, last handoff path/time, count, effective/configured mode, policy phase/action, projection flag, fallback and wrapper ownership).
 - Append-only events: `getAgentDir()/context-budget/events.jsonl` (crossings, blocks, handoffs, idle/backstop/fallback, `would_*` and errors). `PI_CONTEXT_BUDGET_STATE_DIR` redirects both.
 - Status files survive exit: check PID/session identity before assuming liveness. Hook failures log and continue; telemetry write failures must not prevent a handoff commit.
 - Read committed session JSONL entries (`type: "compaction"`, `details.kind: "handoff"`) rather than expecting `session_compact` for turn-end drafts. A file write/commit-intent event alone is not proof that pi appended the boundary.

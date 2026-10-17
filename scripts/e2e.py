@@ -104,6 +104,16 @@ if scenario == "enforce":
 elif scenario == "observe":
     assert not blocks and not compactions and not commits and not relaunches
     assert any(e["event"].startswith("would_") for e in events)
+    notices = [e for e in events if e["event"] == "would_soft_notice"]
+    crossings = [e for e in events if e["event"] == "would_handoff_crossing"]
+    required = [e for e in events if e["event"] == "would_handoff"]
+    assert notices and crossings and required, "Observe must expose soft/handoff crossings and settle intent"
+    assert all(e["tokens"] >= config["main"]["soft"] for e in notices)
+    assert all(e["tokens"] >= config["main"]["handoff"] and e["tokens"] - e["floor"] >= config["main"]["minProgress"] for e in crossings)
+    assert all(e["from"] != e["to"] and e["to"] == "handoff" for e in crossings)
+    assert all(s["projected"] and s["phase"] == "handoff-required" and s["action"] == "handoff" for s in status)
+    assert not any(e["event"] in ("would_relaunch", "would_relaunch_crossing") for e in events), "This workload stays below hard"
+    print(json.dumps({"would_soft_notice": len(notices), "would_handoff_crossing": len(crossings), "would_handoff": len(required)}))
     assert all(f"TAG-{n}" in (work / "done.txt").read_text() for n in range(1, 7))
 else:
     assert len(relaunches) == 1
@@ -111,5 +121,7 @@ else:
     assert not list((work / "markers").glob("*.json"))
     assert "WRAPPER-DONE" in (work / "done.txt").read_text()
 summary = dict(scenario=scenario, exit=result.returncode, compactions=len(compactions), commits=len(commits), blocks=len(blocks), relaunches=len(relaunches), sessions=len(status), cost=cost)
+if scenario == "observe":
+    summary["would_events"] = {name: sum(e["event"] == name for e in events) for name in ("would_soft_notice", "would_handoff_crossing", "would_handoff", "would_block", "would_relaunch")}
 (work / "result.json").write_text(json.dumps(summary, indent=2))
 print(json.dumps(summary))

@@ -82,6 +82,10 @@ test("observe mode logs would-do events but no blocking, handoff files, continua
   assert.ok(h.events().some(e => e.event === "would_relaunch"));
   assert.ok(h.events().some(e => e.event === "would_block"));
   assert.equal(h.status().mode, "observe");
+  assert.equal(h.status().phase, "fallback-armed");
+  assert.equal(h.status().action, "relaunch");
+  assert.equal(h.status().projected, true);
+  assert.ok(h.events().some(e => e.event === "would_soft_notice"));
 });
 test("hard without wrapper commits a valid handoff and resumes instead of trapping tools", async () => {
   const h = await harness();
@@ -202,12 +206,13 @@ test("new external runs clear the idle-only request; invalid config falls back t
   assert.ok(h.events().some(e => e.event === "config_error"));
 });
 test("observe records both warm-cache idle request and would-reset without calling compact", async () => {
-  const h = await harness("observe", { idleMinutes: 0.000001, idleMinTokens: 50 });
+  const h = await harness("observe", { idleMinutes: 0.000001, idleMinTokens: 50, keepRecentTokens: 10 });
   const key = Symbol.for("pi-jobs.liveManagers"), global = globalThis as Record<symbol, unknown>;
   global[key] = new Set([{ list: () => [{ status: "running" }] }]);
   const now = Date.now;
   try {
-    await h.turn(100); await h.emit("agent_settled", { aborted: false });
+    await h.turn(100); await h.emit("agent_before_settle");
+    await h.emit("agent_settled", { aborted: false });
     Date.now = () => now() + 1000;
     await h.emit("input", { text: "next" });
     assert.ok(h.events().some(e => e.event === "would_idle_handoff"));

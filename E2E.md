@@ -2,7 +2,29 @@
 
 Staging only; no global installation, repository creation or publication. Runtime files and runner state are isolated under this checkout's `.ai-work/`. No live agent configuration or external source checkout was modified.
 
-## Round-1 structural revision (current)
+## Round-2 observe telemetry revision (current)
+
+Observe now runs the same enforce transition on a separate copy and converts every effect to exactly one log-only `would_*` effect. The preview retains enforce's latches; actual history/counts remain separate and preview-only state is discarded on activation. Shared policy tracing records handoff/hard crossings and required actions; status exposes the projected policy `phase`, `action`, `fallbackReason` and `projected` flag. Native off/observe compaction behavior is unchanged.
+
+The supplied 100k → 350k → 450k → settle reproduction was first added as a test on `5f2557e`: **exit 1**, actual effects `[[], [], [], []]`, confirming the review. It now passes with soft notice, handoff crossing and handoff intent logs. Table-driven sequences compare observe effects 1:1 to enforce effects and assert identical preview latches, log-only output, idle conditions, hard/cap recovery, actual-latch preservation and no preview state leaking into activation.
+
+Current local checks (Node 26.8.1, pi 1.2.0):
+- `npm test`: **exit 0**, 165 tests: 164 passed; only the CI-only presence assertion skipped.
+- `npm run typecheck`: **exit 0**.
+- `npm run check:shell`: **exit 0**.
+- `npm pack --dry-run`: **exit 0**, seven generic files, ~24.2 KB packed / 73.5 KB unpacked.
+
+Only paid scenario **(b) observe** was rerun, once:
+
+```sh
+python3 -B scripts/phase.py run --kind integration --label 'round-2 Haiku observe telemetry E2E' --timeout 280 --queue-timeout 10 -- python3 -B scripts/e2e.py observe r2
+```
+
+Exit **0**, task completed with all six code words. `events.jsonl`: **1 would_soft_notice**, **1 would_handoff_crossing**, **12 would_handoff** intents, **10 would_block**, **0 would_relaunch**. The driver verifies the soft/handoff token bounds and floor-relative progress at the crossings, and status `phase=handoff-required`, `action=handoff`, `projected=true`. Actual blocks, commits, compactions and relaunches: **all zero**. Round API spend: **$0.00931515**. Scenarios (a)/(c) were not rerun.
+
+The existing actual soft-notice latch is preserved across inactive modes; a virtual notice does not suppress the first actual notice when enforcement is activated. The latter latch checks are offline tests and do not change this default-observe paid scenario's inputs or behavior. All task writes remain in staging; no installation/publication or protected-directory edits.
+
+## Round-1 structural revision (historical)
 
 The lifecycle policy is now the pure immutable state machine in `src/core.ts`; `extension.ts` translates pi events and executes explicit effects. Observe/off/guard-off leave native compaction untouched. A valid hard-limit handoff recovers in-process; cap/loop fallback remains independent. Wrapper ownership is bound to PID, primary hosting identity and a fresh per-launch nonce.
 

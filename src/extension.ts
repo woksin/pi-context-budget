@@ -4,7 +4,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
-import { effectiveMode, modelThresholds, parseConfig, renderHandoff, ownsWrapper, initialState, transition, fallbackFor,
+import { effectiveMode, modelThresholds, parseConfig, renderHandoff, ownsWrapper, initialState, transition, policyStatus,
   restoreHistory, type Effect, type Frame, type MachineEvent, type Handoff, type HandoffInput, type HistoryItem } from "./core.ts";
 import { appendEvent, atomicJson, gitState, issueClaims, runningState, writeHandoff, writeMarker, processSessionHosts, type SessionHosts } from "./storage.ts";
 
@@ -50,13 +50,13 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
     }
     function status(ctx: ExtensionContext): void {
       try {
-        const f = frame(ctx);
+        const f = frame(ctx), policy = policyStatus(state, f);
         atomicJson(join(stateDir, "status", `${ctx.sessionManager.getSessionId()}.json`), {
           at: new Date().toISOString(), pid: process.pid, sessionId: ctx.sessionManager.getSessionId(), sessionFile: ctx.sessionManager.getSessionFile(),
           cwd: ctx.cwd, model: ref(ctx), role: host?.subagent ? "subagent" : "main", tokens: state.tokens,
-          thresholds: f.thresholds, floor: state.floor, phase: state.phase, lastHandoffPath: state.lastHandoff?.path ?? null,
+          thresholds: f.thresholds, floor: state.floor, phase: policy.phase, action: policy.action, projected: f.mode === "observe", lastHandoffPath: state.lastHandoff?.path ?? null,
           lastHandoffTime: state.lastHandoff?.at ?? null, handoffCount: state.count, mode: f.mode, configuredMode: config.mode,
-          fallbackReason: f.mode === "enforce" ? fallbackFor(state, f) ?? null : null,
+          fallbackReason: policy.fallbackReason,
           wrapper: f.wrapped, relaunchMarker: f.wrapped ? process.env.PI_RELAUNCH_MARKER : null,
         });
       } catch (error) { log(ctx, "status_error", { error: String(error) }); }
