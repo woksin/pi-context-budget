@@ -265,8 +265,7 @@ function active(s: MachineState, e: MachineEvent, f: Frame): Effect[] {
       ? [{ type: "reject_handoff", reason: "A handoff is already stored. End this turn without further tools." }]
       : [{ type: "write_handoff", idleOnly: s.settleRequest === "idle" }];
     case "handoff_written":
-      s.lastHandoff = s.stored = e.handoff;
-      if (s.settleRequest !== "idle") s.pending = e.handoff;
+      s.lastHandoff = s.stored = s.pending = e.handoff;
       return [];
     case "turn_end": {
       // Hard means WITHOUT a usable handoff. Cap/loop must not be bypassed by another handoff.

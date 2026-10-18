@@ -132,7 +132,7 @@ test("backstop summaries are unique; stale stored handoff is replaced mechanical
   const c = await h.emit("session_before_compact", { preparation: { tokensBefore: 300 }, reason: "overflow" });
   assert.match(c.compaction.summary, /Emergency handoff/);
 });
-test("idle requires pending work, stores only, tolerates Nothing to compact, invalidates on tool", async () => {
+test("idle requires pending work, commits this turn, tolerates Nothing to compact, invalidates on tool", async () => {
   const h = await harness("enforce", { idleMinutes: 0.0000001, idleMinTokens: 50, keepRecentTokens: 10 });
   await h.turn(100);
   assert.equal(await h.emit("agent_before_settle"), undefined);
@@ -143,7 +143,7 @@ test("idle requires pending work, stores only, tolerates Nothing to compact, inv
     assert.equal((await h.emit("agent_before_settle")).continue, true);
     await h.emit("agent_start"); // Internal continuation: must NOT erase the idle request.
     await h.handoff();
-    assert.equal(await h.turn(100), undefined); // Store only, not turn_end compaction.
+    assert.equal((await h.turn(100)).entries[0].type, "compaction"); // Same-turn reset, not stored only.
     await h.emit("agent_settled", { aborted: false });
     const now = Date.now;
     Date.now = () => now() + 1000;
@@ -155,6 +155,43 @@ test("idle requires pending work, stores only, tolerates Nothing to compact, inv
     h.setTokens(100);
     assert.equal(await h.emit("tool_call", { toolName: "read", toolCallId: "after-idle-noop" }), undefined);
   } finally { delete global[key]; }
+});
+test("idle handoff resets before a notification or new run within the idle window", async () => {
+  const h = await harness("enforce", { idleMinTokens: 50 }); // Default 50-minute window.
+  const key = Symbol.for("pi-jobs.liveManagers"), global = globalThis as Record<symbol, unknown>, previous = global[key];
+  global[key] = new Set([{ list: () => [{ id: "watch", status: "running" }] }]);
+  try {
+    await h.turn(100);
+    const request = await h.emit("agent_before_settle");
+    assert.equal(request.continue, true);
+    assert.match(request.entries[0].content, /context resets at the end of this turn/i);
+    await h.emit("agent_start");
+    const result = await h.handoff();
+    assert.match(result.content[0].text, /context resets at the end of this turn/i);
+    assert.equal(await h.emit("agent_before_settle"), undefined);
+    await assert.rejects(h.handoff(), /already stored/);
+    const draft = await h.turn(100);
+    assert.equal(draft.continue, true);
+    assert.equal(draft.entries[0].type, "compaction");
+    assert.equal(draft.entries[0].firstKeptEntryId, null);
+    assert.equal(draft.entries[0].details.path, result.details.handoff.path);
+    assert.equal(draft.entries[0].summary, result.details.handoff.text);
+    assert.equal(h.status().handoffCount, 1);
+    assert.equal(h.status().tokens, null);
+    assert.equal(h.status().floor, null);
+    h.setTokens(null);
+    await h.emit("agent_settled", { aborted: false });
+    await h.emit("input", { source: "extension", text: "watch completed" });
+    await h.emit("before_agent_start");
+    await h.emit("agent_start");
+    assert.equal(await h.emit("tool_call", { toolName: "read", toolCallId: "after-idle-commit" }), undefined);
+    assert.equal(await h.emit("agent_before_settle"), undefined);
+    assert.deepEqual(h.counters(), { shutdown: 0, compact: 0 });
+    assert.equal(h.events().filter(e => e.event === "idle_handoff_requested").length, 1);
+    const commits = h.events().filter(e => e.event === "handoff_committed");
+    assert.equal(commits.length, 1);
+    assert.equal(commits[0].path, result.details.handoff.path);
+  } finally { global[key] = previous; }
 });
 test("blocked sibling keeps pending handoff; already-running sibling invalidates it", async () => {
   const h = await harness();

@@ -25,7 +25,7 @@ const cases: { name: string; state?: Partial<MachineState>; event: MachineEvent;
   { name: "internal agent_start cannot reset continuation", state: { settleRequest: "budget" }, event: { type: "agent_start" }, phase: "handoff-required", effects: [] },
   { name: "repeat settle never loops", state: { settleRequest: "budget" }, event: { type: "agent_before_settle", pendingWork: false }, phase: "handoff-required", effects: [] },
   { name: "idle continuation retains intent across agent_start", state: { settleRequest: "idle" }, event: { type: "agent_start" }, frame: { tokens: 100 }, phase: "idle", effects: [] },
-  { name: "idle handoff stored ONLY", state: { settleRequest: "idle" }, event: { type: "handoff_written", handoff: h }, frame: { tokens: 100 }, phase: "idle", effects: [] },
+  { name: "idle handoff pending commit", state: { settleRequest: "idle" }, event: { type: "handoff_written", handoff: h }, frame: { tokens: 100 }, phase: "handoff-pending-commit", effects: [] },
   { name: "fresh external prompt invalidates idle snapshot", state: { stored: h, settleRequest: "idle" }, event: { type: "before_agent_start" }, frame: { tokens: 100 }, phase: "idle", effects: [] },
   { name: "idle input compacts", state: { stored: h, lastSettled: 1 }, event: { type: "input", now: 4000000, streaming: false, alreadyCompacted: false }, frame: { tokens: 40000 }, phase: "compacting", effects: ["compact"] },
   { name: "already compacted input skips", state: { stored: h, lastSettled: 1 }, event: { type: "input", now: 4000000, streaming: false, alreadyCompacted: true }, frame: { tokens: 40000 }, phase: "fallback-armed", effects: [] },
@@ -47,7 +47,7 @@ for (const c of cases) test(`transition: ${c.name}`, () => {
   assert.equal(next.state.phase, c.phase);
   assert.deepEqual(kinds(next.effects), c.effects);
   assert.deepEqual(before, saved, "the reducer must not mutate its input");
-  if (c.name.includes("stored ONLY")) { assert.equal(next.state.pending, undefined); assert.equal(next.state.stored, h); }
+  if (c.name === "idle handoff pending commit") { assert.equal(next.state.pending, h); assert.equal(next.state.stored, h); }
 });
 
 for (const mode of ["off", "observe"] as const) for (const c of cases) test(`${mode} is inert: ${c.name}`, () => {
@@ -65,6 +65,31 @@ for (const [errorMessage, aborted, expected] of [
   assert.equal(classifyFailure({ errorMessage, aborted }), expected);
   const next = transition(base(), { type: "session_compact_failed", reason: "threshold", errorMessage, aborted }, { ...f, tokens: 100 });
   assert.equal(next.state.compactionFallback, expected === "persistent");
+});
+test("idle handoff commits at the next turn boundary without requesting another handoff", () => {
+  const frame = { ...f, tokens: 100, config: { ...config, idleMinTokens: 50 } };
+  let state = base();
+  const step = (event: MachineEvent) => {
+    const result = transition(state, event, frame);
+    state = result.state;
+    return result.effects;
+  };
+  assert.deepEqual(kinds(step({ type: "agent_before_settle", pendingWork: true })), ["steer"]);
+  assert.equal(state.settleRequest, "idle");
+  step({ type: "handoff_written", handoff: h });
+  step({ type: "agent_start" });
+  step({ type: "input", now: 1000, streaming: true, alreadyCompacted: false });
+  assert.deepEqual(kinds(step({ type: "agent_before_settle", pendingWork: true })), []);
+  assert.equal(state.pending, h);
+  assert.deepEqual(kinds(step({ type: "tool_call", tool: "read", id: "blocked-idle" })), ["block"]);
+  step({ type: "tool_end", tool: "read", id: "blocked-idle", error: true });
+  assert.deepEqual(kinds(step({ type: "handoff_prepare" })), ["reject_handoff"]);
+  const effects = step({ type: "turn_end", usage: 100 });
+  assert.deepEqual(effects.filter(e => e.type === "commit"), [{ type: "commit", handoff: h }]);
+  assert.equal(state.tokens, null);
+  assert.equal(state.floor, null);
+  assert.equal(state.count, 1);
+  assert.equal(state.pending, undefined);
 });
 test("manual unowned errors never poison fallback; owned transient errors have a bounded retry budget", () => {
   const no = transition(base(), { type: "session_compact_failed", reason: "manual", errorMessage: "EACCES" }, { ...f, tokens: 100 });

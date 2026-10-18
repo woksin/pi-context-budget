@@ -114,7 +114,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
           case "steer":
             log(ctx, effect.idleOnly ? "idle_handoff_requested" : "settle_handoff_requested");
             result = { entries: [{ type: "custom_message", customType: "context-budget", display: true, content: effect.idleOnly
-              ? "Pending background work remains and context is large. Call context_handoff now while the cache is warm, then end this turn. It is stored only, until the next idle input."
+              ? "Pending background work remains and context is large. Call context_handoff now while the cache is warm, then end this turn. The context resets at the end of this turn."
               : "Context recovery is required. Call context_handoff with goal, next_step, verified facts and verbatim user_constraints, then end this turn without further tools." }], continue: true }; break;
           case "commit":
             log(ctx, "handoff_committed", { path: effect.handoff.path, n: effect.handoff.n, count: state.count });
@@ -168,7 +168,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
     pi.on("before_agent_start", safe(async (_e, ctx) => { await run({ type: "before_agent_start" }, ctx); }));
     pi.registerTool({
       name: "context_handoff", label: "Context handoff",
-      description: "Write a concise structured handoff, then END THIS TURN without more tools. Recovery continues automatically; an idle request stores only. Separate facts from hypotheses and preserve user constraints verbatim.",
+      description: "Write a concise structured handoff, then END THIS TURN without more tools. Recovery continues automatically; an idle request resets the context at the end of this turn. Separate facts from hypotheses and preserve user constraints verbatim.",
       parameters: { type: "object", properties: {
         goal: { type: "string", minLength: 1 }, next_step: { type: "string", minLength: 1 }, facts: { type: "string", minLength: 1 },
         decisions: { type: "string" }, user_constraints: { type: "string" }, open_items: { type: "string" }, hypotheses: { type: "string" },
@@ -183,7 +183,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
         }
         const handoff = createHandoff(ctx, input);
         await run({ type: "handoff_written", handoff }, ctx);
-        return { content: [{ type: "text", text: intent.idleOnly ? "Handoff stored for idle reset. End this turn." : "Handoff stored. End this turn without further tools; recovery continues automatically." }], details: { handoff } };
+        return { content: [{ type: "text", text: intent.idleOnly ? "Handoff stored. End this turn without further tools; the context resets at the end of this turn." : "Handoff stored. End this turn without further tools; recovery continues automatically." }], details: { handoff } };
       },
     });
     pi.on("tool_call", safe((e, ctx) => run({ type: "tool_call", tool: e.toolName, id: e.toolCallId }, ctx)));

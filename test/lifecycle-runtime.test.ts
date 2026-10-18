@@ -67,7 +67,7 @@ test("real pi agent_start during settle continuation does not reset the one-cont
   await h.session.prompt("next request");
   assert.equal(h.faux.state.callCount, 3); // second prompt: exactly one continuation
 });
-test("real pi warm-cache continuation stores a handoff rather than committing it", { skip }, async t => {
+test("real pi warm-cache continuation commits a handoff at turn end", { skip }, async t => {
   const key = Symbol.for("pi-jobs.liveManagers"), global = globalThis as Record<symbol, unknown>, old = global[key];
   global[key] = new Set([{ list: () => [{ status: "running" }] }]);
   try {
@@ -75,7 +75,7 @@ test("real pi warm-cache continuation stores a handoff rather than committing it
     h.faux.setResponses([h.reply("waiting"), h.reply([h.ai.fauxToolCall("context_handoff", { goal: "wait", next_step: "consume job", facts: "pending work" })]), h.reply("stored")]);
     await h.session.prompt("work waits on a job");
     assert.equal(h.faux.state.callCount, 3);
-    assert.equal(h.sessionManager.getBranch().filter((e: any) => e.type === "compaction").length, 0);
+    assert.equal(h.sessionManager.getBranch().filter((e: any) => e.type === "compaction").length, 1);
     assert.ok(h.status().lastHandoffPath);
   } finally { global[key] = old; }
 });
