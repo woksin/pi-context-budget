@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { initialState, transition, parseConfig, classifyFailure, MAX_COMPACTION_RETRIES, type MachineState, type MachineEvent, type Frame, type Effect } from "../src/core.ts";
+import { initialState, transition, parseConfig, classifyFailure, MAX_COMPACTION_RETRIES, restoreHistory, type HistoryItem, type MachineState, type MachineEvent, type Frame, type Effect } from "../src/core.ts";
 
 const config = parseConfig({ mode: "enforce", main: { soft: 100, handoff: 200, hard: 1000, minProgress: 50 } });
 const f: Frame = { mode: "enforce", tokens: 300, thresholds: config.main, config, wrapped: false };
@@ -85,11 +85,54 @@ test("idle handoff commits at the next turn boundary without requesting another 
   step({ type: "tool_end", tool: "read", id: "blocked-idle", error: true });
   assert.deepEqual(kinds(step({ type: "handoff_prepare" })), ["reject_handoff"]);
   const effects = step({ type: "turn_end", usage: 100 });
-  assert.deepEqual(effects.filter(e => e.type === "commit"), [{ type: "commit", handoff: h }]);
+  assert.deepEqual(effects.filter(e => e.type === "commit"), [{ type: "commit", handoff: h, source: "idle" }]);
   assert.equal(state.tokens, null);
   assert.equal(state.floor, null);
-  assert.equal(state.count, 1);
+  assert.equal(state.count, 0);
+  assert.deepEqual(state.handoffTurns, []);
   assert.equal(state.pending, undefined);
+});
+test("idle commits outlive the session cap; budget and hard commits still hit it", () => {
+  for (const source of ["idle", "budget", "hard"] as const) {
+    const idle = source === "idle";
+    const c = { ...config, idleMinTokens: 50,
+      loop: idle ? config.loop : { ...config.loop, maxHandoffsWithoutProgress: config.maxHandoffsPerSession + 1 } };
+    const frame = { ...f, config: c, tokens: idle ? 100 : source === "hard" ? 1200 : 300 };
+    let state = base();
+    for (let n = 0; n < (idle ? c.maxHandoffsPerSession + 5 : c.maxHandoffsPerSession); n++) {
+      state = transition(state, { type: "before_agent_start" }, frame).state;
+      state = transition(state, { type: "turn_end", usage: 100 }, { ...frame, tokens: 100 }).state;
+      const request = transition(state, { type: "agent_before_settle", pendingWork: true }, frame);
+      assert.deepEqual(kinds(request.effects), ["steer"]);
+      assert.equal(request.state.settleRequest, idle ? "idle" : "budget");
+      state = transition(request.state, { type: "handoff_written", handoff: h }, frame).state;
+      const commit = transition(state, { type: "turn_end", usage: frame.tokens }, frame);
+      assert.deepEqual(kinds(commit.effects), ["commit"], `${source} commit ${n + 1}`);
+      state = commit.state;
+      assert.equal(state.count, idle ? 0 : n + 1);
+      assert.equal(state.handoffTurns.length, idle ? 0 : n + 1);
+      const tools = transition(state, { type: "tool_call", tool: "read", id: `${source}-${n}` }, { ...frame, tokens: null });
+      assert.deepEqual(kinds(tools.effects), !idle && n + 1 === c.maxHandoffsPerSession ? ["block"] : []);
+    }
+  }
+});
+test("history restoration excludes tagged idle commits but counts budget and legacy commits", () => {
+  const history: HistoryItem[] = Array.from({ length: config.maxHandoffsPerSession + 5 }, () => ({ type: "compaction", owned: true, source: "idle" }));
+  const idle = restoreHistory(history, "enforce");
+  assert.equal(idle.count, 0);
+  assert.deepEqual(idle.handoffTurns, []);
+  const budget = restoreHistory([...history, { type: "compaction", owned: true, source: "budget" }, { type: "compaction", owned: true }], "enforce");
+  assert.equal(budget.count, 2);
+  assert.equal(budget.handoffTurns.length, 2);
+});
+test("owned idle-input compaction does not consume budget or loop limits", () => {
+  const frame = { ...f, tokens: 100, config: { ...config, keepRecentTokens: 10 } };
+  const started = transition(base({ stored: h, lastSettled: 1 }), { type: "input", now: 4000000, streaming: false, alreadyCompacted: false }, frame);
+  const backstop = transition(started.state, { type: "session_before_compact", reason: "manual" }, frame);
+  assert.ok(backstop.effects.some(e => e.type === "backstop" && e.source === "idle"));
+  const completed = transition(backstop.state, { type: "session_compact", owned: true }, frame);
+  assert.equal(completed.state.count, 0);
+  assert.deepEqual(completed.state.handoffTurns, []);
 });
 test("manual unowned errors never poison fallback; owned transient errors have a bounded retry budget", () => {
   const no = transition(base(), { type: "session_compact_failed", reason: "manual", errorMessage: "EACCES" }, { ...f, tokens: 100 });

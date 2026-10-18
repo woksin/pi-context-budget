@@ -176,7 +176,8 @@ test("idle handoff resets before a notification or new run within the idle windo
     assert.equal(draft.entries[0].firstKeptEntryId, null);
     assert.equal(draft.entries[0].details.path, result.details.handoff.path);
     assert.equal(draft.entries[0].summary, result.details.handoff.text);
-    assert.equal(h.status().handoffCount, 1);
+    assert.equal(h.status().handoffCount, 0);
+    assert.equal(draft.entries[0].details.source, "idle");
     assert.equal(h.status().tokens, null);
     assert.equal(h.status().floor, null);
     h.setTokens(null);
@@ -191,6 +192,10 @@ test("idle handoff resets before a notification or new run within the idle windo
     const commits = h.events().filter(e => e.event === "handoff_committed");
     assert.equal(commits.length, 1);
     assert.equal(commits[0].path, result.details.handoff.path);
+    assert.equal(commits[0].source, "idle");
+    h.branch.push(draft.entries[0]);
+    await h.emit("session_tree");
+    assert.equal(h.status().handoffCount, 0);
   } finally { global[key] = previous; }
 });
 test("blocked sibling keeps pending handoff; already-running sibling invalidates it", async () => {

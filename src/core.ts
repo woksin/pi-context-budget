@@ -87,6 +87,7 @@ export function modelThresholds(config: Config, model: string, sub: boolean): Th
 }
 export type Phase = "idle" | "soft-notified" | "handoff-required" | "handoff-pending-commit" | "compacting" | "fallback-armed";
 export type Fallback = "hard" | "loop" | "cap" | "compaction";
+export type CommitSource = "idle" | "budget";
 type BudgetAction = "none" | "handoff" | "relaunch";
 export type FailureClass = "cancelled" | "nothing-to-compact" | "transient" | "persistent";
 export const MAX_COMPACTION_RETRIES = 2;
@@ -94,7 +95,7 @@ export interface MachineState {
   phase: Phase; mode: Mode; tokens: number | null; floor: number | null;
   turn: number; count: number; handoffTurns: number[]; softNotified: boolean;
   settleRequest: "none" | "budget" | "idle";
-  pending?: Handoff; stored?: Handoff; lastHandoff?: Handoff;
+  pending?: Handoff; pendingSource?: CommitSource; stored?: Handoff; lastHandoff?: Handoff;
   failures: number; compactionFallback: boolean;
   compaction?: { id: number; origin: "idle" | "backstop" };
   attempt: number; blockedCalls: string[]; lastSettled: number; observedIdle: boolean;
@@ -127,9 +128,9 @@ export type Effect =
   | { type: "reject_handoff"; reason: string }
   | { type: "block"; reason: string }
   | { type: "steer"; idleOnly: boolean }
-  | { type: "commit"; handoff: Handoff }
+  | { type: "commit"; handoff: Handoff; source: CommitSource }
   | { type: "compact"; attempt: number }
-  | { type: "backstop"; handoff?: Handoff; tokensBefore: number }
+  | { type: "backstop"; handoff?: Handoff; tokensBefore: number; source: CommitSource }
   | { type: "relaunch"; handoff?: Handoff }
   | { type: "cancel_compaction" };
 type LogEffect = Extract<Effect, { type: "log" }>;
@@ -154,14 +155,15 @@ export function fallbackFor(s: MachineState, f: Frame): Fallback | undefined {
 function handoffRequired(s: MachineState, f: Frame): boolean {
   return s.tokens !== null && s.floor !== null && s.tokens >= f.thresholds.handoff && s.tokens - s.floor >= f.thresholds.minProgress;
 }
-function committed(s: MachineState): void {
-  s.count++; s.handoffTurns.push(s.turn); s.tokens = s.floor = null;
-  s.stored = s.pending ?? s.stored; s.pending = undefined;
+function committed(s: MachineState, source: CommitSource): void {
+  if (source !== "idle") { s.count++; s.handoffTurns.push(s.turn); }
+  s.tokens = s.floor = null;
+  s.stored = s.pending ?? s.stored; s.pending = undefined; s.pendingSource = undefined;
   s.softNotified = false; s.settleRequest = "none";
   s.compaction = undefined; s.failures = 0; s.compactionFallback = s.relaunchSent = false;
 }
 function resetEnforcement(s: MachineState): void {
-  s.pending = s.stored = undefined; s.compaction = undefined; s.blockedCalls = [];
+  s.pending = s.stored = undefined; s.pendingSource = undefined; s.compaction = undefined; s.blockedCalls = [];
   s.settleRequest = "none"; s.failures = 0; s.compactionFallback = s.relaunchSent = false;
   s.lastAction = "none";
 }
@@ -256,7 +258,7 @@ function active(s: MachineState, e: MachineEvent, f: Frame): Effect[] {
     case "tool_end": {
       if (s.blockedCalls.includes(e.id)) { s.blockedCalls = s.blockedCalls.filter(id => id !== e.id); return []; }
       if (e.tool !== "context_handoff") {
-        s.pending = s.stored = undefined;
+        s.pending = s.stored = undefined; s.pendingSource = undefined;
         if (!e.error) s.handoffTurns = [];
       }
       return [];
@@ -266,12 +268,14 @@ function active(s: MachineState, e: MachineEvent, f: Frame): Effect[] {
       : [{ type: "write_handoff", idleOnly: s.settleRequest === "idle" }];
     case "handoff_written":
       s.lastHandoff = s.stored = s.pending = e.handoff;
+      s.pendingSource = s.settleRequest === "idle" ? "idle" : "budget";
       return [];
     case "turn_end": {
       // Hard means WITHOUT a usable handoff. Cap/loop must not be bypassed by another handoff.
       const usable = s.pending ?? (fallback === "hard" || handoffRequired(s, f) ? s.stored : undefined);
       if (usable && fallback !== "loop" && fallback !== "cap" && s.providerFailure === "none") {
-        committed(s); return [{ type: "commit", handoff: usable }];
+        const source = s.pendingSource ?? "budget";
+        committed(s, source); return [{ type: "commit", handoff: usable, source }];
       }
       if (s.tokens === null || s.tokens < f.thresholds.soft) s.softNotified = false;
       if (!s.softNotified && (s.tokens ?? 0) >= f.thresholds.soft) { s.softNotified = true; return [{ type: "notify" }]; }
@@ -298,7 +302,8 @@ function active(s: MachineState, e: MachineEvent, f: Frame): Effect[] {
       }
       return [];
     case "session_before_compact":
-      startCompaction(s, "backstop"); return [{ type: "backstop", handoff: s.stored, tokensBefore: e.tokensBefore ?? s.tokens ?? 0 }];
+      startCompaction(s, "backstop"); return [{ type: "backstop", handoff: s.stored, tokensBefore: e.tokensBefore ?? s.tokens ?? 0,
+        source: s.compaction!.origin === "idle" ? "idle" : "budget" }];
     case "session_compact_failed": return compactionFailed(s, e);
     case "backstop_failed":
       startCompaction(s, "backstop");
@@ -320,10 +325,10 @@ export function transition(previous: MachineState, event: MachineEvent, frame: F
     if (s.floor === null && event.usage !== undefined && s.providerFailure === "none") s.floor = event.usage;
   }
   if (event.type === "before_agent_start") {
-    s.pending = s.stored = undefined; s.settleRequest = "none"; s.providerFailure = "none";
+    s.pending = s.stored = undefined; s.pendingSource = undefined; s.settleRequest = "none"; s.providerFailure = "none";
   }
   if (event.type === "session_compact") {
-    if (event.owned && s.mode === "enforce") committed(s);
+    if (event.owned && s.mode === "enforce") committed(s, s.compaction?.origin === "idle" ? "idle" : "budget");
     else { s.tokens = s.floor = null; s.compaction = undefined; s.compactionFallback = false; s.failures = 0; s.relaunchSent = false; }
   }
   const effects = s.mode === "enforce" ? active(s, event, frame) : [];
@@ -335,7 +340,7 @@ export function transition(previous: MachineState, event: MachineEvent, frame: F
   return { state: s, effects: s.mode === "enforce" ? [...policyTrace(s, event, frame), ...effects] : effects };
 }
 
-export type HistoryItem = { type: "input" } | { type: "usage"; tokens: number } | { type: "compaction"; owned: boolean }
+export type HistoryItem = { type: "input" } | { type: "usage"; tokens: number } | { type: "compaction"; owned: boolean; source?: CommitSource }
   | { type: "tool"; handoff?: Handoff; error?: boolean };
 /** Restore persisted observations without replaying historical policy effects. */
 export function restoreHistory(history: HistoryItem[], mode: Mode): MachineState {
@@ -345,7 +350,7 @@ export function restoreHistory(history: HistoryItem[], mode: Mode): MachineState
     if (e.type === "usage") { s.turn++; s.tokens = e.tokens; s.floor ??= e.tokens; }
     if (e.type === "compaction") {
       s.tokens = s.floor = null;
-      if (e.owned) { s.count++; s.handoffTurns.push(s.turn); }
+      if (e.owned && e.source !== "idle") { s.count++; s.handoffTurns.push(s.turn); }
     }
     if (e.type === "tool") {
       if (e.handoff) s.stored = s.lastHandoff = e.handoff;

@@ -117,9 +117,9 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
               ? "Pending background work remains and context is large. Call context_handoff now while the cache is warm, then end this turn. The context resets at the end of this turn."
               : "Context recovery is required. Call context_handoff with goal, next_step, verified facts and verbatim user_constraints, then end this turn without further tools." }], continue: true }; break;
           case "commit":
-            log(ctx, "handoff_committed", { path: effect.handoff.path, n: effect.handoff.n, count: state.count });
+            log(ctx, "handoff_committed", { path: effect.handoff.path, n: effect.handoff.n, count: state.count, source: effect.source });
             result = { entries: [{ type: "compaction", summary: effect.handoff.text, firstKeptEntryId: null,
-              details: { kind: "handoff", path: effect.handoff.path, n: effect.handoff.n } }], continue: true }; break;
+              details: { kind: "handoff", path: effect.handoff.path, n: effect.handoff.n, source: effect.source } }], continue: true }; break;
           case "compact": await compact(ctx, effect.attempt); break;
           case "backstop": {
             // Mechanical recovery must fit and work even if handoff storage/metadata is unavailable.
@@ -127,7 +127,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
             const summary = `${h?.text ?? `# Emergency handoff\n${emergency!.goal}\n${emergency!.facts}\n${emergency!.next_step}`}\nCompaction instance: ${randomUUID()}\n`;
             log(ctx, "backstop", { path: h?.path, reason: "machine-authorized" });
             result = { compaction: { summary, firstKeptEntryId: null as unknown as string, tokensBefore: effect.tokensBefore,
-              details: { kind: "handoff", path: h?.path, n: h?.n } } }; break;
+              details: { kind: "handoff", path: h?.path, n: h?.n, source: effect.source } } }; break;
           }
           case "relaunch": {
             if (!frame(ctx).wrapped) break;
@@ -150,7 +150,10 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
       host?.release(); host = hosts.acquire(ctx.sessionManager.getSessionId());
       reload(ctx); knownIds.clear();
       const history: HistoryItem[] = ctx.sessionManager.getBranch().flatMap((e): HistoryItem[] => {
-        if (e.type === "compaction") return [{ type: "compaction", owned: (e.details as { kind?: string })?.kind === "handoff" }];
+        if (e.type === "compaction") {
+          const details = e.details as { kind?: string; source?: string } | undefined;
+          return [{ type: "compaction", owned: details?.kind === "handoff", source: details?.source === "idle" ? "idle" : "budget" }];
+        }
         if (e.type !== "message") return [];
         const m = e.message;
         if (m.role === "user") return [{ type: "input" }];
