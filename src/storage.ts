@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
-import { appendFileSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { boundedAutoState, isSubagent, type AutoState, type Handoff } from "./core.ts";
 
@@ -60,22 +61,43 @@ export function gitState(cwd: string): Pick<AutoState, "cwd" | "root" | "branch"
   };
   return { cwd: resolve(cwd), root: git("rev-parse", "--show-toplevel") || resolve(cwd), branch: git("branch", "--show-current") || "unknown/detached", head: git("rev-parse", "HEAD") || "unknown" };
 }
-interface RunningRecord { id?: string; agentId?: string; status?: string; cwd?: string; command?: string; kind?: string; logPath?: string; description?: string; session?: { sessionId?: string } }
+interface RunningRecord { id?: string; agentId?: string; status?: string; cwd?: string; command?: string; kind?: string; label?: string; until?: string; intervalSeconds?: number; timeoutSeconds?: number; logPath?: string; description?: string; session?: { sessionId?: string } }
 interface SubRegistry { hasRunning?: () => boolean; listAgents?: () => RunningRecord[]; getRecord?: (id: string) => RunningRecord | undefined }
 interface JobRegistry { list: () => RunningRecord[] }
-export function runningState(knownIds: string[] = []): Pick<AutoState, "jobs" | "subagents" | "unavailable"> {
+export function subagentTaskDir(cwd: string, sessionId: string): string {
+  const encoded = cwd.replace(/[/\\]/g, "-").replace(/^[A-Za-z]:-/, "").replace(/^-+/, "");
+  return join(tmpdir(), `pi-subagents-${process.getuid?.() ?? 0}`, encoded, sessionId, "tasks");
+}
+export function runningState(knownIds: string[] = [], session?: { cwd: string; sessionId: string; taskDir?: string }): Pick<AutoState, "jobs" | "subagents" | "unavailable"> {
   const global = globalThis as Record<symbol, unknown>;
   const unavailable: string[] = [];
   const subagents: unknown[] = [], jobs: unknown[] = [];
-  const brief = (r: RunningRecord) => ({ id: r.id ?? r.agentId, status: r.status, cwd: r.cwd, command: r.command, kind: r.kind, logPath: r.logPath, description: r.description });
+  const brief = (r: RunningRecord) => ({ id: r.id ?? r.agentId, status: r.status, cwd: r.cwd, command: r.command, kind: r.kind, label: r.label, until: r.until, intervalSeconds: r.intervalSeconds, timeoutSeconds: r.timeoutSeconds, logPath: r.logPath, description: r.description });
   try {
     const sub = global[Symbol.for("pi-subagents:manager")] as SubRegistry | undefined;
     if (!sub) unavailable.push("pi-subagents registry absent");
     else {
-      const records = sub.listAgents?.() ?? knownIds.map(id => sub.getRecord?.(id)).filter((r): r is RunningRecord => !!r);
+      let enumerated = !!sub.listAgents;
+      const ids = new Set(knownIds);
+      if (!sub.listAgents && session && sub.getRecord) {
+        try {
+          for (const file of readdirSync(session.taskDir ?? subagentTaskDir(session.cwd, session.sessionId)).sort()) {
+            if (file.endsWith(".output")) ids.add(file.slice(0, -7));
+          }
+          enumerated = true;
+        } catch (error) {
+          // No task directory is normal before the first spawn, but not proof
+          // of an empty inventory when the manager says work is pending.
+          enumerated = (error as NodeJS.ErrnoException).code === "ENOENT" && sub.hasRunning?.() === false;
+        }
+      }
+      const records = sub.listAgents?.() ?? [...ids].map(id => sub.getRecord?.(id)).filter((r): r is RunningRecord => !!r);
       subagents.push(...records.filter(r => r.status === "running" || r.status === "queued").map(brief));
-      if (sub.hasRunning?.() && !subagents.length) subagents.push({ status: "running", detail: "Registry reports pending work; ids unavailable" });
-      if (!sub.listAgents) unavailable.push("pi-subagents registry cannot enumerate; captured known ids only");
+      if (sub.hasRunning?.() && !subagents.length) {
+        subagents.push({ status: "running", detail: "Registry reports pending work; ids unavailable" });
+        enumerated = false;
+      }
+      if (!enumerated) unavailable.push("pi-subagents enumeration unavailable; captured known ids only");
     }
   } catch { unavailable.push("pi-subagents registry unreadable"); }
   try {

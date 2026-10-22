@@ -44,6 +44,7 @@ The configuration path is **`getAgentDir()/context-budget.json`**, or `PI_CONTEX
 ```json
 {
   "mode": "observe",
+  "resumeChecks": {},
   "main": { "soft": 300000, "handoff": 400000, "hard": 600000, "minProgress": 50000 },
   "subagent": { "soft": 150000, "handoff": 200000, "hard": 300000, "minProgress": 25000 },
   "models": {
@@ -60,6 +61,7 @@ The configuration path is **`getAgentDir()/context-budget.json`**, or `PI_CONTEX
 | Field | Meaning |
 |---|---|
 | `mode` | `off`, `observe` (default), or `enforce` |
+| `resumeChecks` | Optional map of exact session names to trusted shell commands; default `{}` (disabled). `PI_RESUME_CHECK` takes precedence. |
 | `enforceCwds` | Optional array of absolute directory prefixes/globs. Outside it, enforce becomes observe. Empty array enforces nowhere. |
 | `main`, `subagent` | Soft/handoff/hard thresholds and minimum growth above the measured context floor |
 | `models` | Exact `provider/model-id` overrides, merged separately into main/subagent thresholds |
@@ -111,7 +113,9 @@ Optional: `decisions` (and why), `user_constraints`, `open_items`, `hypotheses`,
 
 Automatic metadata: timestamp, cwd/repository root, git branch/HEAD, pending jobs/watches/subagents, and this session's issue claims when the corresponding integrations are present. Agent-written facts remain claims until rechecked; automatic git state is recorded separately.
 
-Files: `<repo-root or cwd>/.ai-work/handoffs/<sessionId>-<n>.md` plus JSON sidecar. Markdown is capped at **12,288 UTF-8 bytes**, including automatic state. Automatic observations have separate fixed budgets with explicit truncation/omission counts, so unbounded job or claim volume cannot consume the whole narrative budget; user constraints are never truncated. Oversize is a clear tool error, never silent truncation. Each summary has a unique heading; retain-none compaction replaces previous summaries instead of stacking them. Read the handoff, verify HEAD and external state, then continue from Next step without asking the user to restate the task.
+**Sensitive data:** full job commands, including any inline tokens or credentials, appear in the handoff. Avoid putting secrets in commands and treat handoff files as sensitive.
+
+Files: `<repo-root or cwd>/.ai-work/handoffs/<sessionId>-<n>.md` plus JSON sidecar. Markdown is capped at **49,152 UTF-8 bytes (48 KiB)**. The split reserves the previous **12 KiB for narrative**, with **16 KiB for jobs/watches**, **4 KiB for subagents**, **4 KiB for resume-check output**, **768 bytes for claims** (plus an omission marker), and the remaining headroom for bounded metadata, headings and paths. Unbounded job or claim volume cannot consume the narrative allowance; user constraints are never truncated. Jobs render as `id | label | kind | until | intervalSeconds | full command | cwd | logPath`; genuinely absent fields are `-`. Commands stay intact unless their whole line exceeds 600 characters, then that line ends with `…(cut, N chars)` (N is the original line length). The job budget fits about 20 such lines; further records have an explicit omission count. Oversize is a clear tool error, never silent truncation. Each summary has a unique heading; retain-none compaction replaces previous summaries instead of stacking them. Read the handoff, verify HEAD and external state, then continue from Next step without asking the user to restate the task.
 
 ### Idle reset
 
@@ -136,6 +140,19 @@ To restore automatic overflow recovery, enable pi compaction and choose model-sp
 ```
 
 This triggers above 620,000 (`window - reserveTokens`). Use your actual model id/window and choose `reserveTokens = window - (hard + safetyMargin)`, with positive reserve and adequate output space. Per-model pi settings cannot express distinct main/child reserves. **Do not enable automatic compaction in uninstrumented live processes**; they could invoke the default summarizer before this hook exists.
+
+### Optional resume checks
+
+Set a trusted operator command with `PI_RESUME_CHECK='bash /absolute/path/resume-check.sh'`, or configure exact session names in `context-budget.json`:
+
+```json
+{ "resumeChecks": { "coordinator": "bash /absolute/path/resume-check.sh" } }
+```
+
+The nonempty env value wins, then the current Pi session name is looked up in the map. With neither source, this is completely off. In enforce mode only (respecting cwd restrictions and guard-off, and skipping subagent sessions), `bash -c` runs in the session cwd immediately before a handoff is written, under `## Resume check`, and again after a committed handoff context reset, before the first resumed provider call. Fresh results are injected into that call's context and retained there for subsequent calls until the next reset; the command runs once per boundary, not once per tool. The command inherits the process environment; the extension never sets identity variables globally. Only configure commands you trust (prefer read-only checks).
+
+Combined stdout/stderr is capped so the result, command label and exit status fit within 4 KiB. Nonzero exit, spawn error, truncation and timeout are visible, never a reason to abort the handoff/reset. A **30-second timeout kills the process group**, then allows at most one second for output to drain before closing the pipes and returning a timed-out result. Direct child exit also starts a one-second drain limit, so inherited pipes cannot hang the check. Escaped descendants may outlive the check; commands should not daemonize/escape that group. These observations complement, not replace, verification of external state.
+
 
 ## `pi-session` wrapper
 
@@ -172,7 +189,7 @@ Markers are `<pid>-<random-launch-nonce>.json` with `cwd`, nullable `launchPromp
 - Append-only events: `getAgentDir()/context-budget/events.jsonl` (crossings, blocks, handoffs, idle/backstop/fallback, `would_*` and errors). `PI_CONTEXT_BUDGET_STATE_DIR` redirects both.
 - Status files survive exit: check PID/session identity before assuming liveness. Hook failures log and continue; telemetry write failures must not prevent a handoff commit.
 - Read committed session JSONL entries (`type: "compaction"`, `details.kind: "handoff"`) rather than expecting `session_compact` for turn-end drafts. A file write/commit-intent event alone is not proof that pi appended the boundary.
-- Optional integrations use the `pi-jobs.liveManagers` and `pi-subagents:manager` Symbol registries, and `<agentDir>/issue-work/registry.jsonl`. Missing data is labelled unavailable. Job managers are process-wide and can include sibling sessions. The current subagent registry cannot enumerate: known tool-result ids are captured; unknown running work is explicitly reported.
+- Optional integrations use the `pi-jobs.liveManagers` and `pi-subagents:manager` Symbol registries, and `<agentDir>/issue-work/registry.jsonl`. Missing data is labelled unavailable. Job managers are process-wide and can include sibling sessions. When `listAgents` is unavailable, the extension discovers ids in this session’s `$TMPDIR/pi-subagents-<uid>/<cwd-slug>/<sessionId>/tasks/*.output` directory and calls the live registry’s `getRecord` for each id, combined with known tool-result ids. Only authoritative running/queued records render, as `id | status | description`; stale files do not resurrect finished work. No transcript content is trusted as status. An inaccessible task directory/registry or pending work with no discoverable ids is labelled unavailable; an empty inventory is not an error. Job managers remain process-wide, while task-directory discovery is session-scoped.
 - In-process subagents inherit the root environment but **do not own its wrapper**; current child sessions have no shutdown binding. They never write the parent's marker. Hard-limit handoffs can still recover in-process; loop/cap or unrecoverable fallback requires parent/operator intervention.
 - No automatic event-log rotation or handoff deletion. Files may contain sensitive user constraints, paths and task state; keep them private.
 

@@ -334,3 +334,92 @@ test("hook I/O failures are logged, backstop cancels instead of default summariz
   assert.ok(h.events().some(e => e.event === "hook_error"));
   assert.ok(h.events().some(e => e.event === "backstop_error"));
 });
+
+test("resume check runs before writing and only after a committed reset, before the resumed context", async t => {
+  const old = process.env.PI_RESUME_CHECK;
+  delete process.env.PI_RESUME_CHECK;
+  t.after(() => { if (old === undefined) delete process.env.PI_RESUME_CHECK; else process.env.PI_RESUME_CHECK = old; });
+  const h = await harness("enforce", { resumeChecks: { L0: "printf x >> checks; cat checks" } });
+  (h.ctx.sessionManager as any).getSessionName = () => "L0";
+  assert.equal(await h.emit("context", { messages: [] }), undefined);
+  const result = await h.handoff(), file = result.details.handoff.path;
+  assert.match(readFileSync(file, "utf8"), /## Resume check\ncommand: .*\nexit: 0\nx/);
+  assert.equal(readFileSync(join(h.dir, "checks"), "utf8"), "x");
+  assert.equal(await h.emit("context", { messages: [] }), undefined); // not reset yet
+  const committed = await h.turn();
+  h.branch.push({ ...committed.entries[0], id: "boundary-1" });
+  h.setTokens(null);
+  const resumed = await h.emit("context", { messages: [] });
+  assert.match(resumed.messages[0].content, /after context reset.*\ncommand: .*\nexit: 0\nxx/s);
+  assert.equal(readFileSync(join(h.dir, "checks"), "utf8"), "xx");
+  await h.emit("context", { messages: [] });
+  assert.equal(readFileSync(join(h.dir, "checks"), "utf8"), "xx"); // no rerun per tool turn
+  const second = await h.emit("session_before_compact", { reason: "manual" });
+  h.branch.push({ type: "compaction", id: "boundary-2", details: second.compaction.details });
+  await h.emit("context", { messages: [] });
+  assert.equal(readFileSync(join(h.dir, "checks"), "utf8"), "xxx");
+});
+
+test("env resume check beats config; nonzero status does not break either injection point", async t => {
+  const old = process.env.PI_RESUME_CHECK;
+  process.env.PI_RESUME_CHECK = "echo from-env; exit 9";
+  t.after(() => { if (old === undefined) delete process.env.PI_RESUME_CHECK; else process.env.PI_RESUME_CHECK = old; });
+  const h = await harness("enforce", { resumeChecks: { L0: "echo from-config" } });
+  (h.ctx.sessionManager as any).getSessionName = () => "L0";
+  const handoff = await h.handoff();
+  assert.match(handoff.details.handoff.text, /exit: 9\nfrom-env/);
+  assert.ok(!handoff.details.handoff.text.includes("from-config"));
+  const committed = await h.turn();
+  h.branch.push({ ...committed.entries[0], id: "env-boundary" });
+  assert.match((await h.emit("context", { messages: [] })).messages[0].content, /exit: 9\nfrom-env/);
+});
+
+test("resume commands stay inactive in off/observe and guard-off; unconfigured enforcement stays unchanged", async t => {
+  const old = process.env.PI_RESUME_CHECK;
+  process.env.PI_RESUME_CHECK = "touch should-not-run";
+  t.after(() => { if (old === undefined) delete process.env.PI_RESUME_CHECK; else process.env.PI_RESUME_CHECK = old; });
+  for (const m of ["off", "observe"]) {
+    const h = await harness(m);
+    await h.handoff();
+    h.branch.push({ type: "compaction", id: m, details: { kind: "handoff" } });
+    assert.equal(await h.emit("context", { messages: [] }), undefined);
+    assert.equal(existsSync(join(h.dir, "should-not-run")), false);
+  }
+  const h = await harness("enforce", {}, true), key = Symbol.for("context-budget:test-guard");
+  const global = globalThis as Record<symbol, unknown>, previous = global[key];
+  global[key] = true;
+  try {
+    await h.handoff();
+    h.branch.push({ type: "compaction", id: "guard-off", details: { kind: "handoff" } });
+    assert.equal(await h.emit("context", { messages: [] }), undefined);
+    assert.equal(existsSync(join(h.dir, "should-not-run")), false);
+  } finally { global[key] = previous; }
+  delete process.env.PI_RESUME_CHECK;
+  const disabled = await harness();
+  assert.ok(!(await disabled.handoff()).details.handoff.text.includes("## Resume check"));
+  disabled.branch.push({ type: "compaction", id: "disabled", details: { kind: "handoff" } });
+  assert.equal(await disabled.emit("context", { messages: [] }), undefined);
+});
+
+test("enforced in-process subagents skip inherited and configured resume checks at both injection points", async t => {
+  const old = process.env.PI_RESUME_CHECK;
+  process.env.PI_RESUME_CHECK = "touch should-not-run";
+  t.after(() => { if (old === undefined) delete process.env.PI_RESUME_CHECK; else process.env.PI_RESUME_CHECK = old; });
+  const hosts = new SessionHosts(), parent = hosts.acquire("primary");
+  t.after(() => parent.release());
+  const h = await harness("enforce", { resumeChecks: { coordinator: "touch should-not-run" } }, false, hosts);
+  t.after(() => h.emit("session_shutdown"));
+  (h.ctx.sessionManager as any).getSessionName = () => "coordinator";
+  const check = async (id: string) => {
+    const handoff = await h.handoff();
+    assert.ok(!handoff.details.handoff.text.includes("## Resume check"));
+    const committed = await h.turn();
+    h.branch.push({ ...committed.entries[0], id });
+    assert.equal(await h.emit("context", { messages: [] }), undefined);
+    assert.equal(existsSync(join(h.dir, "should-not-run")), false);
+  };
+  assert.equal(h.status().role, "subagent");
+  await check("env-subagent");
+  delete process.env.PI_RESUME_CHECK;
+  await check("configured-subagent");
+});

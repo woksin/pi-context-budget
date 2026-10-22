@@ -4,8 +4,9 @@ import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
-import { effectiveMode, modelThresholds, parseConfig, renderHandoff, ownsWrapper, initialState, transition, policyStatus,
+import { effectiveMode, modelThresholds, parseConfig, renderHandoff, validateHandoff, ownsWrapper, initialState, transition, policyStatus,
   restoreHistory, type Effect, type Frame, type MachineEvent, type Handoff, type HandoffInput, type HistoryItem } from "./core.ts";
+import { resumeCommand, runResumeCheck } from "./resume-check.ts";
 import { appendEvent, atomicJson, gitState, issueClaims, runningState, writeHandoff, writeMarker, processSessionHosts, type SessionHosts } from "./storage.ts";
 
 type ActionResult = BoundaryResult & ToolCallEventResult & SessionBeforeCompactResult;
@@ -21,6 +22,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
     let host: ReturnType<SessionHosts["acquire"]> | undefined;
     let sequence = 0;
     const knownIds = new Set<string>();
+    let resumeBoundary: string | undefined, resumeMessage: string | undefined;
     let isGuardOff: ((name: string) => boolean) | undefined;
     try { isGuardOff = (await import(pathToFileURL(join(agentDir, "lib/guards.ts")).href)).isGuardOff; }
     catch { /* Optional integration: absence never disables configured enforcement. */ }
@@ -62,14 +64,21 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
       } catch (error) { log(ctx, "status_error", { error: String(error) }); }
     }
     function autoState(ctx: ExtensionContext) {
-      const running = runningState([...knownIds]);
+      const running = runningState([...knownIds], { cwd: ctx.cwd, sessionId: ctx.sessionManager.getSessionId() });
       let claims: unknown[] = [];
       try { claims = issueClaims(join(agentDir, "issue-work/registry.jsonl"), ctx.sessionManager.getSessionId()); }
       catch { running.unavailable.push("issue_work registry absent/unreadable"); }
       return { ...gitState(ctx.cwd), ...running, claims };
     }
-    function createHandoff(ctx: ExtensionContext, input: HandoffInput): Handoff {
-      const auto = autoState(ctx), id = ctx.sessionManager.getSessionId();
+    function checkCommand(ctx: ExtensionContext) {
+      if (host?.subagent) return undefined;
+      return resumeCommand(config, ctx.sessionManager.getSessionName?.());
+    }
+    async function createHandoff(ctx: ExtensionContext, input: HandoffInput): Promise<Handoff> {
+      validateHandoff(input);
+      const command = checkCommand(ctx);
+      const resumeCheck = command ? await runResumeCheck(command, ctx.cwd) : undefined;
+      const auto = { ...autoState(ctx), resumeCheck }, id = ctx.sessionManager.getSessionId();
       let path: string;
       do { path = join(auto.root, ".ai-work/handoffs", `${id}-${++sequence}.md`); } while (existsSync(path));
       const h = renderHandoff(input, auto, id, sequence, path, new Date().toISOString());
@@ -131,7 +140,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
           }
           case "relaunch": {
             if (!frame(ctx).wrapped) break;
-            const h = effect.handoff ?? createHandoff(ctx, emergencyInput(ctx));
+            const h = effect.handoff ?? await createHandoff(ctx, emergencyInput(ctx));
             writeMarker(process.env.PI_RELAUNCH_MARKER!, { cwd: resolve(ctx.cwd), launchPrompt: h.launchPrompt ?? null,
               handoff: h.path, sessionFile: ctx.sessionManager.getSessionFile() ?? null });
             log(ctx, "relaunch", { marker: process.env.PI_RELAUNCH_MARKER, path: h.path });
@@ -148,7 +157,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
     };
     function reset(ctx: ExtensionContext): void {
       host?.release(); host = hosts.acquire(ctx.sessionManager.getSessionId());
-      reload(ctx); knownIds.clear();
+      reload(ctx); knownIds.clear(); resumeBoundary = resumeMessage = undefined;
       const history: HistoryItem[] = ctx.sessionManager.getBranch().flatMap((e): HistoryItem[] => {
         if (e.type === "compaction") {
           const details = e.details as { kind?: string; source?: string } | undefined;
@@ -167,6 +176,19 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
     }
     pi.on("session_start", safe((_e, ctx) => { reset(ctx); log(ctx, "session_start", { mode: frame(ctx).mode, model: ref(ctx) }); }));
     pi.on("session_tree", safe((_e, ctx) => reset(ctx)));
+    // Context runs after Pi has installed the boundary and before the resumed
+    // provider call, including retain-none commits returned from turn_end.
+    pi.on("context", safe(async (event, ctx) => {
+      if (mode(ctx) !== "enforce") return;
+      const boundary = [...ctx.sessionManager.getBranch()].reverse().find(e => e.type === "compaction");
+      if (!boundary || (boundary.details as { kind?: string } | undefined)?.kind !== "handoff") return;
+      if (resumeBoundary !== boundary.id) {
+        resumeBoundary = boundary.id; resumeMessage = undefined;
+        const command = checkCommand(ctx);
+        if (command) resumeMessage = `## Resume check (after context reset)\n${await runResumeCheck(command, ctx.cwd)}`;
+      }
+      if (resumeMessage) return { messages: [...event.messages, { role: "custom" as const, customType: "context-budget-resume-check", content: resumeMessage, display: false, timestamp: Date.now() }] };
+    }));
     pi.on("agent_start", safe(async (_e, ctx) => { await run({ type: "agent_start" }, ctx); }));
     pi.on("before_agent_start", safe(async (_e, ctx) => { await run({ type: "before_agent_start" }, ctx); }));
     pi.registerTool({
@@ -184,7 +206,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
           await execute(effects, ctx);
           return { content: [{ type: "text", text: "Handoff inactive; no automatic action. Continue the task." }], details: {} };
         }
-        const handoff = createHandoff(ctx, input);
+        const handoff = await createHandoff(ctx, input);
         await run({ type: "handoff_written", handoff }, ctx);
         return { content: [{ type: "text", text: intent.idleOnly ? "Handoff stored. End this turn without further tools; the context resets at the end of this turn." : "Handoff stored. End this turn without further tools; recovery continues automatically." }], details: { handoff } };
       },
@@ -208,9 +230,9 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
       const result = await run({ type: "turn_end", usage: u ? u.input + u.output + u.cacheRead + u.cacheWrite : undefined, failure }, ctx);
       log(ctx, "turn", { tokens: state.tokens, floor: state.floor, phase: state.phase }); status(ctx); return result;
     }));
-    const pendingWork = () => { const r = runningState([...knownIds]); return !!(r.jobs.length || r.subagents.length); };
-    pi.on("agent_before_settle", safe((_e, ctx) => run({ type: "agent_before_settle", pendingWork: pendingWork() }, ctx)));
-    pi.on("agent_settled", safe(async (e, ctx) => { await run({ type: "agent_settled", now: Date.now(), aborted: e.aborted, pendingWork: pendingWork() }, ctx); }));
+    const pendingWork = (ctx: ExtensionContext) => { const r = runningState([...knownIds], { cwd: ctx.cwd, sessionId: ctx.sessionManager.getSessionId() }); return !!(r.jobs.length || r.subagents.length); };
+    pi.on("agent_before_settle", safe((_e, ctx) => run({ type: "agent_before_settle", pendingWork: pendingWork(ctx) }, ctx)));
+    pi.on("agent_settled", safe(async (e, ctx) => { await run({ type: "agent_settled", now: Date.now(), aborted: e.aborted, pendingWork: pendingWork(ctx) }, ctx); }));
     pi.on("input", safe(async (e, ctx) => {
       reload(ctx);
       await run({ type: "input", now: Date.now(), streaming: !!e.streamingBehavior, alreadyCompacted: ctx.sessionManager.getBranch().at(-1)?.type === "compaction" }, ctx);

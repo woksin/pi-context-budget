@@ -5,6 +5,7 @@ export interface Thresholds { soft: number; handoff: number; hard: number; minPr
 export interface Config {
   mode: Mode;
   enforceCwds?: string[];
+  resumeChecks?: Record<string, string>;
   main: Thresholds;
   subagent: Thresholds;
   models: Record<string, { main?: Partial<Thresholds>; subagent?: Partial<Thresholds> }>;
@@ -51,9 +52,14 @@ export function parseConfig(raw: unknown): Config {
     const m = object(value, ref);
     models[ref] = { main: thresholds(m.main, main), subagent: thresholds(m.subagent, subagent) };
   }
+  const resumeChecks: Record<string, string> = Object.create(null);
+  for (const [name, command] of Object.entries(v.resumeChecks === undefined ? {} : object(v.resumeChecks, "resumeChecks"))) {
+    if (typeof command !== "string" || !command.trim()) throw new Error("resumeChecks commands must be nonempty text");
+    resumeChecks[name] = command;
+  }
   const loop = v.loop === undefined ? {} : object(v.loop, "loop");
   return {
-    mode: mode as Mode, enforceCwds: allow as string[] | undefined, main, subagent, models,
+    mode: mode as Mode, resumeChecks, enforceCwds: allow as string[] | undefined, main, subagent, models,
     idleMinutes: positive(v.idleMinutes, 50, "idleMinutes"),
     idleMinTokens: positive(v.idleMinTokens, 300000, "idleMinTokens"),
     keepRecentTokens: positive(v.keepRecentTokens, 20000, "keepRecentTokens"),
@@ -368,6 +374,7 @@ export interface HandoffInput {
 export interface AutoState {
   cwd: string; root: string; branch: string; head: string;
   jobs: unknown[]; subagents: unknown[]; claims: unknown[]; unavailable: string[];
+  resumeCheck?: string;
 }
 export interface Handoff { text: string; path: string; n: number; at: string; launchPrompt?: string }
 export function validateHandoff(p: HandoffInput): void {
@@ -382,7 +389,35 @@ export function validateHandoff(p: HandoffInput): void {
   }
   if (p.launch_prompt !== undefined && !isAbsolute(p.launch_prompt)) throw new Error("launch_prompt must be an absolute path");
 }
-export const MAX_HANDOFF_BYTES = 12 * 1024;
+// 12 KiB narrative remains available alongside 16 KiB jobs, 4 KiB agents,
+// 4 KiB resume output, 768 B claims and bounded metadata/headings (48 KiB total).
+export const MAX_HANDOFF_BYTES = 48 * 1024;
+function stateField(value: unknown): string {
+  return value === undefined || value === null ? "-" : String(value).replace(/\r/g, "\\r").replace(/\n/g, "\\n");
+}
+export function jobLine(record: unknown): string {
+  if (typeof record === "string") return record;
+  const r = (record ?? {}) as Record<string, unknown>;
+  const line = [r.id, r.label, r.kind, r.until, r.intervalSeconds, r.command, r.cwd, r.logPath].map(stateField).join(" | ");
+  const chars = Array.from(line);
+  return chars.length > 600 ? chars.slice(0, 570).join("") + `…(cut, ${chars.length} chars)` : line;
+}
+export function subagentLine(record: unknown): string {
+  if (typeof record === "string") return record;
+  const r = (record ?? {}) as Record<string, unknown>;
+  return [r.id ?? r.agentId, r.status, r.description ?? r.detail].map(stateField).join(" | ");
+}
+function boundedLines(records: unknown[], render: (r: unknown) => string, budget: number): string[] {
+  const lines: string[] = [];
+  let bytes = 0;
+  for (const record of records) {
+    const line = render(record), size = Buffer.byteLength(line) + 1;
+    if (bytes + size > budget - 80) break;
+    lines.push(line); bytes += size;
+  }
+  if (lines.length < records.length) lines.push(`omitted: ${records.length - lines.length} records`);
+  return lines;
+}
 /** Automatic observations cannot consume the model's entire narrative budget. */
 export function boundedAutoState(auto: AutoState): AutoState {
   const short = (text: string) => Buffer.byteLength(text) > 256 ? Buffer.from(text).subarray(0, 250).toString("utf8") + "…" : text;
@@ -400,7 +435,8 @@ export function boundedAutoState(auto: AutoState): AutoState {
     return out;
   };
   return { cwd: short(auto.cwd), root: short(auto.root), branch: short(auto.branch), head: short(auto.head),
-    jobs: list(auto.jobs), subagents: list(auto.subagents), claims: list(auto.claims), unavailable: auto.unavailable.slice(0, 8).map(short) };
+    jobs: boundedLines(auto.jobs, jobLine, 16 * 1024), subagents: boundedLines(auto.subagents, subagentLine, 4 * 1024),
+    claims: list(auto.claims), unavailable: auto.unavailable.slice(0, 8).map(short), resumeCheck: auto.resumeCheck };
 }
 export function renderHandoff(p: HandoffInput, auto: AutoState, id: string, n: number, path: string, at: string): Handoff {
   validateHandoff(p);
@@ -413,7 +449,8 @@ export function renderHandoff(p: HandoffInput, auto: AutoState, id: string, n: n
     p.open_items && `## Open items\n${p.open_items}`, p.hypotheses && `## Hypotheses (unverified)\n${p.hypotheses}`,
     `## Next step\n${p.next_step}`, p.files_to_read?.length && `## Read first\n${p.files_to_read.join("\n")}`,
     `## Automatically collected state\nCwd: ${auto.cwd}\nRepository root: ${auto.root}\nBranch: ${auto.branch}\nHEAD: ${auto.head}\nLaunch prompt: ${p.launch_prompt ?? "not supplied"}\n` +
-      `Running jobs / watches: ${JSON.stringify(auto.jobs)}\nRunning subagents: ${JSON.stringify(auto.subagents)}\nIssue claims: ${JSON.stringify(auto.claims)}\nUnavailable: ${auto.unavailable.join(", ") || "none"}`,
+      `Running jobs / watches:\n${auto.jobs.join("\n") || "none"}\nRunning subagents:\n${auto.subagents.join("\n") || "none"}\nIssue claims: ${JSON.stringify(auto.claims)}\nUnavailable: ${auto.unavailable.join(", ") || "none"}`,
+    auto.resumeCheck && `## Resume check\n${auto.resumeCheck}`,
     "Resume now from Next step without asking the user. Verify current git HEAD and re-establish external state before trusting prior review/CI/issue facts.",
   ];
   const text = sections.filter(Boolean).join("\n\n") + "\n";

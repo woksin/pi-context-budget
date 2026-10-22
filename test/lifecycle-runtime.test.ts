@@ -12,7 +12,7 @@ const runtime = findRuntime(), skip = runtime ? false : "pi runtime unavailable"
 const root = resolve(import.meta.dirname, "../.ai-work/real-runtime");
 mkdirSync(root, { recursive: true });
 let sequence = 0;
-async function setup(t: { after(fn: () => Promise<void>): void }, options: { hosts?: SessionHosts; parent?: string; idle?: boolean; mode?: string; before?: (pi: any) => void } = {}) {
+async function setup(t: { after(fn: () => Promise<void>): void }, options: { hosts?: SessionHosts; parent?: string; idle?: boolean; mode?: string; resume?: string; before?: (pi: any) => void } = {}) {
   const pc: any = await import(pathToFileURL(join(runtime!, "dist/index.js")).href);
   const aiPath = [join(runtime!, "node_modules/@earendil-works/pi-ai/dist/index.js"), join(dirname(dirname(runtime!)), "@earendil-works/pi-ai/dist/index.js")].find(existsSync)!;
   const ai: any = await import(pathToFileURL(aiPath).href);
@@ -21,7 +21,7 @@ async function setup(t: { after(fn: () => Promise<void>): void }, options: { hos
   process.env.PI_CONTEXT_BUDGET_STATE_DIR = join(dir, "state");
   process.env.PI_CONTEXT_BUDGET_CONFIG = join(dir, "config.json");
   delete process.env.PI_SESSION_WRAPPER;
-  writeFileSync(process.env.PI_CONTEXT_BUDGET_CONFIG, JSON.stringify({ mode: options.mode ?? "enforce", main: { soft: 100, handoff: 200, hard: 1000, minProgress: 50 }, idleMinTokens: options.idle ? 50 : 100000 }));
+  writeFileSync(process.env.PI_CONTEXT_BUDGET_CONFIG, JSON.stringify({ mode: options.mode ?? "enforce", main: { soft: 100, handoff: 200, hard: 1000, minProgress: 50 }, idleMinTokens: options.idle ? 50 : 100000, resumeChecks: options.resume ? { L0: options.resume } : {} }));
   const faux = ai.fauxProvider({ provider: `context-budget-faux-${process.pid}-${++sequence}`, models: [{ id: "m" }] });
   const modelRuntime = await pc.ModelRuntime.create({ authPath: join(agentDir, "auth.json"), modelsPath: join(agentDir, "models.json") });
   modelRuntime.registerNativeProvider(faux.provider);
@@ -121,4 +121,29 @@ test("real SDK hosting marks in-memory children and releases the primary before 
   await child.close(); await main.close();
   const fork = await setup(t, { hosts, parent: "/fork-source.jsonl" });
   assert.equal(fork.status().role, "main");
+});
+
+
+test("real Pi context hook injects fresh resume state into the first post-reset provider call", { skip: !runtime }, async t => {
+  const old = process.env.PI_RESUME_CHECK;
+  delete process.env.PI_RESUME_CHECK;
+  t.after(() => { if (old === undefined) delete process.env.PI_RESUME_CHECK; else process.env.PI_RESUME_CHECK = old; });
+  const h = await setup(t, { resume: "printf x >> checks; cat checks" });
+  h.session.sessionManager.appendSessionInfo("L0");
+  h.faux.setResponses([
+    () => {
+      assert.equal(existsSync(join(h.dir, "checks")), false);
+      return h.reply([h.ai.fauxToolCall("context_handoff", { goal: "finish", next_step: "resume", facts: "verified" })]);
+    },
+    (context: any) => {
+      assert.equal(readFileSync(join(h.dir, "checks"), "utf8"), "xx");
+      assert.match(JSON.stringify(context.messages), /after context reset/);
+      assert.match(JSON.stringify(context.messages), /exit: 0\\nxx/);
+      return h.reply("resumed with fresh external state");
+    },
+  ]);
+  await h.session.prompt("work and hand off");
+  const boundary = h.session.sessionManager.getBranch().find((e: any) => e.type === "compaction");
+  assert.match(boundary.summary, /## Resume check\ncommand: .*\nexit: 0\nx/);
+  assert.equal(h.faux.state.callCount, 2);
 });

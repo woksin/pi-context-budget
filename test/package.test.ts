@@ -14,7 +14,7 @@ test("public package exposes only the generic runtime, documentation, license an
   assert.deepEqual(p.files, ["src/", "bin/pi-session", "README.md", "LICENSE", "package.json"]);
   for (const entry of [...p.pi.extensions, p.bin["pi-session"]]) assert.ok(existsSync(resolve(root, entry)));
   assert.ok(statSync(resolve(root, p.bin["pi-session"])).mode & 0o111);
-  for (const name of ["README.md", "src/extension.ts", "src/core.ts", "src/storage.ts", "bin/pi-session"]) {
+  for (const name of ["README.md", "src/extension.ts", "src/core.ts", "src/storage.ts", "src/resume-check.ts", "bin/pi-session"]) {
     const text = readFileSync(join(root, name), "utf8");
     assert.doesNotMatch(text, /\/Users\/|\/Volumes\//, `${name} must be portable`);
     assert.doesNotMatch(text, /\bCratis\b|\bL0\b|\blanes?\b/i, `${name} must be generic`);
