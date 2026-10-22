@@ -54,13 +54,17 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
       state = next.state;
       return next.effects;
     }
+    function updateModeMismatch(ctx: ExtensionContext): void {
+      const current = modeStatus(ctx);
+      const mismatch = config.mode !== current.effective ? `context-budget: configured ${config.mode}, effective ${current.effective} (${current.reason})` : undefined;
+      ctx.ui.setStatus?.("context-budget", mismatch);
+      if (mismatch && mismatch !== mismatchLogged) log(ctx, "mode_mismatch", { configured: config.mode, effective: current.effective, reason: current.reason });
+      mismatchLogged = mismatch;
+    }
     function status(ctx: ExtensionContext): void {
       try {
         const f = frame(ctx), policy = policyStatus(state, f);
-        const mismatch = config.mode !== f.mode ? `context-budget: configured ${config.mode}, effective ${f.mode} (${modeStatus(ctx).reason})` : undefined;
-        ctx.ui.setStatus?.("context-budget", mismatch);
-        if (mismatch && mismatch !== mismatchLogged) log(ctx, "mode_mismatch", { configured: config.mode, effective: f.mode, reason: modeStatus(ctx).reason });
-        mismatchLogged = mismatch;
+        updateModeMismatch(ctx);
         atomicJson(join(stateDir, "status", `${ctx.sessionManager.getSessionId()}.json`), {
           at: new Date().toISOString(), pid: process.pid, sessionId: ctx.sessionManager.getSessionId(), sessionFile: ctx.sessionManager.getSessionFile(),
           cwd: ctx.cwd, model: ref(ctx), role: host?.subagent ? "subagent" : "main", tokens: state.tokens,
@@ -162,7 +166,9 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
     }
     async function run(event: MachineEvent, ctx: ExtensionContext) {
       const result = await execute(step(event, ctx), ctx);
-      status(ctx);
+      // Mode feedback stays live without publishing native-compaction previews
+      // over the last budget status in observe mode.
+      try { updateModeMismatch(ctx); } catch (error) { log(ctx, "status_error", { error: String(error) }); }
       return result;
     }
     const safe = <E, R>(handler: (event: E, ctx: ExtensionContext) => R | Promise<R>) => async (event: E, ctx: ExtensionContext): Promise<R | undefined> => {
@@ -209,7 +215,8 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
         } catch { /* Optional recorded/live watch state unavailable. */ }
         resumeMessage = checks.join("\n\n") || undefined;
       }
-      if (resumeMessage) return { messages: [...event.messages, { role: "custom" as const, customType: "context-budget-resume-check", content: resumeMessage, display: false, timestamp: Date.now() }] };
+      const message = [resumeMessage, watchMessage].filter(Boolean).join("\n\n");
+      if (message) return { messages: [...event.messages, { role: "custom" as const, customType: "context-budget-resume-check", content: message, display: false, timestamp: Date.now() }] };
     }));
     pi.on("agent_start", safe(async (_e, ctx) => { await run({ type: "agent_start" }, ctx); }));
     pi.on("before_agent_start", safe(async (_e, ctx) => { await run({ type: "before_agent_start" }, ctx); }));
