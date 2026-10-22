@@ -5,9 +5,9 @@ import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
 import { effectiveMode, modelThresholds, parseConfig, renderHandoff, validateHandoff, ownsWrapper, initialState, transition, policyStatus,
-  restoreHistory, type Effect, type Frame, type MachineEvent, type Handoff, type HandoffInput, type HistoryItem } from "./core.ts";
+  restoreHistory, handoffBackoff, type Effect, type Frame, type MachineEvent, type Handoff, type HandoffInput, type HistoryItem } from "./core.ts";
 import { resumeCommand, runResumeCheck } from "./resume-check.ts";
-import { appendEvent, atomicJson, gitState, issueClaims, runningState, writeHandoff, writeMarker, processSessionHosts, type SessionHosts } from "./storage.ts";
+import { appendEvent, atomicJson, gitState, issueClaims, runningState, writeHandoff, writeMarker, processSessionHosts, pendingQuestions, watchCheck, type SessionHosts } from "./storage.ts";
 
 type ActionResult = BoundaryResult & ToolCallEventResult & SessionBeforeCompactResult;
 export default async function (pi: ExtensionAPI) {
@@ -23,6 +23,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
     let sequence = 0;
     const knownIds = new Set<string>();
     let resumeBoundary: string | undefined, resumeMessage: string | undefined;
+    let mismatchLogged: string | undefined;
     let isGuardOff: ((name: string) => boolean) | undefined;
     try { isGuardOff = (await import(pathToFileURL(join(agentDir, "lib/guards.ts")).href)).isGuardOff; }
     catch { /* Optional integration: absence never disables configured enforcement. */ }
@@ -35,10 +36,13 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
       catch (error) { config = parseConfig({}); log(ctx, "config_error", { error: String(error), mode: "observe" }); }
     }
     const ref = (ctx: ExtensionContext) => ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "unknown";
-    function mode(ctx: ExtensionContext) {
+    function modeStatus(ctx: ExtensionContext) {
       let off = false;
       try { off = isGuardOff?.("context") ?? false; } catch { /* Unpatched optional guard module. */ }
-      return effectiveMode(config, ctx.cwd, off);
+      return { effective: effectiveMode(config, ctx.cwd, off), reason: off ? "context guard off" : "cwd restriction" };
+    }
+    function mode(ctx: ExtensionContext) {
+      return modeStatus(ctx).effective;
     }
     function frame(ctx: ExtensionContext, observedTokens?: number | null): Frame {
       return { mode: mode(ctx), tokens: observedTokens === undefined ? ctx.getContextUsage()?.tokens ?? null : observedTokens,
@@ -53,12 +57,16 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
     function status(ctx: ExtensionContext): void {
       try {
         const f = frame(ctx), policy = policyStatus(state, f);
+        const mismatch = config.mode !== f.mode ? `context-budget: configured ${config.mode}, effective ${f.mode} (${modeStatus(ctx).reason})` : undefined;
+        ctx.ui.setStatus?.("context-budget", mismatch);
+        if (mismatch && mismatch !== mismatchLogged) log(ctx, "mode_mismatch", { configured: config.mode, effective: f.mode, reason: modeStatus(ctx).reason });
+        mismatchLogged = mismatch;
         atomicJson(join(stateDir, "status", `${ctx.sessionManager.getSessionId()}.json`), {
           at: new Date().toISOString(), pid: process.pid, sessionId: ctx.sessionManager.getSessionId(), sessionFile: ctx.sessionManager.getSessionFile(),
           cwd: ctx.cwd, model: ref(ctx), role: host?.subagent ? "subagent" : "main", tokens: state.tokens,
           thresholds: f.thresholds, floor: state.floor, phase: policy.phase, action: policy.action, projected: f.mode === "observe", lastHandoffPath: state.lastHandoff?.path ?? null,
           lastHandoffTime: state.lastHandoff?.at ?? null, handoffCount: state.count, mode: f.mode, configuredMode: config.mode,
-          fallbackReason: policy.fallbackReason,
+          fallbackReason: policy.fallbackReason, modeMismatchReason: config.mode !== f.mode ? modeStatus(ctx).reason : null,
           wrapper: f.wrapped, relaunchMarker: f.wrapped ? process.env.PI_RELAUNCH_MARKER : null,
         });
       } catch (error) { log(ctx, "status_error", { error: String(error) }); }
@@ -68,7 +76,8 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
       let claims: unknown[] = [];
       try { claims = issueClaims(join(agentDir, "issue-work/registry.jsonl"), ctx.sessionManager.getSessionId()); }
       catch { running.unavailable.push("issue_work registry absent/unreadable"); }
-      return { ...gitState(ctx.cwd), ...running, claims };
+      return { ...gitState(ctx.cwd), ...running, claims,
+        questions: pendingQuestions(process.env.PI_QUESTIONS_HOME || join(agentDir, "user-questions"), ctx.sessionManager.getSessionId()) };
     }
     function checkCommand(ctx: ExtensionContext) {
       if (host?.subagent) return undefined;
@@ -151,13 +160,17 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
       }
       return result;
     }
-    async function run(event: MachineEvent, ctx: ExtensionContext) { return execute(step(event, ctx), ctx); }
+    async function run(event: MachineEvent, ctx: ExtensionContext) {
+      const result = await execute(step(event, ctx), ctx);
+      status(ctx);
+      return result;
+    }
     const safe = <E, R>(handler: (event: E, ctx: ExtensionContext) => R | Promise<R>) => async (event: E, ctx: ExtensionContext): Promise<R | undefined> => {
       try { return await handler(event, ctx); } catch (error) { log(ctx, "hook_error", { error: String(error) }); }
     };
     function reset(ctx: ExtensionContext): void {
       host?.release(); host = hosts.acquire(ctx.sessionManager.getSessionId());
-      reload(ctx); knownIds.clear(); resumeBoundary = resumeMessage = undefined;
+      reload(ctx); knownIds.clear(); resumeBoundary = resumeMessage = mismatchLogged = undefined;
       const history: HistoryItem[] = ctx.sessionManager.getBranch().flatMap((e): HistoryItem[] => {
         if (e.type === "compaction") {
           const details = e.details as { kind?: string; source?: string } | undefined;
@@ -182,10 +195,19 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
       if (mode(ctx) !== "enforce") return;
       const boundary = [...ctx.sessionManager.getBranch()].reverse().find(e => e.type === "compaction");
       if (!boundary || (boundary.details as { kind?: string } | undefined)?.kind !== "handoff") return;
+      let watchMessage: string | undefined;
       if (resumeBoundary !== boundary.id) {
         resumeBoundary = boundary.id; resumeMessage = undefined;
         const command = checkCommand(ctx);
-        if (command) resumeMessage = `## Resume check (after context reset)\n${await runResumeCheck(command, ctx.cwd)}`;
+        const checks: string[] = [];
+        if (command) checks.push(`## Resume check (after context reset)\n${await runResumeCheck(command, ctx.cwd)}`);
+        try {
+          const path = (boundary.details as { path?: string }).path;
+          const handoff = state.lastHandoff?.path === path ? state.lastHandoff
+            : path ? JSON.parse(readFileSync(path.replace(/\.md$/, ".json"), "utf8")) as Handoff : undefined;
+          watchMessage = watchCheck(handoff?.recordedJobs);
+        } catch { /* Optional recorded/live watch state unavailable. */ }
+        resumeMessage = checks.join("\n\n") || undefined;
       }
       if (resumeMessage) return { messages: [...event.messages, { role: "custom" as const, customType: "context-budget-resume-check", content: resumeMessage, display: false, timestamp: Date.now() }] };
     }));
@@ -206,6 +228,10 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
           await execute(effects, ctx);
           return { content: [{ type: "text", text: "Handoff inactive; no automatic action. Continue the task." }], details: {} };
         }
+        validateHandoff(input);
+        const f = frame(ctx);
+        const refusal = handoffBackoff(input, state.lastHandoff, gitState(ctx.cwd).head, (f.tokens ?? state.tokens ?? 0) >= f.thresholds.hard);
+        if (refusal) throw new Error(refusal);
         const handoff = await createHandoff(ctx, input);
         await run({ type: "handoff_written", handoff }, ctx);
         return { content: [{ type: "text", text: intent.idleOnly ? "Handoff stored. End this turn without further tools; the context resets at the end of this turn." : "Handoff stored. End this turn without further tools; recovery continues automatically." }], details: { handoff } };

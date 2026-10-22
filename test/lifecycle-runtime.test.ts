@@ -147,3 +147,37 @@ test("real Pi context hook injects fresh resume state into the first post-reset 
   assert.match(boundary.summary, /## Resume check\ncommand: .*\nexit: 0\nx/);
   assert.equal(h.faux.state.callCount, 2);
 });
+
+test("real Pi applies an idle handoff despite queued steering and follow-ups, then delivers both", { skip }, async t => {
+  const key = Symbol.for("pi-jobs.liveManagers"), global = globalThis as Record<symbol, unknown>, old = global[key];
+  global[key] = new Set([{ list: () => [{ id: "waiting", status: "running" }] }]);
+  t.after(() => { global[key] = old; });
+  let session: any, queued = false;
+  const h = await setup(t, { idle: true, before: (pi: any) => {
+    pi.on("tool_execution_end", async (event: any) => {
+      if (event.toolName !== "context_handoff" || queued) return;
+      queued = true;
+      await session.steer("queued steering notification");
+      await session.followUp("queued follow-up notification");
+    });
+  } });
+  session = h.session;
+  const seen: string[] = [];
+  h.faux.setResponses([
+    h.reply("waiting for background work"),
+    h.reply([h.ai.fauxToolCall("context_handoff", { goal: "wait", facts: "pending background job", next_step: "consume notifications" })]),
+    (context: any) => {
+      const boundary = h.sessionManager.getBranch().find((e: any) => e.type === "compaction");
+      assert.equal(boundary.details.source, "idle");
+      seen.push(JSON.stringify(context.messages));
+      return h.reply("consumed steering");
+    },
+    (context: any) => { seen.push(JSON.stringify(context.messages)); return h.reply("consumed follow-up"); },
+  ]);
+  await session.prompt("work waits on a job");
+  assert.ok(queued);
+  assert.equal(h.sessionManager.getBranch().filter((e: any) => e.type === "compaction").length, 1);
+  assert.ok(seen[0].includes("queued steering notification"));
+  assert.ok(seen.some(context => context.includes("queued follow-up notification")));
+  assert.equal(h.status().handoffCount, 0);
+});

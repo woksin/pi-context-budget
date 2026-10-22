@@ -23,7 +23,7 @@ async function harness(mode = "enforce", overrides: Record<string, unknown> = {}
   writeFileSync(process.env.PI_CONTEXT_BUDGET_CONFIG, JSON.stringify({ mode, main: { soft: 100, handoff: 200, hard: 1000, minProgress: 50 }, ...overrides }));
   const handlers = new Map<string, (e: any, ctx: ExtensionContext) => Promise<any>>();
   let tool: any;
-  const notifications: string[] = [];
+  const notifications: string[] = [], footer: (string | undefined)[] = [];
   const pi = { on: (name: string, handler: any) => { handlers.set(name, handler); }, registerTool: (value: any) => { tool = value; } } as unknown as ExtensionAPI;
   let usage: number | null = 100, shutdown = 0, compact = 0;
   const branch: any[] = [];
@@ -31,7 +31,7 @@ async function harness(mode = "enforce", overrides: Record<string, unknown> = {}
   const ctx = { cwd: dir, hasUI: false, model: { provider: "test", id: "test" },
     sessionManager: { getSessionId: () => sid, getSessionFile: () => join(dir, "session.jsonl"), getHeader: () => ({}), getBranch: () => branch },
     getContextUsage: () => ({ tokens: usage }), shutdown: () => { shutdown++; },
-    ui: { notify: (text: string) => notifications.push(text) },
+    ui: { notify: (text: string) => notifications.push(text), setStatus: (_key: string, text?: string) => footer.push(text) },
     compact: (opts: any) => {
       compact++;
       // Real pi ordering: failed hook is awaited BEFORE compact's onError callback.
@@ -43,8 +43,8 @@ async function harness(mode = "enforce", overrides: Record<string, unknown> = {}
   const emit = (name: string, event = {}) => handlers.get(name)!(event, ctx);
   await emit("session_start");
   const turn = async (tokens = 300) => { usage = tokens; return emit("turn_end", { message: { role: "assistant", usage: { input: tokens, output: 0, cacheRead: 0, cacheWrite: 0 } } }); };
-  const handoff = () => tool.execute("h", required, undefined, undefined, ctx);
-  return { dir, ctx, sid, emit, turn, handoff, notifications, branch, setTokens: (n: number | null) => { usage = n; }, counters: () => ({ shutdown, compact }),
+  const handoff = (input = required) => tool.execute("h", input, undefined, undefined, ctx);
+  return { dir, ctx, sid, emit, turn, handoff, notifications, footer, branch, setTokens: (n: number | null) => { usage = n; }, counters: () => ({ shutdown, compact }),
     events: () => readFileSync(join(dir, "state/events.jsonl"), "utf8").trim().split("\n").map(l => JSON.parse(l)),
     status: () => JSON.parse(readFileSync(join(dir, "state/status", `${sid}.json`), "utf8")) };
 }
@@ -204,7 +204,7 @@ test("blocked sibling keeps pending handoff; already-running sibling invalidates
   assert.equal((await h.emit("tool_call", { toolName: "read", toolCallId: "blocked" })).block, true);
   await h.emit("tool_execution_end", { toolName: "read", toolCallId: "blocked", isError: true });
   assert.equal((await h.turn()).entries[0].type, "compaction");
-  await h.handoff();
+  await h.handoff({ ...required, facts: "Read part two and verified results" });
   await h.emit("tool_execution_end", { toolName: "read", toolCallId: "already-running", isError: false });
   assert.equal(await h.turn(), undefined);
 });
@@ -411,7 +411,7 @@ test("enforced in-process subagents skip inherited and configured resume checks 
   t.after(() => h.emit("session_shutdown"));
   (h.ctx.sessionManager as any).getSessionName = () => "coordinator";
   const check = async (id: string) => {
-    const handoff = await h.handoff();
+    const handoff = await h.handoff({ ...required, facts: id });
     assert.ok(!handoff.details.handoff.text.includes("## Resume check"));
     const committed = await h.turn();
     h.branch.push({ ...committed.entries[0], id });
@@ -422,4 +422,98 @@ test("enforced in-process subagents skip inherited and configured resume checks 
   await check("env-subagent");
   delete process.env.PI_RESUME_CHECK;
   await check("configured-subagent");
+});
+
+
+test("queued wake starting a run cannot discard an idle handoff before its turn boundary", async () => {
+  const h = await harness("enforce", { idleMinTokens: 50 });
+  const key = Symbol.for("pi-jobs.liveManagers"), global = globalThis as Record<symbol, unknown>, old = global[key];
+  global[key] = new Set([{ list: () => [{ id: "j1", status: "running" }] }]);
+  try {
+    await h.turn(100);
+    await h.emit("agent_before_settle");
+    const stored = await h.handoff();
+    await h.emit("input", { streamingBehavior: "followUp", text: "wake notification" });
+    await h.emit("before_agent_start");
+    const boundary = await h.turn(100);
+    assert.equal(boundary.entries[0].details.path, stored.details.handoff.path);
+    assert.equal(boundary.entries[0].details.source, "idle");
+  } finally { global[key] = old; }
+});
+
+test("near-duplicate tool errors back off, survive history restore, and yield to hard recovery", async () => {
+  const h = await harness();
+  const first = await h.handoff();
+  await h.turn(100);
+  h.branch.push({ type: "message", message: { role: "toolResult", toolName: "context_handoff", details: first.details } });
+  await h.emit("session_tree");
+  await assert.rejects(h.handoff(), /unchanged repository HEAD; retry after .*15 min back-off/);
+  h.setTokens(1200);
+  const forced = await h.handoff();
+  assert.ok(forced.details.handoff);
+  assert.equal((await h.turn(1200)).entries[0].type, "compaction");
+});
+
+test("optional session-owned questions render in automatic state", async t => {
+  const h = await harness(), old = process.env.PI_QUESTIONS_HOME;
+  process.env.PI_QUESTIONS_HOME = join(h.dir, "questions");
+  t.after(() => { if (old === undefined) delete process.env.PI_QUESTIONS_HOME; else process.env.PI_QUESTIONS_HOME = old; });
+  const dir = join(process.env.PI_QUESTIONS_HOME, "items", "Q-1");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "r00000001.json"), JSON.stringify({ id: "Q-1", status: "open", title: "Approve rollout", asker: { sessionId: h.sid } }));
+  const result = await h.handoff();
+  assert.match(result.details.handoff.text, /## Pending questions\nQ-1 \| open \| Approve rollout/);
+});
+
+test("first resumed call checks missing jobs with full commands, including after restore", async () => {
+  const h = await harness(), key = Symbol.for("pi-jobs.liveManagers"), global = globalThis as Record<symbol, unknown>, old = global[key];
+  const command = "echo " + "x".repeat(800);
+  global[key] = new Set([{ list: () => [{ id: "watch-1", label: "CI", command, status: "running" }] }]);
+  try {
+    await h.handoff();
+    const committed = await h.turn(100);
+    h.branch.push({ ...committed.entries[0], id: "watch-reset" });
+    await h.emit("session_tree"); // metadata must also work when tool results were pruned
+    global[key] = new Set();
+    const resumed = await h.emit("context", { messages: [] });
+    assert.ok(resumed.messages[0].content.includes(`watch-1 | CI | ${command}`));
+    assert.match(resumed.messages[0].content, /## Watch check/);
+    assert.equal(await h.emit("context", { messages: [] }), undefined); // first resumed call only
+  } finally { global[key] = old; }
+});
+
+test("mode mismatch footer names the reason and logs once until resolved", async () => {
+  const h = await harness("enforce", { enforceCwds: [] });
+  assert.equal(h.footer.at(-1), "context-budget: configured enforce, effective observe (cwd restriction)");
+  await h.turn(); await h.turn();
+  assert.equal(h.events().filter(e => e.event === "mode_mismatch").length, 1);
+  writeFileSync(join(h.dir, "config.json"), JSON.stringify({ mode: "enforce" }));
+  await h.emit("input");
+  assert.equal(h.footer.at(-1), undefined);
+  const guarded = await harness("enforce", {}, true);
+  const key = Symbol.for("context-budget:test-guard"), global = globalThis as Record<symbol, unknown>;
+  global[key] = true;
+  try {
+    await guarded.emit("tool_call", { toolName: "read" });
+    assert.equal(guarded.footer.at(-1), "context-budget: configured enforce, effective off (context guard off)");
+  } finally { delete global[key]; }
+});
+
+test("a reused factory and child session_start cannot flip the parent's mode", async () => {
+  const h = await harness();
+  const dir = process.env.PI_CODING_AGENT_DIR!;
+  const factory = createContextBudgetExtension({ agentDir: dir, hosts: new SessionHosts() });
+  const bind = async (ctx: ExtensionContext) => {
+    const handlers = new Map<string, any>();
+    await factory({ on: (name: string, fn: any) => handlers.set(name, fn), registerTool: () => {} } as unknown as ExtensionAPI);
+    await handlers.get("session_start")({}, ctx);
+    return handlers;
+  };
+  const parent = await bind(h.ctx);
+  writeFileSync(join(h.dir, "config.json"), JSON.stringify({ mode: "off" }));
+  const child = { ...h.ctx, sessionManager: { ...h.ctx.sessionManager, getSessionId: () => "child" } } as ExtensionContext;
+  const childHandlers = await bind(child);
+  await childHandlers.get("session_shutdown")({}, child);
+  await parent.get("turn_end")({ message: { role: "assistant", usage: { input: 100, output: 0, cacheRead: 0, cacheWrite: 0 } } }, h.ctx);
+  assert.equal(h.status().mode, "enforce");
 });

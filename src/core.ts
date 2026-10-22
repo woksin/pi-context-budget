@@ -331,7 +331,10 @@ export function transition(previous: MachineState, event: MachineEvent, frame: F
     if (s.floor === null && event.usage !== undefined && s.providerFailure === "none") s.floor = event.usage;
   }
   if (event.type === "before_agent_start") {
-    s.pending = s.stored = undefined; s.pendingSource = undefined; s.settleRequest = "none"; s.providerFailure = "none";
+    // A queued wake may start a run before the pending handoff's boundary.
+    // Keep the committed tool result until turn_end applies it; never touch Pi's queue.
+    if (!s.pending) { s.stored = undefined; s.pendingSource = undefined; }
+    s.settleRequest = "none"; s.providerFailure = "none";
   }
   if (event.type === "session_compact") {
     if (event.owned && s.mode === "enforce") committed(s, s.compaction?.origin === "idle" ? "idle" : "budget");
@@ -375,8 +378,28 @@ export interface AutoState {
   cwd: string; root: string; branch: string; head: string;
   jobs: unknown[]; subagents: unknown[]; claims: unknown[]; unavailable: string[];
   resumeCheck?: string;
+  questions?: string[];
 }
-export interface Handoff { text: string; path: string; n: number; at: string; launchPrompt?: string }
+export interface RecordedJob { id: string; label: string; command: string }
+export interface Handoff {
+  text: string; path: string; n: number; at: string; launchPrompt?: string;
+  narrativeTokens?: string[]; head?: string; recordedJobs?: RecordedJob[];
+}
+/** Lowercase Unicode word-set Jaccard on goal + facts + next_step; order is ignored. */
+export function narrativeTokens(input: HandoffInput): string[] {
+  return [...new Set(`${input.goal} ${input.facts} ${input.next_step}`.toLowerCase().match(/[\p{L}\p{N}_]+/gu) ?? [])];
+}
+export function handoffBackoff(input: HandoffInput, previous: Handoff | undefined, head: string, hard: boolean, now = Date.now()): string | undefined {
+  if (hard || !previous?.narrativeTokens || head === "unknown" || head !== previous.head) return;
+  const until = Date.parse(previous.at) + 15 * 60_000;
+  if (!(now < until)) return;
+  const current = new Set(narrativeTokens(input)), prior = new Set(previous.narrativeTokens);
+  const intersection = [...current].filter(token => prior.has(token)).length;
+  const union = new Set([...current, ...prior]).size;
+  if ((union ? intersection / union : 1) > 0.9) {
+    return `Near-duplicate handoff (narrative similarity > 0.9) with unchanged repository HEAD; retry after ${new Date(until).toISOString()} (15 min back-off).`;
+  }
+}
 export function validateHandoff(p: HandoffInput): void {
   for (const field of ["goal", "next_step", "facts"] as const) {
     if (typeof p[field] !== "string" || !p[field].trim()) throw new Error(`${field} is required and must be nonempty`);
@@ -436,10 +459,17 @@ export function boundedAutoState(auto: AutoState): AutoState {
   };
   return { cwd: short(auto.cwd), root: short(auto.root), branch: short(auto.branch), head: short(auto.head),
     jobs: boundedLines(auto.jobs, jobLine, 16 * 1024), subagents: boundedLines(auto.subagents, subagentLine, 4 * 1024),
-    claims: list(auto.claims), unavailable: auto.unavailable.slice(0, 8).map(short), resumeCheck: auto.resumeCheck };
+    claims: list(auto.claims), unavailable: auto.unavailable.slice(0, 8).map(short), resumeCheck: auto.resumeCheck,
+    questions: auto.questions?.slice(0, 20).map(line => Array.from(line).slice(0, 200).join("")) };
 }
 export function renderHandoff(p: HandoffInput, auto: AutoState, id: string, n: number, path: string, at: string): Handoff {
   validateHandoff(p);
+  const recordedJobs = auto.jobs.flatMap((record): RecordedJob[] => {
+    if (!record || typeof record !== "object") return [];
+    const r = record as Record<string, unknown>;
+    return typeof r.id === "string" && typeof r.command === "string"
+      ? [{ id: r.id, label: typeof r.label === "string" ? r.label : "-", command: r.command }] : [];
+  });
   auto = boundedAutoState(auto);
   const sections = [
     `# Handoff ${id}-${n}`, `Timestamp: ${at}\nHandoff file: ${path}`,
@@ -450,11 +480,12 @@ export function renderHandoff(p: HandoffInput, auto: AutoState, id: string, n: n
     `## Next step\n${p.next_step}`, p.files_to_read?.length && `## Read first\n${p.files_to_read.join("\n")}`,
     `## Automatically collected state\nCwd: ${auto.cwd}\nRepository root: ${auto.root}\nBranch: ${auto.branch}\nHEAD: ${auto.head}\nLaunch prompt: ${p.launch_prompt ?? "not supplied"}\n` +
       `Running jobs / watches:\n${auto.jobs.join("\n") || "none"}\nRunning subagents:\n${auto.subagents.join("\n") || "none"}\nIssue claims: ${JSON.stringify(auto.claims)}\nUnavailable: ${auto.unavailable.join(", ") || "none"}`,
+    auto.questions?.length && `## Pending questions\n${auto.questions.join("\n")}`,
     auto.resumeCheck && `## Resume check\n${auto.resumeCheck}`,
     "Resume now from Next step without asking the user. Verify current git HEAD and re-establish external state before trusting prior review/CI/issue facts.",
   ];
   const text = sections.filter(Boolean).join("\n\n") + "\n";
   const bytes = Buffer.byteLength(text);
   if (bytes > MAX_HANDOFF_BYTES) throw new Error(`Handoff is ${bytes} bytes; limit is ${MAX_HANDOFF_BYTES}. Shorten narrative and reference absolute files; do not omit user constraints.`);
-  return { text, path, n, at, launchPrompt: p.launch_prompt };
+  return { text, path, n, at, launchPrompt: p.launch_prompt, narrativeTokens: narrativeTokens(p), head: auto.head, recordedJobs };
 }

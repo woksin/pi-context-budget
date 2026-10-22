@@ -86,6 +86,9 @@ The package optionally reads `getAgentDir()/lib/guards.ts` if your setup provide
 
 **Off/observe and guard-off leave native pi compaction unchanged**: the hook returns no summary and no cancellation for manual, threshold or overflow compaction. The package initiates nothing; pi can still compact using its own configured behavior and summarizer. Only enforce mode intercepts compaction.
 
+Configured/effective mode differences are shown in the footer, for example
+`context-budget: configured enforce, effective off (context guard off)`, and logged once per mismatch transition. Cwd restrictions report `cwd restriction`. Configuration and policy state are local to each runtime binding: starting an SDK child does not change its parent's mode. There is no package-specific per-session mode override; the optional guard integration is consulted live.
+
 ## Handoff policy
 
 1. **Soft:** one UI advisory per crossing: finish the current step first, then hand off at a natural boundary. No model steer or extra provider call.
@@ -182,6 +185,16 @@ Initial arguments are preserved (the wrapper's `--` separator is removed). After
 Markers are `<pid>-<random-launch-nonce>.json` with `cwd`, nullable `launchPrompt`, `handoff`, nullable `sessionFile`. Descendant processes inherit the environment but fail the PID check; in-process SDK children fail the hosting check. Fresh nonces prevent retained markers from being mistaken for a later launch after PID reuse. Invalid markers, provider/non-zero exits or limit exhaustion stop without relaunch and retain evidence. Custom value-taking extension options should use `--flag=value`; built-in value-taking flags are parsed explicitly.
 
 **SIGTERM is not an automatic recovery authorization.** A signal exit is commonly 143; the zero-exit contract intentionally refuses to relaunch it. Deliberate crash recovery requires inspecting the marker and starting a new wrapper after verifying the old process is gone. Relaunch tears down jobs/subagents and changes session-id claims.
+
+### Duplicate back-off and optional state integrations
+
+A new handoff is refused with a tool error and `retry after <time>` for 15 minutes after the previous handoff when repository HEAD is unchanged and narrative similarity is **> 0.9**. Similarity is token-set Jaccard (intersection/union) over lowercase Unicode words in `goal + facts + next_step`, ignoring word order and punctuation. Changed HEAD, sufficiently changed narrative or expiry permits another handoff. Unknown HEAD cannot establish unchanged state. Hard-limit enforcement always bypasses this check. The comparison metadata persists in tool results and survives session restoration.
+
+Queued notifications and follow-ups never postpone a pending handoff's turn-boundary reset; Pi retains and delivers its queue after the reset.
+
+Optional **pi-questions** integration reads `$PI_QUESTIONS_HOME` or `<agent dir>/user-questions`, without writing anything. The latest item revision contributes `Pending questions` lines for this session's open items only: `id | status | title`, at most 20 lines of 200 characters. Missing/unreadable stores and corrupt items are silently omitted.
+
+The first resumed provider call compares recorded jobs/watches with the live **pi-jobs** registry. A `Watch check` block lists missing work as `id | label | full command` so it can be re-armed; no block appears when all recorded work is running or the registry is absent/unreadable. Full commands are retained in handoff metadata even when the display line was shortened. This is an observation, not automatic job execution.
 
 ## Telemetry and integration limits
 
