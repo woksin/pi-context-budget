@@ -25,7 +25,7 @@ jobs:
       - name: Install development tools without auto-installing the host peer
         run: npm ci --legacy-peer-deps --ignore-scripts
       - name: Install the pi runtime the tests run against
-        run: npm install --no-save --no-package-lock --legacy-peer-deps --ignore-scripts @earendil-works/pi-coding-agent@1.2.0
+        run: npm install --no-save --no-package-lock --ignore-scripts @earendil-works/pi-coding-agent@1.2.0
       - run: npm run typecheck
       - run: npm test
       - run: npm run check:shell
