@@ -1,8 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, utimesSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { handoffBackoff, narrativeTokens, renderHandoff } from "../src/core.ts";
+import { handoffBackoff, narrativeTokens, renderHandoff, forced, initialState, parseConfig } from "../src/core.ts";
 import { pendingQuestions, watchCheck } from "../src/storage.ts";
 
 const root = resolve(import.meta.dirname, "../.ai-work/wake-state");
@@ -64,4 +64,33 @@ test("watch diff is absent for live work or absent/unreadable registries", () =>
     global[key] = new Set([{ list: () => [{ id: "j1", status: "completed" }] }]);
     assert.match(watchCheck(recorded)!, /j1 \| watch \| echo hello \| cat/);
   } finally { global[key] = old; }
+});
+
+
+test("forced handoffs use policy state tokens rather than a conflicting live measurement", () => {
+  const config = parseConfig({ mode: "enforce", main: { soft: 100, handoff: 200, hard: 1000, minProgress: 50 } });
+  const frame = { mode: "enforce" as const, config, thresholds: config.main, tokens: 10, wrapped: false };
+  assert.equal(forced({ ...initialState("enforce"), tokens: 1000 }, frame), "hard");
+  assert.equal(forced({ ...initialState("enforce"), tokens: 250, floor: 100 }, frame), true);
+  assert.equal(forced({ ...initialState("enforce"), compactionFallback: true }, frame), "compaction");
+  assert.equal(forced({ ...initialState("enforce"), tokens: 10, floor: 0 }, { ...frame, tokens: 1000 }), false);
+});
+
+test("questions scan only the newest 200 item directories by modification time", () => {
+  const home = mkdtempSync(join(root, "question-scan-"));
+  // The oldest, low-numbered open item must not be found beyond the scan cap,
+  // even when all recent items belong to another session and yield no output.
+  for (let n = 1; n <= 201; n++) {
+    const dir = join(home, "items", `Q-${n}`);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "r00000001.json"), JSON.stringify({ id: `Q-${n}`, status: "open", title: `question ${n}`,
+      asker: { sessionId: n === 1 || n === 201 ? "s" : "other" } }));
+    const time = new Date(Date.parse("2026-01-01T00:00:00Z") + n * 1000);
+    utimesSync(dir, time, time);
+  }
+  assert.deepEqual(pendingQuestions(home, "s"), ["Q-201 | open | question 201"]);
+  // Promoting the old item by mtime, not id, makes it eligible again.
+  const newest = new Date("2026-02-01T00:00:00Z");
+  utimesSync(join(home, "items/Q-1"), newest, newest);
+  assert.deepEqual(pendingQuestions(home, "s"), ["Q-1 | open | question 1", "Q-201 | open | question 201"]);
 });

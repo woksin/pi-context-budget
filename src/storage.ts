@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { appendFileSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
@@ -127,7 +127,16 @@ export function issueClaims(path: string, sessionId: string): unknown[] {
 export function pendingQuestions(home: string, sessionId: string): string[] {
   try {
     const lines: string[] = [];
-    for (const id of readdirSync(join(home, "items")).filter(id => /^Q-\d+$/.test(id)).sort((a, b) => Number(a.slice(2)) - Number(b.slice(2)))) {
+    const items = join(home, "items");
+    const recent = readdirSync(items, { withFileTypes: true })
+      .filter(entry => entry.isDirectory() && /^Q-\d+$/.test(entry.name))
+      .flatMap(entry => {
+        try { return [{ id: entry.name, mtime: statSync(join(items, entry.name)).mtimeMs }]; }
+        catch { return []; }
+      })
+      .sort((a, b) => b.mtime - a.mtime || Number(b.id.slice(2)) - Number(a.id.slice(2))).slice(0, 200)
+      .sort((a, b) => Number(a.id.slice(2)) - Number(b.id.slice(2)));
+    for (const { id } of recent) {
       if (lines.length === 20) break;
       try {
         const dir = join(home, "items", id);

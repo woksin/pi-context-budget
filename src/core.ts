@@ -161,6 +161,10 @@ export function fallbackFor(s: MachineState, f: Frame): Fallback | undefined {
 function handoffRequired(s: MachineState, f: Frame): boolean {
   return s.tokens !== null && s.floor !== null && s.tokens >= f.thresholds.handoff && s.tokens - s.floor >= f.thresholds.minProgress;
 }
+/** Back-off must never block the only tool allowed by enforcement. */
+export function forced(s: MachineState, f: Frame): Fallback | boolean {
+  return fallbackFor(s, f) || handoffRequired(s, f);
+}
 function committed(s: MachineState, source: CommitSource): void {
   if (source !== "idle") { s.count++; s.handoffTurns.push(s.turn); }
   s.tokens = s.floor = null;
@@ -332,8 +336,9 @@ export function transition(previous: MachineState, event: MachineEvent, frame: F
   }
   if (event.type === "before_agent_start") {
     // A queued wake may start a run before the pending handoff's boundary.
-    // Keep the committed tool result until turn_end applies it; never touch Pi's queue.
-    if (!s.pending) { s.stored = undefined; s.pendingSource = undefined; }
+    // Keep it only after a normal turn; failed/aborted turns must not replay a
+    // stale handoff over the user's next prompt. Never touch Pi's queue.
+    if (!s.pending || s.providerFailure !== "none") { s.pending = s.stored = undefined; s.pendingSource = undefined; }
     s.settleRequest = "none"; s.providerFailure = "none";
   }
   if (event.type === "session_compact") {
@@ -389,8 +394,8 @@ export interface Handoff {
 export function narrativeTokens(input: HandoffInput): string[] {
   return [...new Set(`${input.goal} ${input.facts} ${input.next_step}`.toLowerCase().match(/[\p{L}\p{N}_]+/gu) ?? [])];
 }
-export function handoffBackoff(input: HandoffInput, previous: Handoff | undefined, head: string, hard: boolean, now = Date.now()): string | undefined {
-  if (hard || !previous?.narrativeTokens || head === "unknown" || head !== previous.head) return;
+export function handoffBackoff(input: HandoffInput, previous: Handoff | undefined, head: string, isForced: boolean, now = Date.now()): string | undefined {
+  if (isForced || !previous?.narrativeTokens || head === "unknown" || head !== previous.head) return;
   const until = Date.parse(previous.at) + 15 * 60_000;
   if (!(now < until)) return;
   const current = new Set(narrativeTokens(input)), prior = new Set(previous.narrativeTokens);

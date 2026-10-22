@@ -5,7 +5,7 @@ import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
 import { effectiveMode, modelThresholds, parseConfig, renderHandoff, validateHandoff, ownsWrapper, initialState, transition, policyStatus,
-  restoreHistory, handoffBackoff, type Effect, type Frame, type MachineEvent, type Handoff, type HandoffInput, type HistoryItem } from "./core.ts";
+  restoreHistory, handoffBackoff, forced, type Effect, type Frame, type MachineEvent, type Handoff, type HandoffInput, type HistoryItem } from "./core.ts";
 import { resumeCommand, runResumeCheck } from "./resume-check.ts";
 import { appendEvent, atomicJson, gitState, issueClaims, runningState, writeHandoff, writeMarker, processSessionHosts, pendingQuestions, watchCheck, type SessionHosts } from "./storage.ts";
 
@@ -57,7 +57,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
     function updateModeMismatch(ctx: ExtensionContext): void {
       const current = modeStatus(ctx);
       const mismatch = config.mode !== current.effective ? `context-budget: configured ${config.mode}, effective ${current.effective} (${current.reason})` : undefined;
-      ctx.ui.setStatus?.("context-budget", mismatch);
+      ctx.ui?.setStatus?.("context-budget", mismatch);
       if (mismatch && mismatch !== mismatchLogged) log(ctx, "mode_mismatch", { configured: config.mode, effective: current.effective, reason: current.reason });
       mismatchLogged = mismatch;
     }
@@ -237,7 +237,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
         }
         validateHandoff(input);
         const f = frame(ctx);
-        const refusal = handoffBackoff(input, state.lastHandoff, gitState(ctx.cwd).head, (f.tokens ?? state.tokens ?? 0) >= f.thresholds.hard);
+        const refusal = handoffBackoff(input, state.lastHandoff, gitState(ctx.cwd).head, Boolean(forced(state, f)));
         if (refusal) throw new Error(refusal);
         const handoff = await createHandoff(ctx, input);
         await run({ type: "handoff_written", handoff }, ctx);

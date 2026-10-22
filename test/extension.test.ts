@@ -517,3 +517,47 @@ test("a reused factory and child session_start cannot flip the parent's mode", a
   await parent.get("turn_end")({ message: { role: "assistant", usage: { input: 100, output: 0, cacheRead: 0, cacheWrite: 0 } } }, h.ctx);
   assert.equal(h.status().mode, "enforce");
 });
+
+
+for (const trigger of ["handoff threshold", "compaction fallback"]) test(`forced near-duplicate handoffs bypass back-off at ${trigger}`, async () => {
+  const h = await harness();
+  await h.turn(100);
+  const first = await h.handoff();
+  await h.turn(100);
+  await h.turn(100); // Establish a new floor after the first reset.
+  if (trigger === "handoff threshold") h.setTokens(250);
+  else {
+    await h.emit("session_before_compact", { reason: "threshold" });
+    await h.emit("session_compact_failed", { type: "session_compact_failed", reason: "threshold", errorMessage: "EACCES" });
+  }
+  assert.ok((await h.emit("tool_call", { toolName: "read", toolCallId: "blocked" })).block);
+  const second = await h.handoff(); // Same narrative, unchanged HEAD, within 15 minutes.
+  assert.ok(second.details.handoff);
+  assert.notEqual(second.details.handoff.path, first.details.handoff.path);
+  const committed = await h.turn(trigger === "handoff threshold" ? 250 : 100);
+  assert.equal(committed.entries[0].details.path, second.details.handoff.path);
+});
+
+for (const failure of ["aborted", "error", "overflow"]) test(`new prompt discards pending handoff after ${failure} turn`, async () => {
+  const h = await harness();
+  await h.turn(100);
+  await h.handoff();
+  const stopped = await h.emit("turn_end", { message: { role: "assistant", stopReason: failure === "aborted" ? "aborted" : "error",
+    errorMessage: failure === "overflow" ? "context overflow" : "provider failed", usage: { input: 100, output: 0, cacheRead: 0, cacheWrite: 0 } } });
+  assert.equal(stopped, undefined);
+  await h.emit("agent_settled", { aborted: failure === "aborted" });
+  await h.emit("input", { text: "new user prompt" });
+  await h.emit("before_agent_start");
+  await h.emit("agent_start");
+  assert.equal(await h.emit("tool_call", { toolName: "read", toolCallId: "fresh-read" }), undefined);
+  assert.equal(await h.turn(100), undefined, "new prompt must not be pruned by a stale handoff reset");
+  assert.ok(!h.events().some(e => e.event === "handoff_committed"));
+});
+
+test("missing UI does not emit mode-mismatch status errors", async () => {
+  const h = await harness("enforce", { enforceCwds: [] });
+  (h.ctx as any).ui = undefined;
+  await h.emit("tool_call", { toolName: "read" });
+  await h.turn(10);
+  assert.ok(!h.events().some(e => e.event === "status_error" || e.event === "hook_error"));
+});
