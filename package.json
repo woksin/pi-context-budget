@@ -1,24 +1,57 @@
 {
   "name": "@woksin/pi-context-budget",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Structured context handoffs and bounded continuous sessions for pi",
   "license": "MIT",
   "author": "woksin",
-  "keywords": ["pi-package", "pi-extension", "pi", "context", "compaction", "handoff"],
-  "repository": { "type": "git", "url": "git+https://github.com/woksin/pi-context-budget.git" },
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi",
+    "context",
+    "compaction",
+    "handoff"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/woksin/pi-context-budget.git"
+  },
   "homepage": "https://github.com/woksin/pi-context-budget#readme",
-  "bugs": { "url": "https://github.com/woksin/pi-context-budget/issues" },
-  "publishConfig": { "access": "public" },
-  "files": ["src/", "bin/pi-session", "README.md", "LICENSE", "package.json"],
+  "bugs": {
+    "url": "https://github.com/woksin/pi-context-budget/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "src/",
+    "bin/pi-session",
+    "README.md",
+    "LICENSE",
+    "package.json"
+  ],
   "type": "module",
-  "engines": { "node": ">=22.19.0" },
-  "bin": { "pi-session": "./bin/pi-session" },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "bin": {
+    "pi-session": "./bin/pi-session"
+  },
   "scripts": {
     "test": "node --test --test-timeout=30000 'test/*.test.ts'",
     "typecheck": "tsc --noEmit",
     "check:shell": "bash -n bin/pi-session"
   },
-  "peerDependencies": { "@earendil-works/pi-coding-agent": "*" },
-  "pi": { "extensions": ["./src/extension.ts"] },
-  "devDependencies": { "@types/node": "^26.0.0", "typescript": "^6.0.0" }
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./src/extension.ts"
+    ]
+  },
+  "devDependencies": {
+    "@types/node": "^26.0.0",
+    "typescript": "^6.0.0"
+  }
 }
