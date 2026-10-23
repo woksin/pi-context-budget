@@ -1,8 +1,21 @@
 # pi-context-budget
 
-Structured context handoffs for [pi](https://github.com/earendil-works/pi): keep working in the **same session and process** while replacing a large conversation with a concise, verified-state handoff. Jobs, subagents and session-scoped integrations stay alive. A `pi-session` wrapper provides fresh-process fallback when in-process recovery is no longer safe.
+Structured context handoffs for pi: keep working in the same session and process while a large conversation is replaced by a concise, verified-state handoff.
+
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) [![npm](https://img.shields.io/npm/v/@woksin/pi-context-budget.svg)](https://www.npmjs.com/package/@woksin/pi-context-budget) [![CI](https://img.shields.io/github/actions/workflow/status/woksin/pi-context-budget/ci.yml?label=CI)](https://github.com/woksin/pi-context-budget/actions/workflows/ci.yml)
+
+Jobs, subagents and session-scoped integrations stay alive. A `pi-session` wrapper provides a fresh-process fallback when in-process recovery is no longer safe.
 
 **Observe by default.** Installing the package does not block tools, compact history or restart sessions until you explicitly enable enforcement.
+
+## Features
+
+- A `context_handoff` tool that separates verified facts, hypotheses and user constraints, with git HEAD collected independently.
+- Observe mode by default, with opt-in enforcement.
+- Idle reset and an overflow backstop.
+- Optional resume checks.
+- A `pi-session` wrapper that relaunches in a fresh process when needed.
+- Config in `context-budget.json` (or `PI_CONTEXT_BUDGET_CONFIG`).
 
 ## Why
 
@@ -228,3 +241,14 @@ Unit tests use `node:test`, fake extension contexts and a fake pi executable; th
 CI runs Node 22/24, installs the tested pi runtime, typechecks, tests, checks Bash syntax and inspects the npm tarball. To release, bump `package.json` and lockfile, commit, and publish a GitHub release tagged `v<version>`. The release workflow reruns CI and uses npm trusted publishing with provenance; configure the npm trusted publisher for this repository, `publish.yml` and the `npm` environment. Creating a release is the publication trigger; a normal push is not.
 
 MIT licensed.
+
+## Related projects
+
+- [pi-setup](https://github.com/woksin/pi-setup): my full pi agent setup (rules, agents, extensions, installer) that ties these together
+- [pi-jobs](https://github.com/woksin/pi-jobs): background shell jobs and watches that wake the agent when they finish
+- [pi-recover](https://github.com/woksin/pi-recover): `/recover` picks up unfinished subagents, workflows and jobs after a crash or usage limit
+- [pi-orch](https://github.com/woksin/pi-orch) (experimental): repo-owner orchestration with an order bus and batched candidate PRs
+
+## License
+
+MIT, see [LICENSE](LICENSE).
