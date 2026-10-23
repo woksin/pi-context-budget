@@ -222,6 +222,14 @@ test("shared guard opt-out disables blocks, handoffs and backstop, including an 
     assert.equal(h.counters().shutdown, 0);
   } finally { delete global[key]; }
 });
+test("primary status exposes hosting identity and active/ended lifecycle", async () => {
+  const h = await harness();
+  assert.equal(h.status().primarySessionId, h.sid);
+  assert.equal(h.status().state, "active");
+  await h.emit("session_shutdown");
+  assert.equal(h.status().primarySessionId, h.sid);
+  assert.equal(h.status().state, "ended");
+});
 test("in-process subagent never writes the inherited parent marker", async () => {
   const hosts = new SessionHosts();
   const parent = hosts.acquire("real-primary");
@@ -235,7 +243,13 @@ test("in-process subagent never writes the inherited parent marker", async () =>
   assert.equal(h.counters().shutdown, 0);
   assert.equal(existsSync(process.env.PI_RELAUNCH_MARKER), false);
   assert.equal(h.status().role, "subagent");
+  assert.equal(h.status().sessionId, h.sid);
+  assert.equal(h.status().pid, process.pid);
+  assert.equal(h.status().primarySessionId, "real-primary");
+  assert.equal(h.status().state, "active");
   await h.emit("session_shutdown"); parent.release();
+  assert.equal(h.status().primarySessionId, "real-primary");
+  assert.equal(h.status().state, "ended");
 });
 test("new external runs clear the idle-only request; invalid config falls back to observe", async () => {
   const h = await harness();

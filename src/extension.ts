@@ -10,6 +10,10 @@ import { resumeCommand, runResumeCheck } from "./resume-check.ts";
 import { appendEvent, atomicJson, gitState, issueClaims, runningState, writeHandoff, writeMarker, processSessionHosts, pendingQuestions, watchCheck, type SessionHosts } from "./storage.ts";
 
 type ActionResult = BoundaryResult & ToolCallEventResult & SessionBeforeCompactResult;
+type StatusState = "active" | "ended";
+function statusIdentity(host: ReturnType<SessionHosts["acquire"]> | undefined, state: StatusState = "active") {
+  return { primarySessionId: host?.primarySessionId, state };
+}
 export default async function (pi: ExtensionAPI) {
   const { getAgentDir } = await import("@earendil-works/pi-coding-agent");
   return createContextBudgetExtension({ agentDir: getAgentDir() })(pi);
@@ -61,13 +65,13 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
       if (mismatch && mismatch !== mismatchLogged) log(ctx, "mode_mismatch", { configured: config.mode, effective: current.effective, reason: current.reason });
       mismatchLogged = mismatch;
     }
-    function status(ctx: ExtensionContext): void {
+    function status(ctx: ExtensionContext, lifecycle?: StatusState): void {
       try {
         const f = frame(ctx), policy = policyStatus(state, f);
         updateModeMismatch(ctx);
         atomicJson(join(stateDir, "status", `${ctx.sessionManager.getSessionId()}.json`), {
           at: new Date().toISOString(), pid: process.pid, sessionId: ctx.sessionManager.getSessionId(), sessionFile: ctx.sessionManager.getSessionFile(),
-          cwd: ctx.cwd, model: ref(ctx), role: host?.subagent ? "subagent" : "main", tokens: state.tokens,
+          cwd: ctx.cwd, model: ref(ctx), role: host?.subagent ? "subagent" : "main", tokens: state.tokens, ...statusIdentity(host, lifecycle),
           thresholds: f.thresholds, floor: state.floor, phase: policy.phase, action: policy.action, projected: f.mode === "observe", lastHandoffPath: state.lastHandoff?.path ?? null,
           lastHandoffTime: state.lastHandoff?.at ?? null, handoffCount: state.count, mode: f.mode, configuredMode: config.mode,
           fallbackReason: policy.fallbackReason, modeMismatchReason: config.mode !== f.mode ? modeStatus(ctx).reason : null,
@@ -285,6 +289,6 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
       await run({ type: "session_compact", owned: !!state.compaction && e.fromExtension }, ctx); status(ctx);
     }));
     pi.on("session_compact_failed", safe(async (e, ctx) => { await run(e, ctx); }));
-    pi.on("session_shutdown", safe((_e, ctx) => { status(ctx); host?.release(); host = undefined; log(ctx, "session_shutdown"); }));
+    pi.on("session_shutdown", safe((_e, ctx) => { status(ctx, "ended"); host?.release(); host = undefined; log(ctx, "session_shutdown"); }));
   };
 }

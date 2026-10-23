@@ -11,12 +11,12 @@ import { boundedAutoState, isSubagent, type AutoState, type Handoff, type Record
 export class SessionHosts {
   private primary?: string;
   private refs = new Map<string, number>();
-  acquire(sessionId: string): { subagent: boolean; release: () => void } {
+  acquire(sessionId: string): { primarySessionId: string; subagent: boolean; release: () => void } {
     this.primary ??= sessionId;
     const subagent = isSubagent({ sessionId, primarySessionId: this.primary });
     this.refs.set(sessionId, (this.refs.get(sessionId) ?? 0) + 1);
     let released = false;
-    return { subagent, release: () => {
+    return { primarySessionId: this.primary, subagent, release: () => {
       if (released) return;
       released = true;
       const count = (this.refs.get(sessionId) ?? 1) - 1;
