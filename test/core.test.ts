@@ -37,14 +37,18 @@ test("process hosting distinguishes live SDK children from forked/resumed primar
   const hosts = new SessionHosts();
   const main = hosts.acquire("main-with-parentSession");
   assert.equal(main.subagent, false);
+  assert.equal(main.primarySessionId, "main-with-parentSession");
   const child = hosts.acquire("in-memory-child-without-parentSession");
   assert.equal(child.subagent, true);
+  assert.equal(child.primarySessionId, main.primarySessionId);
   child.release();
   const resumed = hosts.acquire("resumed-child");
   assert.equal(resumed.subagent, true);
   resumed.release(); main.release();
   const fork = hosts.acquire("fork-with-parentSession");
   assert.equal(fork.subagent, false);
+  assert.equal(fork.primarySessionId, "fork-with-parentSession");
+  assert.equal(child.primarySessionId, "main-with-parentSession");
   fork.release();
   assert.equal(hosts.acquire("resumed-main-with-parentSession").subagent, false);
 });
