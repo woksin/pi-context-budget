@@ -4,6 +4,7 @@ export type Mode = "off" | "observe" | "enforce";
 export interface Thresholds { soft: number; handoff: number; hard: number; minProgress: number }
 export interface Config {
   mode: Mode;
+  overflowRecovery: boolean;
   enforceCwds?: string[];
   resumeChecks?: Record<string, string>;
   main: Thresholds;
@@ -25,6 +26,11 @@ function object(value: unknown, field: string): ObjectValue {
 function positive(value: unknown, fallback: number, field: string): number {
   if (value === undefined) return fallback;
   if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) throw new Error(`${field} must be positive and finite`);
+  return value;
+}
+function boolean(value: unknown, fallback: boolean, field: string): boolean {
+  if (value === undefined) return fallback;
+  if (typeof value !== "boolean") throw new Error(`${field} must be a boolean`);
   return value;
 }
 function integer(value: unknown, fallback: number, field: string): number {
@@ -59,7 +65,7 @@ export function parseConfig(raw: unknown): Config {
   }
   const loop = v.loop === undefined ? {} : object(v.loop, "loop");
   return {
-    mode: mode as Mode, resumeChecks, enforceCwds: allow as string[] | undefined, main, subagent, models,
+    mode: mode as Mode, overflowRecovery: boolean(v.overflowRecovery, true, "overflowRecovery"), resumeChecks, enforceCwds: allow as string[] | undefined, main, subagent, models,
     idleMinutes: positive(v.idleMinutes, 50, "idleMinutes"),
     idleMinTokens: positive(v.idleMinTokens, 300000, "idleMinTokens"),
     keepRecentTokens: positive(v.keepRecentTokens, 20000, "keepRecentTokens"),
@@ -67,6 +73,24 @@ export function parseConfig(raw: unknown): Config {
     loop: { maxHandoffsWithoutProgress: integer(loop.maxHandoffsWithoutProgress, 2, "maxHandoffsWithoutProgress"),
       withinTurns: integer(loop.withinTurns, 8, "withinTurns") },
   };
+}
+const OVERFLOW_PATTERNS = [/prompt (?:is )?too long/i, /request_too_large/i, /exceeds the context window/i,
+  /maximum context length/i, /context[_ ]length[_ ]exceeded/i, /input is too long/i, /too many tokens/i,
+  /token limit exceeded/i, /context (?:window )?overflow/i, /input token count.*exceeds the maximum/i];
+const NON_OVERFLOW_PATTERNS = [/rate limit/i, /too many requests/i, /^(Throttling error|Service unavailable):/i];
+export function isContextOverflowError(text: string): boolean {
+  if (NON_OVERFLOW_PATTERNS.some(pattern => pattern.test(text))) return false;
+  return OVERFLOW_PATTERNS.some(pattern => pattern.test(text));
+}
+export function guardOffCrossings(crossed: { handoff: boolean; hard: boolean }, tokens: number | null, t: Thresholds) {
+  const fired: ("handoff" | "hard")[] = [];
+  if (tokens === null) return { crossed, fired };
+  const next = { ...crossed };
+  for (const level of ["handoff", "hard"] as const) {
+    next[level] = tokens >= t[level];
+    if (next[level] && !crossed[level]) fired.push(level);
+  }
+  return { crossed: next, fired };
 }
 export function effectiveMode(config: Config, cwd: string, guardOff = false): Mode {
   if (guardOff) return "off";

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseConfig, effectiveMode, isSubagent, ownsWrapper, modelThresholds, renderHandoff, MAX_HANDOFF_BYTES } from "../src/core.ts";
+import { isContextOverflowError, guardOffCrossings, parseConfig, effectiveMode, isSubagent, ownsWrapper, modelThresholds, renderHandoff, MAX_HANDOFF_BYTES } from "../src/core.ts";
 import { atomicJson, issueClaims, runningState, writeHandoff, writeMarker, SessionHosts } from "../src/storage.ts";
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
@@ -10,6 +10,33 @@ mkdirSync(root, { recursive: true });
 const dir = () => mkdtempSync(join(root, "case-"));
 const config = parseConfig({});
 const t = config.main;
+test("overflow recovery configuration defaults and validation", () => {
+  assert.equal(parseConfig({}).overflowRecovery, true);
+  assert.equal(parseConfig({ overflowRecovery: false }).overflowRecovery, false);
+  assert.throws(() => parseConfig({ overflowRecovery: "yes" }), /overflowRecovery must be a boolean/);
+});
+test("provider overflow recognition excludes throttling and unrelated failures", () => {
+  const messages = ['400 {"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 1000464 tokens > 1000000 maximum"}}',
+    "prompt too long", "request_too_large", "exceeds the context window", "maximum context length", "context_length_exceeded",
+    "input is too long", "too many tokens", "token limit exceeded", "context overflow", "context window overflow", "input token count 100 exceeds the maximum"];
+  for (const message of messages) assert.equal(isContextOverflowError(message), true, message);
+  for (const message of ["rate limit: too many tokens per minute", "too many requests: context overflow", "Throttling error: too many tokens", "Service unavailable: context overflow", "provider failed"]) {
+    assert.equal(isContextOverflowError(message), false, message);
+  }
+});
+test("guard-off crossings fire once per level and re-arm below thresholds", () => {
+  const clear = { handoff: false, hard: false };
+  assert.deepEqual(guardOffCrossings(clear, null, t), { crossed: clear, fired: [] });
+  const handoff = guardOffCrossings(clear, t.handoff, t);
+  assert.deepEqual(handoff.fired, ["handoff"]);
+  assert.deepEqual(guardOffCrossings(handoff.crossed, t.handoff + 1, t).fired, []);
+  const hard = guardOffCrossings(handoff.crossed, t.hard, t);
+  assert.deepEqual(hard.fired, ["hard"]);
+  assert.deepEqual(guardOffCrossings(hard.crossed, null, t).crossed, hard.crossed);
+  const dropped = guardOffCrossings(hard.crossed, t.handoff - 1, t);
+  assert.deepEqual(dropped.crossed, clear);
+  assert.deepEqual(guardOffCrossings(dropped.crossed, t.hard, t).fired, ["handoff", "hard"]);
+});
 test("defaults, model overrides, roles and validated config", () => {
   assert.equal(config.mode, "observe");
   assert.equal(t.handoff, 400000);

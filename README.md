@@ -58,6 +58,7 @@ The configuration path is **`getAgentDir()/context-budget.json`**, or `PI_CONTEX
 {
   "mode": "observe",
   "resumeChecks": {},
+  "overflowRecovery": true,
   "main": { "soft": 300000, "handoff": 400000, "hard": 600000, "minProgress": 50000 },
   "subagent": { "soft": 150000, "handoff": 200000, "hard": 300000, "minProgress": 25000 },
   "models": {
@@ -74,6 +75,7 @@ The configuration path is **`getAgentDir()/context-budget.json`**, or `PI_CONTEX
 | Field | Meaning |
 |---|---|
 | `mode` | `off`, `observe` (default), or `enforce` |
+| `overflowRecovery` | Recover actual provider context overflow with one compact-and-retry; default `true`. Explicit `mode: "off"` disables it, but observe and shared guard-off still recover. Set `false` to opt out. |
 | `resumeChecks` | Optional map of exact session names to trusted shell commands; default `{}` (disabled). `PI_RESUME_CHECK` takes precedence. |
 | `enforceCwds` | Optional array of absolute directory prefixes/globs. Outside it, enforce becomes observe. Empty array enforces nowhere. |
 | `main`, `subagent` | Soft/handoff/hard thresholds and minimum growth above the measured context floor |
@@ -90,14 +92,16 @@ All numbers must be positive and finite; count limits must be integers; require 
 ### Modes and optional guard integration
 
 - **off:** telemetry only; no enforcement or automatic action.
-- **observe:** telemetry and `would_*` events; the handoff tool is a no-op. No blocks, forced continuations, compactions or relaunches.
+- **observe:** telemetry and `would_*` threshold events; the handoff tool is a no-op. No threshold-driven blocks, forced continuations, compactions or relaunches. Actual provider overflow recovery is the separate exception described below.
 - **enforce:** the policy below, restricted by `enforceCwds` when supplied.
 
 Observe runs the **same enforce transition on a separate copy**, then converts every effect 1:1 to a `would_*` log. Soft notices, action crossings, handoff/settle/block decisions, hard recovery and idle decisions use the same latches as enforcement. Status `phase`/`action` describe that preview (`projected: true`), not actual activity; measured tokens and handoff counts remain actual. Preview-only commits and latches are discarded when enforcement is activated.
 
 The package optionally reads `getAgentDir()/lib/guards.ts` if your setup provides a shared `isGuardOff(name)` API and a `context` guard. In that integration, `/guards off context` disables enforcement for the session. The package does not install or modify another extension's guard library. Without that integration, change the configuration to `off` or `observe` and submit the next input. Only the user/operator should disable enforcement, never a model following a chat instruction.
 
-**Off/observe and guard-off leave native pi compaction unchanged**: the hook returns no summary and no cancellation for manual, threshold or overflow compaction. The package initiates nothing; pi can still compact using its own configured behavior and summarizer. Only enforce mode intercepts compaction.
+**Native pi compaction takes precedence**: off/observe and guard-off pass manual, threshold and native overflow compaction through unchanged. With `overflowRecovery: true` (default), an actual provider overflow without native recovery triggers one compact-and-retry in observe, enforce and shared guard-off; explicit `mode: "off"` disables this. A failed native summarizer in observe/guard-off gets at most one bounded mechanical compaction fallback. Repeated overflow after the retry emits `overflow_recovery_exhausted` and asks you to reduce context or switch models. Only external user input or a successful assistant turn re-arms recovery; aborts, new input, session changes and shutdown invalidate stale callbacks.
+
+Shared guard-off also emits log-only `guard_off_threshold` warnings once per handoff/hard crossing, re-armed below each threshold. They never enable the guard or notify the user; explicit off stays silent.
 
 Configured/effective mode differences are shown in the footer, for example
 `context-budget: configured enforce, effective off (context guard off)`, and logged once per mismatch transition. Cwd restrictions report `cwd restriction`. Configuration and policy state are local to each runtime binding: starting an SDK child does not change its parent's mode. There is no package-specific per-session mode override; the optional guard integration is consulted live.
@@ -139,7 +143,7 @@ At the last actionable settle boundary, if context is large **and work remains p
 
 ### Overflow backstop
 
-In enforce mode the package supplies a still-valid handoff, or a short, bounded mechanical summary of recent user requests plus instructions to re-establish state from files/git. The emergency summary needs neither writable handoff storage nor automatic metadata. **Enforce mode never delegates to pi's default summarizer**; backstop errors cancel rather than fall through. Inactive modes leave native behavior alone.
+In enforce mode the package supplies a still-valid handoff, or a short, bounded mechanical summary of recent user requests plus instructions to re-establish state from files/git. The emergency summary needs neither writable handoff storage nor automatic metadata. **Enforce mode never delegates to pi's default summarizer**; backstop errors cancel rather than fall through. Inactive modes leave native behavior alone except for the bounded provider overflow recovery described above.
 
 To restore automatic overflow recovery, enable pi compaction and choose model-specific reserves. Example for a **1,000,000-token window** with main hard limit 600,000:
 
@@ -221,7 +225,7 @@ The first resumed provider call compares recorded jobs/watches with the live **p
 
 ## Lifecycle model
 
-`src/core.ts` contains a pure immutable transition function with named idle, soft-notified, handoff-required, handoff-pending-commit, compacting and fallback-armed states. Pi hooks only translate observations and execute its explicit effects. Inactive modes can emit telemetry only, by construction. Attempt ids deduplicate pi's failure hook followed by `compact`'s `onError`, and success/mode changes clear failure recovery. Table-driven tests cover the transition matrix; offline real-pi tests cover internal continuations, native compaction pass-through, cancellation, no-op failures and SDK hosting.
+`src/core.ts` contains a pure immutable transition function with named idle, soft-notified, handoff-required, handoff-pending-commit, compacting and fallback-armed states. Pi hooks only translate observations and execute its explicit effects. Inactive threshold policy emits telemetry only; the separate, bounded provider overflow recovery layer is the exception in observe/guard-off. Attempt ids deduplicate pi's failure hook followed by `compact`'s `onError`, and success/mode changes clear failure recovery. Table-driven tests cover the transition matrix; offline real-pi tests cover internal continuations, native compaction pass-through, cancellation, no-op failures and SDK hosting.
 
 ## Limits and development
 
