@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { initialState, transition, parseConfig, classifyFailure, MAX_COMPACTION_RETRIES, restoreHistory, type HistoryItem, type MachineState, type MachineEvent, type Frame, type Effect } from "../src/core.ts";
+import { initialState, transition, policyStatus, parseConfig, classifyFailure, MAX_COMPACTION_RETRIES, restoreHistory, type HistoryItem, type MachineState, type MachineEvent, type Frame, type Effect } from "../src/core.ts";
 
 const config = parseConfig({ mode: "enforce", main: { soft: 100, handoff: 200, hard: 1000, minProgress: 50 } });
 const f: Frame = { mode: "enforce", tokens: 300, thresholds: config.main, config, wrapped: false };
@@ -32,10 +32,10 @@ const cases: { name: string; state?: Partial<MachineState>; event: MachineEvent;
   { name: "backstop IO failure is a machine-authorized cancellation", event: { type: "backstop_failed", reason: "overflow", errorMessage: "EACCES" }, frame: { tokens: 100 }, phase: "fallback-armed", effects: ["log", "cancel_compaction"] },
   { name: "backstop starts owned attempt", event: { type: "session_before_compact", reason: "threshold" }, phase: "compacting", effects: ["backstop"] },
   { name: "successful compaction disarms persistent fallback", state: { compactionFallback: true, failures: 3 }, event: { type: "session_compact", owned: true }, phase: "idle", effects: [] },
-  { name: "loop cannot be bypassed by a pending handoff", state: { handoffTurns: [0, 0, 0], pending: h, softNotified: true }, event: turn, phase: "fallback-armed", effects: [] },
-  { name: "cap cannot be bypassed by a pending handoff", state: { count: 10, pending: h, softNotified: true }, event: turn, phase: "fallback-armed", effects: [] },
+  { name: "loop cannot be bypassed by a pending handoff", state: { handoffTurns: [0, 0, 0], pending: h, softNotified: true }, event: turn, phase: "degraded", effects: [] },
+  { name: "cap cannot be bypassed by a pending handoff", state: { count: 10, pending: h, softNotified: true }, event: turn, phase: "degraded", effects: [] },
   { name: "cap wrapper fallback", state: { count: 10, stored: h }, event: { type: "agent_settled", now: 1, aborted: false, pendingWork: false }, frame: { wrapped: true }, phase: "fallback-armed", effects: ["relaunch"] },
-  { name: "unowned wrapper never shuts down", state: { count: 10 }, event: { type: "agent_settled", now: 1, aborted: false, pendingWork: false }, phase: "fallback-armed", effects: ["log"] },
+  { name: "unowned wrapper never shuts down, degrades with one notice", state: { count: 10 }, event: { type: "agent_settled", now: 1, aborted: false, pendingWork: false }, phase: "degraded", effects: ["log", "notify_degraded"] },
   { name: "overflow error can recover at settled", state: { count: 10, providerFailure: "overflow" }, event: { type: "agent_settled", now: 1, aborted: false, pendingWork: false }, frame: { wrapped: true }, phase: "fallback-armed", effects: ["relaunch"] },
   { name: "provider failure never authorizes restart", state: { count: 10, providerFailure: "error" }, event: { type: "agent_settled", now: 1, aborted: false, pendingWork: false }, frame: { wrapped: true }, phase: "fallback-armed", effects: [] },
   { name: "user abort never authorizes restart", state: { count: 10 }, event: { type: "agent_settled", now: 1, aborted: true, pendingWork: false }, frame: { wrapped: true }, phase: "fallback-armed", effects: [] },
@@ -97,7 +97,7 @@ test("idle commits outlive the session cap; budget and hard commits still hit it
     const idle = source === "idle";
     const c = { ...config, idleMinTokens: 50,
       loop: idle ? config.loop : { ...config.loop, maxHandoffsWithoutProgress: config.maxHandoffsPerSession + 1 } };
-    const frame = { ...f, config: c, tokens: idle ? 100 : source === "hard" ? 1200 : 300 };
+    const frame = { ...f, wrapped: true, config: c, tokens: idle ? 100 : source === "hard" ? 1200 : 300 };
     let state = base();
     for (let n = 0; n < (idle ? c.maxHandoffsPerSession + 5 : c.maxHandoffsPerSession); n++) {
       state = transition(state, { type: "before_agent_start" }, frame).state;
@@ -161,4 +161,56 @@ test("success resets hard recovery and loop progress re-arms only after fresh gr
   assert.deepEqual(allowed.effects, []);
   const loop = transition(base({ handoffTurns: [0, 0, 0] }), { type: "tool_end", tool: "read", id: "ok", error: false }, f);
   assert.notEqual(loop.state.phase, "fallback-armed");
+});
+
+const call = { type: "tool_call", tool: "write", id: "a" } as const;
+const settled = { type: "agent_settled", now: 1, aborted: false, pendingWork: false } as const;
+for (const [kind, st] of [["cap", { count: 10 }], ["loop", { handoffTurns: [0, 0, 0] }]] as [string, Partial<MachineState>][]) {
+  test(`unwrapped ${kind}: tools are not blocked, one notice, no steer`, () => {
+    let s = base({ ...st, stored: h });
+    for (const ev of [call, { type: "agent_before_settle", pendingWork: true } as const]) {
+      const r = transition(s, ev, f); s = r.state; assert.deepEqual(r.effects.filter(e => e.type !== "log"), []);
+    }
+    const first = transition(s, settled, f);
+    assert.deepEqual(first.effects.filter(e => e.type === "notify_degraded"), [{ type: "notify_degraded", reason: kind }]);
+    const second = transition(first.state, settled, f);
+    assert.deepEqual(kinds(second.effects), []);
+    assert.deepEqual(kinds(transition(second.state, call, f).effects), []);
+  });
+  test(`wrapped ${kind}: still blocks and relaunches`, () => {
+    const w = { ...f, wrapped: true };
+    assert.deepEqual(kinds(transition(base({ ...st, stored: h }), call, w).effects), ["block"]);
+    assert.deepEqual(kinds(transition(base({ ...st, stored: h }), settled, w).effects), ["relaunch"]);
+  });
+}
+test("unwrapped restored cap session is unblocked", () => {
+  const s = restoreHistory(Array.from({ length: 10 }, () => ({ type: "compaction", owned: true, source: "budget" }) as HistoryItem), "enforce");
+  assert.deepEqual(kinds(transition(s, call, f).effects), []);
+});
+test("unwrapped hard fallback is unchanged", () => {
+  assert.deepEqual(kinds(transition(base(), call, { ...f, tokens: 1200 }).effects), ["block"]);
+  assert.deepEqual(kinds(transition(base(), settled, { ...f, tokens: 1200 }).effects), ["log"]);
+});
+
+for (const [kind, st] of [["cap", { count: 10 }], ["loop", { handoffTurns: [0, 0, 0] }]] as [string, Partial<MachineState>][]) {
+  test(`unwrapped ${kind} with a stale pending handoff: no block, prepare is accepted`, () => {
+    const s = base({ ...st, pending: h, stored: h });
+    assert.deepEqual(kinds(transition(s, call, f).effects), []);
+    const prep = transition(s, { type: "handoff_prepare" }, f);
+    assert.deepEqual(kinds(prep.effects), ["write_handoff"]);
+    assert.equal(prep.state.pending, undefined);
+    const again = transition(transition(prep.state, { type: "handoff_written", handoff: h }, f).state, { type: "handoff_prepare" }, f);
+    assert.deepEqual(kinds(again.effects), ["write_handoff"]);
+  });
+  test(`status: ${kind} is degraded/none unwrapped, fallback-armed/relaunch wrapped`, () => {
+    const s = base(st);
+    assert.deepEqual(policyStatus(s, f), { phase: "degraded", action: "none", fallbackReason: kind });
+    const w = policyStatus(s, { ...f, wrapped: true });
+    assert.equal(w.phase, "fallback-armed"); assert.equal(w.action, "relaunch");
+    assert.equal(transition(s, turn, f).state.phase, "degraded");
+  });
+}
+test("status: unwrapped hard stays fallback-armed/relaunch", () => {
+  const p = policyStatus(base({ tokens: 1200 }), { ...f, tokens: 1200 });
+  assert.equal(p.phase, "fallback-armed"); assert.equal(p.action, "relaunch");
 });
