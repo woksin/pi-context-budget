@@ -115,7 +115,7 @@ export function modelThresholds(config: Config, model: string, sub: boolean): Th
   const role = sub ? "subagent" : "main";
   return { ...config[role], ...config.models[model]?.[role] };
 }
-export type Phase = "idle" | "soft-notified" | "handoff-required" | "handoff-pending-commit" | "compacting" | "fallback-armed";
+export type Phase = "idle" | "soft-notified" | "handoff-required" | "handoff-pending-commit" | "compacting" | "fallback-armed" | "degraded";
 export type Fallback = "hard" | "loop" | "cap" | "compaction";
 export type CommitSource = "idle" | "budget";
 type BudgetAction = "none" | "handoff" | "relaunch";
@@ -185,6 +185,11 @@ export function fallbackFor(s: MachineState, f: Frame): Fallback | undefined {
   if (s.tokens !== null && s.tokens >= f.thresholds.hard) return "hard";
   return undefined;
 }
+/** Cap/loop with no wrapper cannot relaunch: enforcement degrades to notify-only. */
+function degradedFor(s: MachineState, f: Frame): "cap" | "loop" | undefined {
+  const fb = fallbackFor(s, f);
+  return (fb === "cap" || fb === "loop") && !f.wrapped ? fb : undefined;
+}
 function handoffRequired(s: MachineState, f: Frame): boolean {
   return s.tokens !== null && s.floor !== null && s.tokens >= f.thresholds.handoff && s.tokens - s.floor >= f.thresholds.minProgress;
 }
@@ -209,12 +214,14 @@ function phase(s: MachineState, f: Frame): Phase {
   if (s.mode === "off") return "idle";
   if (s.mode === "observe" && s.observation) s = s.observation;
   if (s.compaction) return "compacting";
+  if (degradedFor(s, f)) return "degraded";
   if (fallbackFor(s, f)) return "fallback-armed";
   if (s.pending) return "handoff-pending-commit";
   if (handoffRequired(s, f)) return "handoff-required";
   return s.softNotified ? "soft-notified" : "idle";
 }
 function budgetAction(s: MachineState, f: Frame): BudgetAction {
+  if (degradedFor(s, f)) return "none";
   return fallbackFor(s, f) ? "relaunch" : handoffRequired(s, f) ? "handoff" : "none";
 }
 /** Status uses the same policy view as decisions, not the inactive actual-state shell. */
@@ -222,7 +229,7 @@ export function policyStatus(s: MachineState, f: Frame) {
   if (f.mode === "off") return { phase: "idle" as Phase, action: "none", fallbackReason: null };
   const view = f.mode === "observe" ? s.observation ?? s : { ...s, mode: "enforce" as const, observation: undefined };
   const current = phase(view, f);
-  const actions = { idle: "none", "soft-notified": "soft", "handoff-required": "handoff", "handoff-pending-commit": "handoff", compacting: "compact", "fallback-armed": "relaunch" };
+  const actions = { idle: "none", "soft-notified": "soft", "handoff-required": "handoff", "handoff-pending-commit": "handoff", compacting: "compact", degraded: "none", "fallback-armed": "relaunch" };
   return { phase: current, action: actions[current], fallbackReason: fallbackFor(view, f) ?? null };
 }
 function policyTrace(s: MachineState, e: MachineEvent, f: Frame): LogEffect[] {
@@ -286,13 +293,15 @@ function compactionFailed(s: MachineState, e: Extract<MachineEvent, { type: "ses
 function active(s: MachineState, e: MachineEvent, f: Frame): Effect[] {
   const fallback = fallbackFor(s, f);
   // Cap/loop with no wrapper cannot relaunch: degrade to notify-only so the session is never deadlocked.
-  if ((fallback === "cap" || fallback === "loop") && !f.wrapped) {
+  const degraded = degradedFor(s, f);
+  if (degraded) {
     switch (e.type) {
       case "tool_call": case "agent_before_settle": return [];
+      case "handoff_prepare": s.pending = undefined; s.pendingSource = undefined; return [{ type: "write_handoff", idleOnly: s.settleRequest === "idle" }];
       case "agent_settled":
         if (s.degradedNotified) return [];
         s.degradedNotified = true;
-        return [{ type: "log", event: "relaunch_unavailable", data: { reason: fallback } }, { type: "notify_degraded", reason: fallback }];
+        return [{ type: "log", event: "relaunch_unavailable", data: { reason: degraded } }, { type: "notify_degraded", reason: degraded }];
       default: break;
     }
   }
