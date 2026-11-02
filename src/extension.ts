@@ -5,7 +5,7 @@ import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
 import { effectiveMode, modelThresholds, parseConfig, renderHandoff, validateHandoff, ownsWrapper, initialState, transition, policyStatus,
-  restoreHistory, handoffBackoff, forced, type Effect, type Frame, type MachineEvent, type Handoff, type HandoffInput, type HistoryItem } from "./core.ts";
+  restoreHistory, handoffBackoff, forced, degradedFor, type Effect, type Frame, type MachineEvent, type Handoff, type HandoffInput, type HistoryItem } from "./core.ts";
 import { OverflowRecovery } from "./overflow-recovery.ts";
 import { resumeCommand, runResumeCheck } from "./resume-check.ts";
 import { appendEvent, atomicJson, gitState, issueClaims, runningState, writeHandoff, writeMarker, processSessionHosts, pendingQuestions, watchCheck, type SessionHosts } from "./storage.ts";
@@ -251,6 +251,10 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
         if (refusal) throw new Error(refusal);
         const handoff = await createHandoff(ctx, input);
         await run({ type: "handoff_written", handoff }, ctx);
+        const degraded = degradedFor(state, frame(ctx));
+        if (degraded) {
+          return { content: [{ type: "text", text: `Handoff written to ${handoff.path}. The session reached its handoff ${degraded === "cap" ? "cap" : "loop limit"} and cannot relaunch, so the context will not reset: continue the task, and ask the user to start a fresh session from this handoff.` }], details: { handoff } };
+        }
         return { content: [{ type: "text", text: intent.idleOnly ? "Handoff stored. End this turn without further tools; the context resets at the end of this turn." : "Handoff stored. End this turn without further tools; recovery continues automatically." }], details: { handoff } };
       },
     });
