@@ -186,7 +186,7 @@ export function fallbackFor(s: MachineState, f: Frame): Fallback | undefined {
   return undefined;
 }
 /** Cap/loop with no wrapper cannot relaunch: enforcement degrades to notify-only. */
-function degradedFor(s: MachineState, f: Frame): "cap" | "loop" | undefined {
+export function degradedFor(s: MachineState, f: Frame): "cap" | "loop" | undefined {
   const fb = fallbackFor(s, f);
   return (fb === "cap" || fb === "loop") && !f.wrapped ? fb : undefined;
 }
