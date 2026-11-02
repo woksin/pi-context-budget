@@ -136,6 +136,9 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
           case "notify":
             log(ctx, "soft_crossing");
             ctx.ui.notify("Context is large: finish the current step first; hand off at the next natural boundary. No handoff is required at the soft threshold.", "info"); break;
+          case "notify_degraded":
+            log(ctx, `${effect.reason}_degraded`);
+            ctx.ui.notify(`Context-budget ${effect.reason === "cap" ? "handoff cap" : "handoff loop limit"} reached and no relaunch wrapper is available. Tools stay available and handoffs are no longer enforced; start a fresh session soon (/new, or relaunch under the wrapper).`, "warning"); break;
           case "block":
             log(ctx, "blocked", { reason: effect.reason }); result = { block: true, reason: effect.reason }; break;
           case "reject_handoff": throw new Error(effect.reason);

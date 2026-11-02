@@ -131,6 +131,8 @@ export interface MachineState {
   attempt: number; blockedCalls: string[]; lastSettled: number; observedIdle: boolean;
   providerFailure: "none" | "error" | "overflow" | "aborted";
   relaunchSent: boolean; lastAction: BudgetAction;
+  /** Unwrapped cap/loop notice already emitted (once per session). */
+  degradedNotified?: boolean;
   /** Counterfactual policy state only; never mixed into actual history or action execution. */
   observation?: MachineState;
 }
@@ -154,6 +156,7 @@ export type MachineEvent =
 export type Effect =
   | { type: "log"; event: string; data?: Record<string, unknown> }
   | { type: "notify" }
+  | { type: "notify_degraded"; reason: "cap" | "loop" }
   | { type: "write_handoff"; idleOnly: boolean }
   | { type: "reject_handoff"; reason: string }
   | { type: "block"; reason: string }
@@ -240,6 +243,7 @@ function wouldLog(effect: Effect, s: MachineState, f: Frame): LogEffect {
       event = aliases[effect.event] ?? `would_${effect.event}`; break;
     }
     case "notify": event = "would_soft_notice"; break;
+    case "notify_degraded": event = `would_${effect.reason}_degraded`; break;
     case "write_handoff": event = effect.idleOnly ? "would_idle_handoff_write" : "would_handoff_write"; break;
     case "reject_handoff": event = "would_handoff_rejected"; break;
     case "block": event = "would_block"; break;
@@ -281,6 +285,17 @@ function compactionFailed(s: MachineState, e: Extract<MachineEvent, { type: "ses
 }
 function active(s: MachineState, e: MachineEvent, f: Frame): Effect[] {
   const fallback = fallbackFor(s, f);
+  // Cap/loop with no wrapper cannot relaunch: degrade to notify-only so the session is never deadlocked.
+  if ((fallback === "cap" || fallback === "loop") && !f.wrapped) {
+    switch (e.type) {
+      case "tool_call": case "agent_before_settle": return [];
+      case "agent_settled":
+        if (s.degradedNotified) return [];
+        s.degradedNotified = true;
+        return [{ type: "log", event: "relaunch_unavailable", data: { reason: fallback } }, { type: "notify_degraded", reason: fallback }];
+      default: break;
+    }
+  }
   switch (e.type) {
     case "tool_call":
       if (e.tool !== "context_handoff" && (s.pending || fallback || handoffRequired(s, f))) {
