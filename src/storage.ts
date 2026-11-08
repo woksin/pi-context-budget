@@ -54,12 +54,27 @@ export function writeMarker(path: string, marker: Marker): void {
   }
   atomicJson(path, marker);
 }
+function git(cwd: string, ...args: string[]): string | undefined {
+  try { return execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8", timeout: 1500, maxBuffer: 65536, stdio: ["ignore", "pipe", "ignore"] }).trim(); }
+  catch { return undefined; }
+}
 export function gitState(cwd: string): Pick<AutoState, "cwd" | "root" | "branch" | "head"> {
-  const git = (...args: string[]) => {
-    try { return execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8", timeout: 1500, maxBuffer: 65536, stdio: ["ignore", "pipe", "ignore"] }).trim(); }
-    catch { return ""; }
-  };
-  return { cwd: resolve(cwd), root: git("rev-parse", "--show-toplevel") || resolve(cwd), branch: git("branch", "--show-current") || "unknown/detached", head: git("rev-parse", "HEAD") || "unknown" };
+  return { cwd: resolve(cwd), root: git(cwd, "rev-parse", "--show-toplevel") || resolve(cwd), branch: git(cwd, "branch", "--show-current") || "unknown/detached", head: git(cwd, "rev-parse", "HEAD") || "unknown" };
+}
+/** Working-tree and upstream detail for handoffs only (gitState runs on every handoff attempt). */
+export function gitDetail(cwd: string): { dirty: string[]; sync: string } {
+  const status = git(cwd, "status", "--short");
+  const lines = status ? status.split("\n").map(line => Array.from(line).slice(0, 200).join("")) : [];
+  const dirty = lines.length > 30 ? [...lines.slice(0, 30), `…(${lines.length - 30} more)`] : lines;
+  const counts = git(cwd, "rev-list", "--left-right", "--count", "@{u}...HEAD")?.split(/\s+/);
+  const sync = status === undefined ? "unknown" : counts === undefined ? (git(cwd, "rev-parse", "--abbrev-ref", "@{u}") === undefined ? "no upstream" : "unknown")
+    : `ahead ${counts[1]}, behind ${counts[0]} (upstream)`;
+  return { dirty, sync };
+}
+/** Launch-prompt text is stored beside the handoff so the relaunch marker always references an absolute file. */
+export function writeLaunchPrompt(path: string, text: string): void {
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  writeFileSync(path, text, { flag: "wx", mode: 0o600 });
 }
 interface RunningRecord { id?: string; agentId?: string; status?: string; cwd?: string; command?: string; kind?: string; label?: string; until?: string; intervalSeconds?: number; timeoutSeconds?: number; logPath?: string; description?: string; session?: { sessionId?: string } }
 interface SubRegistry { hasRunning?: () => boolean; listAgents?: () => RunningRecord[]; getRecord?: (id: string) => RunningRecord | undefined }

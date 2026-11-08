@@ -1,14 +1,14 @@
 /** Pi adapter: collect observations, translate events, execute pure-machine outputs. */
 import type { ExtensionAPI, ExtensionContext, BoundaryResult, ToolCallEventResult, SessionBeforeCompactResult } from "@earendil-works/pi-coding-agent";
-import { existsSync, readFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
-import { effectiveMode, modelThresholds, parseConfig, renderHandoff, validateHandoff, ownsWrapper, initialState, transition, policyStatus,
+import { effectiveMode, modelThresholds, parseConfig, renderHandoff, validateHandoff, ownsWrapper, effectiveThresholds, launchPromptKind, shorten, RETRY, normalizeFilesToRead, REQUIRED, initialState, transition, policyStatus,
   restoreHistory, handoffBackoff, forced, degradedFor, type Effect, type Frame, type MachineEvent, type Handoff, type HandoffInput, type HistoryItem } from "./core.ts";
 import { OverflowRecovery } from "./overflow-recovery.ts";
 import { resumeCommand, runResumeCheck } from "./resume-check.ts";
-import { appendEvent, atomicJson, gitState, issueClaims, runningState, writeHandoff, writeMarker, processSessionHosts, pendingQuestions, watchCheck, type SessionHosts } from "./storage.ts";
+import { appendEvent, atomicJson, gitDetail, gitState, issueClaims, runningState, writeHandoff, writeLaunchPrompt, writeMarker, processSessionHosts, pendingQuestions, watchCheck, type SessionHosts } from "./storage.ts";
 
 type ActionResult = BoundaryResult & ToolCallEventResult & SessionBeforeCompactResult;
 type StatusState = "active" | "ended";
@@ -75,7 +75,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
         atomicJson(join(stateDir, "status", `${ctx.sessionManager.getSessionId()}.json`), {
           at: new Date().toISOString(), pid: process.pid, sessionId: ctx.sessionManager.getSessionId(), sessionFile: ctx.sessionManager.getSessionFile(),
           cwd: ctx.cwd, model: ref(ctx), role: host?.subagent ? "subagent" : "main", tokens: state.tokens, ...statusIdentity(host, lifecycle),
-          thresholds: f.thresholds, floor: state.floor, phase: policy.phase, action: policy.action, projected: f.mode === "observe", lastHandoffPath: state.lastHandoff?.path ?? null,
+          thresholds: f.thresholds, floor: state.floor, effectiveThresholds: effectiveThresholds(state.floor, f.thresholds), phase: policy.phase, action: policy.action, projected: f.mode === "observe", lastHandoffPath: state.lastHandoff?.path ?? null,
           lastHandoffTime: state.lastHandoff?.at ?? null, handoffCount: state.count, mode: f.mode, configuredMode: config.mode,
           fallbackReason: policy.fallbackReason, modeMismatchReason: config.mode !== f.mode ? modeStatus(ctx).reason : null,
           wrapper: f.wrapped, relaunchMarker: f.wrapped ? process.env.PI_RELAUNCH_MARKER : null,
@@ -87,12 +87,18 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
       let claims: unknown[] = [];
       try { claims = issueClaims(join(agentDir, "issue-work/registry.jsonl"), ctx.sessionManager.getSessionId()); }
       catch { running.unavailable.push("issue_work registry absent/unreadable"); }
-      return { ...gitState(ctx.cwd), ...running, claims,
+      return { ...gitState(ctx.cwd), ...gitDetail(ctx.cwd), ...running, claims,
         questions: pendingQuestions(process.env.PI_QUESTIONS_HOME || join(agentDir, "user-questions"), ctx.sessionManager.getSessionId()) };
     }
     function checkCommand(ctx: ExtensionContext) {
       if (host?.subagent) return undefined;
       return resumeCommand(config, ctx.sessionManager.getSessionName?.());
+    }
+    const isFile = (path: string) => { try { return statSync(path).isFile(); } catch { return false; } };
+    function checkLaunchPrompt(input: HandoffInput): void {
+      if (input.launch_prompt !== undefined && launchPromptKind(input.launch_prompt, isFile) === "missing") {
+        throw new Error(`launch_prompt file not found: ${shorten(input.launch_prompt)}; pass prompt text or an existing absolute path. ${RETRY}`);
+      }
     }
     async function createHandoff(ctx: ExtensionContext, input: HandoffInput): Promise<Handoff> {
       validateHandoff(input);
@@ -101,6 +107,12 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
       const auto = { ...autoState(ctx), resumeCheck }, id = ctx.sessionManager.getSessionId();
       let path: string;
       do { path = join(auto.root, ".ai-work/handoffs", `${id}-${++sequence}.md`); } while (existsSync(path));
+      // Prompt text becomes a file beside the handoff, so the relaunch marker always holds an absolute file path.
+      if (input.launch_prompt !== undefined && launchPromptKind(input.launch_prompt, isFile) === "text") {
+        const promptPath = join(dirname(path), `${id}-${sequence}.launch-prompt.md`);
+        writeLaunchPrompt(promptPath, input.launch_prompt);
+        input = { ...input, launch_prompt: promptPath };
+      }
       const h = renderHandoff(input, auto, id, sequence, path, new Date().toISOString());
       writeHandoff(h, auto);
       log(ctx, "handoff_written", { path, n: h.n, bytes: Buffer.byteLength(h.text) });
@@ -141,6 +153,9 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
             ctx.ui.notify("Context-budget handoff loop limit reached and no relaunch wrapper is available. Tools stay available and handoff enforcement is paused until a tool call makes progress; start a fresh session soon (/new, or relaunch under the wrapper).", "warning"); break;
           case "notify_cap_advisory":
             ctx.ui.notify(`Context-budget: ${effect.count} handoffs this session (cap ${effect.cap}). In-place handoffs keep working, but a fresh session is recommended (/new from the latest handoff, or run under pi-session).`, "warning"); break;
+          case "notice_required":
+            log(ctx, "required_notice");
+            result = { entries: [{ type: "custom_message", customType: "context-budget", display: true, content: REQUIRED }] }; break;
           case "block":
             log(ctx, "blocked", { reason: effect.reason }); result = { block: true, reason: effect.reason }; break;
           case "reject_handoff": throw new Error(effect.reason);
@@ -236,9 +251,15 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
       name: "context_handoff", label: "Context handoff",
       description: "Write a concise structured handoff, then END THIS TURN without more tools. Recovery continues automatically; an idle request resets the context at the end of this turn. Separate facts from hypotheses and preserve user constraints verbatim.",
       parameters: { type: "object", properties: {
-        goal: { type: "string", minLength: 1 }, next_step: { type: "string", minLength: 1 }, facts: { type: "string", minLength: 1 },
-        decisions: { type: "string" }, user_constraints: { type: "string" }, open_items: { type: "string" }, hypotheses: { type: "string" },
-        files_to_read: { type: "array", items: { type: "string" } }, launch_prompt: { type: "string" },
+        goal: { type: "string", minLength: 1, description: "What the session is trying to achieve." },
+        next_step: { type: "string", minLength: 1, description: "The single next action to take on resume." },
+        facts: { type: "string", minLength: 1, description: "Verified facts only; verify before relying on them." },
+        decisions: { type: "string", description: "Decisions made and why." },
+        user_constraints: { type: "string", description: "User constraints, verbatim." },
+        open_items: { type: "string", description: "Unfinished work and open questions." },
+        hypotheses: { type: "string", description: "Unverified theories, kept separate from facts." },
+        files_to_read: { type: "array", items: { type: "string", description: "ABSOLUTE path (relative paths are resolved against the cwd)." }, description: "Files to read first on resume." },
+        launch_prompt: { type: "string", description: "Optional. The prompt to start the relaunched session with: either the prompt text (saved to a file for you) or an ABSOLUTE path to an existing file containing it." },
       }, required: ["goal", "next_step", "facts"], additionalProperties: false } as never,
       async execute(_id, input: HandoffInput, _signal, _update, ctx) {
         const effects = step({ type: "handoff_prepare" }, ctx);
@@ -247,7 +268,10 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
           await execute(effects, ctx);
           return { content: [{ type: "text", text: "Handoff inactive; no automatic action. Continue the task." }], details: {} };
         }
+        input = { ...input, files_to_read: normalizeFilesToRead(input.files_to_read, ctx.cwd) as string[] | undefined };
+        if (input.files_to_read === undefined) delete input.files_to_read;
         validateHandoff(input);
+        checkLaunchPrompt(input);
         const f = frame(ctx);
         const refusal = handoffBackoff(input, state.lastHandoff, gitState(ctx.cwd).head, Boolean(forced(state, f)));
         if (refusal) throw new Error(refusal);

@@ -33,7 +33,7 @@ function expected(effect: Effect): { event: string; source: string } {
   if (effect.type === "steer") return { event: effect.idleOnly ? "would_idle_handoff" : "would_handoff", source: effect.type };
   if (effect.type === "write_handoff") return { event: effect.idleOnly ? "would_idle_handoff_write" : "would_handoff_write", source: effect.type };
   if (effect.type === "notify_degraded") return { event: `would_${effect.reason}_degraded`, source: effect.type };
-  const names = { notify: "would_soft_notice", reject_handoff: "would_handoff_rejected", block: "would_block", commit: "would_handoff_commit",
+  const names = { notify: "would_soft_notice", notice_required: "would_required_notice", reject_handoff: "would_handoff_rejected", block: "would_block", commit: "would_handoff_commit",
     compact: "would_idle_compact", backstop: "would_backstop", relaunch: "would_relaunch", cancel_compaction: "would_cancel_compaction", notify_cap_advisory: "would_cap_advisory" };
   return { event: names[effect.type], source: effect.type };
 }
@@ -69,6 +69,9 @@ const sequences: { name: string; seed?: Partial<MachineState>; samples: Sample[]
     at(350000, { type: "session_compact_failed", reason: "threshold", errorMessage: "network timeout" }),
     at(350000, { type: "backstop_failed", reason: "overflow", errorMessage: "EACCES" }),
     at(null, { type: "session_compact", owned: true }),
+  ] },
+  { name: "required notice rides a continuing turn once", samples: [
+    at(450000, { type: "turn_end", usage: 450000, continues: true }), at(450000, { type: "turn_end", usage: 450000, continues: true }),
   ] },
   { name: "cap relaunch latch", seed: { count: 10 }, samples: [
     turn(100000), at(100000, { type: "agent_settled", now: 1, pendingWork: false, aborted: false }),

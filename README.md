@@ -108,8 +108,10 @@ Configured/effective mode differences are shown in the footer, for example
 
 ## Handoff policy
 
+Thresholds are floor-relative. With a known floor, the effective handoff threshold is `min(hard, max(handoff, floor + minProgress))` and the effective soft threshold is `min(handoff', max(soft, handoff' - (handoff - soft)))`: `soft` and `handoff` are minimums, `minProgress` is the floor-relative knob, and `hard` is always absolute and wins. For prompt-heavy installs (floor around 150k) with soft 150000 / handoff 220000 / hard 400000, set `main.minProgress: 120000`: soft at about 200k, handoff at about 270k, about 120k of progress per reset instead of about 70k. The status file shows `effectiveThresholds`. The live config is the user's to change; this package never edits it.
+
 1. **Soft:** one UI advisory per crossing: finish the current step first, then hand off at a natural boundary. No model steer or extra provider call.
-2. **Handoff:** block every tool except `context_handoff` when `tokens >= handoff` **and** `tokens - floor >= minProgress`. The floor is the first assistant usage after bootstrap/compaction; an unknown floor never triggers handoff blocking. Null usage after compaction means fresh context.
+2. **Handoff:** block every tool except `context_handoff` when `tokens >= effective handoff` (above). The floor is the first assistant usage after bootstrap/compaction; an unknown floor never triggers handoff blocking. Null usage after compaction means fresh context. On a turn that already schedules a next request (tool results), a one-time "handoff required" notice is appended at `turn_end` without requesting an extra turn.
 3. **Commit:** the handoff tool writes a unique structured summary; the same `turn_end` commits a retain-none compaction and requests automatic continuation. No process/session-id change. A sibling tool that actually finishes after the handoff invalidates it; a blocked sibling does not.
 4. **Settle:** one continuation asks for a handoff if the agent tries to stop while handoff is required. Internal `agent_start` events do not reset this bound or an idle handoff request; only a genuinely new `before_agent_start` resets external-run state.
 5. **Fallback:** hard limit **without a usable handoff**, cap, loop guard or classified persistent/exhausted compaction failure arms recovery. Non-handoff tools remain blocked, even with a wrapper, with accurate end-turn instructions. A valid handoff at hard commits in-process with or without a wrapper; it cannot bypass the loop guard, nor the cap when a wrapper can relaunch. Without a wrapper the cap is advisory (warning each turn, in-place handoffs continue) and the loop guard pauses enforcement until a successful tool call, so neither can deadlock the session. With an owned wrapper, write the marker and request shutdown only at `agent_settled`; without one, never shut down.
@@ -129,9 +131,9 @@ Only three fields are required:
 }
 ```
 
-Optional: `decisions` (and why), `user_constraints`, `open_items`, `hypotheses`, `files_to_read`, `launch_prompt` (absolute prompt-file path for relaunch).
+Optional: `decisions` (and why), `user_constraints`, `open_items`, `hypotheses`, `files_to_read`, `launch_prompt` (the relaunch prompt text, saved to `<handoff-id>.launch-prompt.md` beside the handoff, or an absolute path to an existing file). Relative `files_to_read` entries are resolved against the cwd. Validation errors name the field, show the truncated offending value and ask for a corrected re-call.
 
-Automatic metadata: timestamp, cwd/repository root, git branch/HEAD, pending jobs/watches/subagents, and this session's issue claims when the corresponding integrations are present. Agent-written facts remain claims until rechecked; automatic git state is recorded separately.
+Automatic metadata: timestamp, cwd/repository root, git branch/HEAD, `git status --short` (at most 30 lines) and ahead/behind of the upstream, pending jobs/watches/subagents, and this session's issue claims when the corresponding integrations are present. Agent-written facts remain claims until rechecked; automatic git state is recorded separately.
 
 **Sensitive data:** full job commands, including any inline tokens or credentials, appear in the handoff. Avoid putting secrets in commands and treat handoff files as sensitive.
 

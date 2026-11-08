@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { initialState, transition, policyStatus, parseConfig, classifyFailure, MAX_COMPACTION_RETRIES, restoreHistory, type HistoryItem, type MachineState, type MachineEvent, type Frame, type Effect } from "../src/core.ts";
+import { initialState, transition, policyStatus, parseConfig, classifyFailure, MAX_COMPACTION_RETRIES, restoreHistory, effectiveThresholds, type HistoryItem, type MachineState, type MachineEvent, type Frame, type Effect } from "../src/core.ts";
 
 const config = parseConfig({ mode: "enforce", main: { soft: 100, handoff: 200, hard: 1000, minProgress: 50 } });
 const f: Frame = { mode: "enforce", tokens: 300, thresholds: config.main, config, wrapped: false };
@@ -276,4 +276,50 @@ test("unwrapped cap at hard: after commit the next tool call is not blocked", ()
   const hard = { ...f, tokens: 1200 };
   const s = transition(base({ ...cap, pending: h }), turn, hard).state;
   assert.deepEqual(kinds(transition(s, call, { ...f, tokens: null }).effects), []);
+});
+
+const floorConfig = parseConfig({ mode: "enforce", main: { soft: 150000, handoff: 220000, hard: 400000, minProgress: 120000 } });
+const ff = (tokens: number, extra: Partial<Frame> = {}): Frame => ({ mode: "enforce", tokens, thresholds: floorConfig.main, config: floorConfig, wrapped: false, ...extra });
+const floorState = (floor: number, values: Partial<MachineState> = {}): MachineState => ({ ...initialState("enforce"), floor, ...values });
+test("floor-relative thresholds: soft and handoff move with a high floor", () => {
+  assert.deepEqual(effectiveThresholds(150000, floorConfig.main), { soft: 200000, handoff: 270000 });
+  const soft = (tokens: number) => kinds(transition(floorState(150000), { type: "turn_end", usage: tokens }, ff(tokens)).effects);
+  assert.deepEqual(soft(170000), []);
+  assert.deepEqual(soft(200000), ["notify"]);
+  const blocked = (tokens: number) => kinds(transition(floorState(150000), { type: "tool_call", tool: "read", id: "a" }, ff(tokens)).effects);
+  assert.deepEqual(blocked(269999), []);
+  assert.deepEqual(blocked(270000), ["block"]);
+});
+test("floor-relative thresholds: small minProgress keeps the absolute handoff; unknown floor stays absolute", () => {
+  const small = parseConfig({ main: { soft: 150000, handoff: 220000, hard: 400000, minProgress: 50000 } }).main;
+  assert.deepEqual(effectiveThresholds(150000, small), { soft: 150000, handoff: 220000 });
+  assert.deepEqual(effectiveThresholds(null, small), { soft: 150000, handoff: 220000 });
+  const unknown = transition(floorState(0, { floor: null }), { type: "tool_call", tool: "read", id: "a" }, ff(399000));
+  assert.deepEqual(kinds(unknown.effects), []);
+});
+test("floor-relative thresholds: hard stays absolute and wins over a very high floor", () => {
+  assert.deepEqual(effectiveThresholds(300000, floorConfig.main), { soft: 330000, handoff: 400000 });
+  const next = transition(floorState(300000), { type: "tool_call", tool: "read", id: "a" }, ff(400000));
+  assert.equal(next.state.phase, "fallback-armed");
+  assert.deepEqual(kinds(next.effects), ["block"]);
+  assert.equal(policyStatus(floorState(300000, { tokens: 399999 }), ff(399999)).fallbackReason, null);
+  assert.equal(policyStatus(floorState(300000, { tokens: 400000 }), ff(400000)).fallbackReason, "hard");
+});
+test("required notice: one entry per requirement on a continuing turn, none otherwise", () => {
+  const over = (event: MachineEvent, state = floorState(100000)) => transition(state, event, ff(300000));
+  const notices = (event: MachineEvent, state?: MachineState) => kinds(over(event, state).effects).filter(k => k === "notice_required");
+  const first = over({ type: "turn_end", usage: 300000, continues: true });
+  assert.deepEqual(kinds(first.effects), ["notice_required"]);
+  assert.deepEqual(notices({ type: "turn_end", usage: 300000, continues: true }, first.state), []);
+  assert.deepEqual(notices({ type: "turn_end", usage: 300000, continues: false }), []);
+  assert.deepEqual(notices({ type: "turn_end", usage: 300000, continues: true }, floorState(100000, { stored: h })), []);
+  assert.deepEqual(kinds(over({ type: "turn_end", usage: 300000, continues: true }, floorState(100000, { pending: h })).effects), ["commit"]);
+  const settle = over({ type: "agent_before_settle", pendingWork: false }, first.state);
+  assert.deepEqual(kinds(settle.effects), ["steer"]);
+});
+test("required notice flag resets after commit and when below the requirement", () => {
+  const noticed = floorState(100000, { requiredNoticed: true, pending: h });
+  assert.equal(transition(noticed, { type: "turn_end", usage: 300000 }, ff(300000)).state.requiredNoticed, false);
+  const below = transition(floorState(100000, { requiredNoticed: true }), { type: "turn_end", usage: 100000, continues: true }, ff(100000));
+  assert.equal(below.state.requiredNoticed, false);
 });

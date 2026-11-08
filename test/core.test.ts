@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { isContextOverflowError, guardOffCrossings, parseConfig, effectiveMode, isSubagent, ownsWrapper, modelThresholds, renderHandoff, MAX_HANDOFF_BYTES } from "../src/core.ts";
+import { isContextOverflowError, guardOffCrossings, parseConfig, effectiveMode, isSubagent, ownsWrapper, modelThresholds, renderHandoff, MAX_HANDOFF_BYTES, validateHandoff, shorten, RETRY, launchPromptKind, normalizeFilesToRead, effectiveThresholds } from "../src/core.ts";
 import { atomicJson, issueClaims, runningState, writeHandoff, writeMarker, SessionHosts } from "../src/storage.ts";
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
@@ -96,7 +96,7 @@ test("handoff rendering, validation, byte cap, uniqueness and exclusive persiste
   assert.match(h.text, /Hypotheses \(unverified\)/);
   assert.match(h.text, /Never push\./);
   assert.notEqual(h.text, renderHandoff(input, auto, "session", 2, join(d, "session-2.md"), h.at).text);
-  for (const bad of [{ ...input, next_step: "" }, { ...input, files_to_read: ["relative"] }, { ...input, launch_prompt: "relative" }]) assert.throws(() => renderHandoff(bad, auto, "s", 1, h.path, h.at));
+  for (const bad of [{ ...input, next_step: "" }, { ...input, files_to_read: ["relative"] }, { ...input, launch_prompt: "x".repeat(16 * 1024 + 1) }, { ...input, launch_prompt: "a\0b" }]) assert.throws(() => renderHandoff(bad, auto, "s", 1, h.path, h.at));
   assert.throws(() => renderHandoff({ ...input, facts: "é".repeat(MAX_HANDOFF_BYTES / 2) }, auto, "s", 1, h.path, h.at), /limit/);
   writeHandoff(h, auto);
   assert.equal(readFileSync(h.path, "utf8"), h.text);
@@ -142,4 +142,41 @@ test("optional Symbol registries degrade gracefully and retain pending watches/s
     assert.equal(runningState().subagents.length, 1);
     assert.equal(runningState().jobs.length, 1);
   } finally { global[sk] = oldS; global[jk] = oldJ; }
+});
+
+test("launch_prompt accepts prompt text and relative-looking strings", () => {
+  for (const launch_prompt of ["relative", "Continue the review.\nThen push.", "/review this"]) validateHandoff({ ...input, launch_prompt });
+});
+test("validation errors show the field, a truncated offending value and the retry hint", () => {
+  const long = "x".repeat(200);
+  assert.throws(() => validateHandoff({ ...input, files_to_read: ["/ok", "src/a.ts"] }), (e: Error) => /^files_to_read\[1\] must be an absolute path, got "src\/a\.ts"\./.test(e.message) && e.message.includes(RETRY));
+  assert.throws(() => validateHandoff({ ...input, files_to_read: ["/ok", long] }), (e: Error) => e.message.includes("…(202 chars)") && !e.message.includes(long));
+  assert.throws(() => validateHandoff({ ...input, files_to_read: "nope" as never }), /files_to_read must be an array/);
+  assert.throws(() => validateHandoff({ ...input, goal: 5 as never }), (e: Error) => /goal is required.*got 5/.test(e.message) && e.message.includes(RETRY));
+  assert.equal(shorten("😀".repeat(100), 10), JSON.stringify("😀".repeat(100)).slice(0, 0) + Array.from(JSON.stringify("😀".repeat(100))).slice(0, 10).join("") + "…(102 chars)");
+});
+test("launchPromptKind distinguishes files, typo'd paths and text", () => {
+  const isFile = (p: string) => p === "/real/prompt.md";
+  assert.equal(launchPromptKind("/real/prompt.md", isFile), "path");
+  assert.equal(launchPromptKind("/real/typo.md", isFile), "missing");
+  assert.equal(launchPromptKind("/review this", isFile), "text");
+  assert.equal(launchPromptKind("/real/prompt.md\nmore", isFile), "text");
+  assert.equal(launchPromptKind("relative/prompt.md", isFile), "text");
+});
+test("normalizeFilesToRead resolves relative and home paths and passes invalid values through", () => {
+  assert.deepEqual(normalizeFilesToRead(["/abs", "src/a.ts", "~/x.md"], "/work", "/home/u"), ["/abs", "/work/src/a.ts", "/home/u/x.md"]);
+  assert.deepEqual(normalizeFilesToRead([5, ""], "/work"), [5, ""]);
+  assert.equal(normalizeFilesToRead(undefined, "/work"), undefined);
+});
+test("effectiveThresholds table", () => {
+  assert.deepEqual(effectiveThresholds(null, t), { soft: t.soft, handoff: t.handoff });
+  assert.deepEqual(effectiveThresholds(100000, { soft: 150000, handoff: 220000, hard: 400000, minProgress: 50000 }), { soft: 150000, handoff: 220000 });
+});
+test("rendered handoff includes the working tree and sync, capped", () => {
+  const dirty = Array.from({ length: 30 }, (_, i) => ` M file${i}.ts`).concat("…(5 more)");
+  const text = renderHandoff(input, { ...auto, dirty, sync: "no upstream" }, "s", 1, "/h.md", "2026-10-17").text;
+  assert.match(text, /Working tree:\n M file0\.ts/);
+  assert.match(text, /…\(5 more\)\nSync: no upstream/);
+  assert.match(renderHandoff(input, { ...auto, dirty: [], sync: "ahead 1, behind 0 (upstream)" }, "s", 1, "/h.md", "x").text, /Working tree:\nclean\nSync: ahead 1/);
+  assert.doesNotMatch(renderHandoff(input, auto, "s", 1, "/h.md", "x").text, /Working tree/);
 });
