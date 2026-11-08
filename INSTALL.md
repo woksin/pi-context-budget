@@ -165,7 +165,7 @@ p.write_text(json.dumps(s, indent=2) + '\n')
 PY
 ```
 
-For a verified 1M window and 600k hard, reserve=380k and threshold=620k. Per-model pi settings cannot express distinct main/child reserves. Children can recover hard limits through a fresh in-process handoff; cap/loop recovery needs parent intervention if no owned wrapper exists. Observe/off and guard-off leave all native compaction untouched, including `/compact`, default summaries and overflow recovery; only enforce supplies the handoff/mechanical backstop. Scope compaction settings to enforced trials if native summarizer cost is not wanted in observe sessions.
+For a verified 1M window and 600k hard, reserve=380k and threshold=620k. Per-model pi settings cannot express distinct main/child reserves. Children can recover hard limits through a fresh in-process handoff; without an owned wrapper the cap is advisory (warning each turn) and the loop guard self-clears on progress. Observe/off and guard-off leave all native compaction untouched, including `/compact`, default summaries and overflow recovery; only enforce supplies the handoff/mechanical backstop. Scope compaction settings to enforced trials if native summarizer cost is not wanted in observe sessions.
 
 ## Trial and rollback
 

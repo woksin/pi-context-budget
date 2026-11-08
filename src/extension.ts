@@ -138,7 +138,9 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
             ctx.ui.notify("Context is large: finish the current step first; hand off at the next natural boundary. No handoff is required at the soft threshold.", "info"); break;
           case "notify_degraded":
             log(ctx, `${effect.reason}_degraded`);
-            ctx.ui.notify(`Context-budget ${effect.reason === "cap" ? "handoff cap" : "handoff loop limit"} reached and no relaunch wrapper is available. Tools stay available and handoffs are no longer enforced; start a fresh session soon (/new, or relaunch under the wrapper).`, "warning"); break;
+            ctx.ui.notify("Context-budget handoff loop limit reached and no relaunch wrapper is available. Tools stay available and handoff enforcement is paused until a tool call makes progress; start a fresh session soon (/new, or relaunch under the wrapper).", "warning"); break;
+          case "notify_cap_advisory":
+            ctx.ui.notify(`Context-budget: ${effect.count} handoffs this session (cap ${effect.cap}). In-place handoffs keep working, but a fresh session is recommended (/new from the latest handoff, or run under pi-session).`, "warning"); break;
           case "block":
             log(ctx, "blocked", { reason: effect.reason }); result = { block: true, reason: effect.reason }; break;
           case "reject_handoff": throw new Error(effect.reason);
@@ -253,7 +255,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
         await run({ type: "handoff_written", handoff }, ctx);
         const degraded = degradedFor(state, frame(ctx));
         if (degraded) {
-          return { content: [{ type: "text", text: `Handoff written to ${handoff.path}. The session reached its handoff ${degraded === "cap" ? "cap" : "loop limit"} and cannot relaunch, so the context will not reset: continue the task, and ask the user to start a fresh session from this handoff.` }], details: { handoff } };
+          return { content: [{ type: "text", text: `Handoff written to ${handoff.path}. The session reached its handoff loop limit and cannot relaunch, so the context will not reset: continue the task, and ask the user to start a fresh session from this handoff.` }], details: { handoff } };
         }
         return { content: [{ type: "text", text: intent.idleOnly ? "Handoff stored. End this turn without further tools; the context resets at the end of this turn." : "Handoff stored. End this turn without further tools; recovery continues automatically." }], details: { handoff } };
       },

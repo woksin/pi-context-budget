@@ -1,6 +1,6 @@
 {
   "name": "@woksin/pi-context-budget",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "description": "Structured context handoffs and bounded continuous sessions for pi",
   "license": "MIT",
   "author": "woksin",

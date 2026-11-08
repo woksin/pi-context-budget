@@ -131,8 +131,8 @@ export interface MachineState {
   attempt: number; blockedCalls: string[]; lastSettled: number; observedIdle: boolean;
   providerFailure: "none" | "error" | "overflow" | "aborted";
   relaunchSent: boolean; lastAction: BudgetAction;
-  /** Unwrapped cap/loop notice already emitted (once per session). */
-  degradedNotified?: boolean;
+  /** Turn on which the unwrapped cap/loop notice was last emitted (at most once per turn). */
+  advisoryNoticeTurn?: number;
   /** Counterfactual policy state only; never mixed into actual history or action execution. */
   observation?: MachineState;
 }
@@ -156,7 +156,8 @@ export type MachineEvent =
 export type Effect =
   | { type: "log"; event: string; data?: Record<string, unknown> }
   | { type: "notify" }
-  | { type: "notify_degraded"; reason: "cap" | "loop" }
+  | { type: "notify_degraded"; reason: "loop" }
+  | { type: "notify_cap_advisory"; count: number; cap: number }
   | { type: "write_handoff"; idleOnly: boolean }
   | { type: "reject_handoff"; reason: string }
   | { type: "block"; reason: string }
@@ -180,18 +181,35 @@ export function classifyFailure(e: { aborted?: boolean; errorMessage?: string })
 }
 export function fallbackFor(s: MachineState, f: Frame): Fallback | undefined {
   if (s.handoffTurns.filter(t => s.turn - t <= f.config.loop.withinTurns).length > f.config.loop.maxHandoffsWithoutProgress) return "loop";
-  if (s.count >= f.config.maxHandoffsPerSession) return "cap";
+  if (f.wrapped && s.count >= f.config.maxHandoffsPerSession) return "cap";
   if (s.compactionFallback) return "compaction";
   if (s.tokens !== null && s.tokens >= f.thresholds.hard) return "hard";
   return undefined;
 }
-/** Cap/loop with no wrapper cannot relaunch: enforcement degrades to notify-only. */
-export function degradedFor(s: MachineState, f: Frame): "cap" | "loop" | undefined {
-  const fb = fallbackFor(s, f);
-  return (fb === "cap" || fb === "loop") && !f.wrapped ? fb : undefined;
+/** Loop with no wrapper cannot relaunch: enforcement degrades to notify-only. Unwrapped cap is advisory only (see capAdvisory). */
+export function degradedFor(s: MachineState, f: Frame): "loop" | undefined {
+  return fallbackFor(s, f) === "loop" && !f.wrapped ? "loop" : undefined;
 }
 function handoffRequired(s: MachineState, f: Frame): boolean {
   return s.tokens !== null && s.floor !== null && s.tokens >= f.thresholds.handoff && s.tokens - s.floor >= f.thresholds.minProgress;
+}
+/** Unwrapped sessions cannot relaunch at the cap: it only warns, in-place enforcement continues. */
+function capAdvisory(s: MachineState, f: Frame): boolean {
+  return !f.wrapped && s.count >= f.config.maxHandoffsPerSession;
+}
+/** Loud, per-turn (deduplicated) notices for unwrapped cap advisory and loop degradation. */
+function notices(s: MachineState, e: MachineEvent, f: Frame): Effect[] {
+  if (e.type !== "turn_end" && e.type !== "agent_settled") return [];
+  const loop = degradedFor(s, f), cap = capAdvisory(s, f);
+  if ((!loop && !cap) || s.advisoryNoticeTurn === s.turn) return [];
+  s.advisoryNoticeTurn = s.turn;
+  const effects: Effect[] = [];
+  if (cap) {
+    const data = { count: s.count, cap: f.config.maxHandoffsPerSession };
+    effects.push({ type: "log", event: "cap_advisory", data }, { type: "notify_cap_advisory", ...data });
+  }
+  if (loop) effects.push({ type: "log", event: "relaunch_unavailable", data: { reason: loop } }, { type: "notify_degraded", reason: loop });
+  return effects;
 }
 /** Back-off must never block the only tool allowed by enforcement. */
 export function forced(s: MachineState, f: Frame): Fallback | boolean {
@@ -251,6 +269,7 @@ function wouldLog(effect: Effect, s: MachineState, f: Frame): LogEffect {
     }
     case "notify": event = "would_soft_notice"; break;
     case "notify_degraded": event = `would_${effect.reason}_degraded`; break;
+    case "notify_cap_advisory": event = "would_cap_advisory"; break;
     case "write_handoff": event = effect.idleOnly ? "would_idle_handoff_write" : "would_handoff_write"; break;
     case "reject_handoff": event = "would_handoff_rejected"; break;
     case "block": event = "would_block"; break;
@@ -291,17 +310,18 @@ function compactionFailed(s: MachineState, e: Extract<MachineEvent, { type: "ses
     data: { classification, failures: s.failures, retry: "next eligible input or automatic compaction boundary" } }];
 }
 function active(s: MachineState, e: MachineEvent, f: Frame): Effect[] {
+  const notice = notices(s, e, f);
+  return [...notice, ...decide(s, e, f)];
+}
+function decide(s: MachineState, e: MachineEvent, f: Frame): Effect[] {
   const fallback = fallbackFor(s, f);
-  // Cap/loop with no wrapper cannot relaunch: degrade to notify-only so the session is never deadlocked.
+  // Loop with no wrapper cannot relaunch: degrade to notify-only so the session is never deadlocked.
   const degraded = degradedFor(s, f);
   if (degraded) {
     switch (e.type) {
       case "tool_call": case "agent_before_settle": return [];
       case "handoff_prepare": s.pending = undefined; s.pendingSource = undefined; return [{ type: "write_handoff", idleOnly: s.settleRequest === "idle" }];
-      case "agent_settled":
-        if (s.degradedNotified) return [];
-        s.degradedNotified = true;
-        return [{ type: "log", event: "relaunch_unavailable", data: { reason: degraded } }, { type: "notify_degraded", reason: degraded }];
+      case "agent_settled": return [];
       default: break;
     }
   }

@@ -34,7 +34,7 @@ function expected(effect: Effect): { event: string; source: string } {
   if (effect.type === "write_handoff") return { event: effect.idleOnly ? "would_idle_handoff_write" : "would_handoff_write", source: effect.type };
   if (effect.type === "notify_degraded") return { event: `would_${effect.reason}_degraded`, source: effect.type };
   const names = { notify: "would_soft_notice", reject_handoff: "would_handoff_rejected", block: "would_block", commit: "would_handoff_commit",
-    compact: "would_idle_compact", backstop: "would_backstop", relaunch: "would_relaunch", cancel_compaction: "would_cancel_compaction" };
+    compact: "would_idle_compact", backstop: "would_backstop", relaunch: "would_relaunch", cancel_compaction: "would_cancel_compaction", notify_cap_advisory: "would_cap_advisory" };
   return { event: names[effect.type], source: effect.type };
 }
 const sequences: { name: string; seed?: Partial<MachineState>; samples: Sample[]; notices?: number }[] = [

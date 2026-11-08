@@ -32,10 +32,11 @@ const cases: { name: string; state?: Partial<MachineState>; event: MachineEvent;
   { name: "backstop IO failure is a machine-authorized cancellation", event: { type: "backstop_failed", reason: "overflow", errorMessage: "EACCES" }, frame: { tokens: 100 }, phase: "fallback-armed", effects: ["log", "cancel_compaction"] },
   { name: "backstop starts owned attempt", event: { type: "session_before_compact", reason: "threshold" }, phase: "compacting", effects: ["backstop"] },
   { name: "successful compaction disarms persistent fallback", state: { compactionFallback: true, failures: 3 }, event: { type: "session_compact", owned: true }, phase: "idle", effects: [] },
-  { name: "loop cannot be bypassed by a pending handoff", state: { handoffTurns: [0, 0, 0], pending: h, softNotified: true }, event: turn, phase: "degraded", effects: [] },
-  { name: "cap cannot be bypassed by a pending handoff", state: { count: 10, pending: h, softNotified: true }, event: turn, phase: "degraded", effects: [] },
+  { name: "loop cannot be bypassed by a pending handoff", state: { handoffTurns: [0, 0, 0], pending: h, softNotified: true }, event: turn, phase: "degraded", effects: ["log", "notify_degraded"] },
+  { name: "wrapped cap cannot be bypassed by a pending handoff", state: { count: 10, pending: h, softNotified: true }, event: turn, frame: { wrapped: true }, phase: "fallback-armed", effects: [] },
+  { name: "unwrapped cap is advisory: pending handoff still commits", state: { count: 10, pending: h, softNotified: true }, event: turn, phase: "idle", effects: ["log", "notify_cap_advisory", "commit"] },
   { name: "cap wrapper fallback", state: { count: 10, stored: h }, event: { type: "agent_settled", now: 1, aborted: false, pendingWork: false }, frame: { wrapped: true }, phase: "fallback-armed", effects: ["relaunch"] },
-  { name: "unowned wrapper never shuts down, degrades with one notice", state: { count: 10 }, event: { type: "agent_settled", now: 1, aborted: false, pendingWork: false }, phase: "degraded", effects: ["log", "notify_degraded"] },
+  { name: "unowned wrapper never relaunches past the cap, only advises", state: { count: 10 }, event: { type: "agent_settled", now: 1, aborted: false, pendingWork: false }, phase: "handoff-required", effects: ["log", "notify_cap_advisory"] },
   { name: "overflow error can recover at settled", state: { count: 10, providerFailure: "overflow" }, event: { type: "agent_settled", now: 1, aborted: false, pendingWork: false }, frame: { wrapped: true }, phase: "fallback-armed", effects: ["relaunch"] },
   { name: "provider failure never authorizes restart", state: { count: 10, providerFailure: "error" }, event: { type: "agent_settled", now: 1, aborted: false, pendingWork: false }, frame: { wrapped: true }, phase: "fallback-armed", effects: [] },
   { name: "user abort never authorizes restart", state: { count: 10 }, event: { type: "agent_settled", now: 1, aborted: true, pendingWork: false }, frame: { wrapped: true }, phase: "fallback-armed", effects: [] },
@@ -166,7 +167,7 @@ test("success resets hard recovery and loop progress re-arms only after fresh gr
 const call = { type: "tool_call", tool: "write", id: "a" } as const;
 const settled = { type: "agent_settled", now: 1, aborted: false, pendingWork: false } as const;
 for (const [kind, st] of [["cap", { count: 10 }], ["loop", { handoffTurns: [0, 0, 0] }]] as [string, Partial<MachineState>][]) {
-  test(`unwrapped ${kind}: tools are not blocked, one notice, no steer`, () => {
+  if (kind === "loop") test(`unwrapped ${kind}: tools are not blocked, one notice, no steer`, () => {
     let s = base({ ...st, stored: h });
     for (const ev of [call, { type: "agent_before_settle", pendingWork: true } as const]) {
       const r = transition(s, ev, f); s = r.state; assert.deepEqual(r.effects.filter(e => e.type !== "log"), []);
@@ -183,16 +184,17 @@ for (const [kind, st] of [["cap", { count: 10 }], ["loop", { handoffTurns: [0, 0
     assert.deepEqual(kinds(transition(base({ ...st, stored: h }), settled, w).effects), ["relaunch"]);
   });
 }
-test("unwrapped restored cap session is unblocked", () => {
+test("unwrapped restored cap session keeps in-place enforcement", () => {
   const s = restoreHistory(Array.from({ length: 10 }, () => ({ type: "compaction", owned: true, source: "budget" }) as HistoryItem), "enforce");
-  assert.deepEqual(kinds(transition(s, call, f).effects), []);
+  assert.equal(s.count, 10);
+  assert.deepEqual(kinds(transition({ ...s, floor: 100, handoffTurns: [] }, call, f).effects), ["block"]);
 });
 test("unwrapped hard fallback is unchanged", () => {
   assert.deepEqual(kinds(transition(base(), call, { ...f, tokens: 1200 }).effects), ["block"]);
   assert.deepEqual(kinds(transition(base(), settled, { ...f, tokens: 1200 }).effects), ["log"]);
 });
 
-for (const [kind, st] of [["cap", { count: 10 }], ["loop", { handoffTurns: [0, 0, 0] }]] as [string, Partial<MachineState>][]) {
+for (const [kind, st] of [["loop", { handoffTurns: [0, 0, 0] }]] as [string, Partial<MachineState>][]) {
   test(`unwrapped ${kind} with a stale pending handoff: no block, prepare is accepted`, () => {
     const s = base({ ...st, pending: h, stored: h });
     assert.deepEqual(kinds(transition(s, call, f).effects), []);
@@ -213,4 +215,65 @@ for (const [kind, st] of [["cap", { count: 10 }], ["loop", { handoffTurns: [0, 0
 test("status: unwrapped hard stays fallback-armed/relaunch", () => {
   const p = policyStatus(base({ tokens: 1200 }), { ...f, tokens: 1200 });
   assert.equal(p.phase, "fallback-armed"); assert.equal(p.action, "relaunch");
+});
+
+const cap = { count: 10 };
+test("unwrapped cap: handoff required blocks tools and context_handoff commits in place", () => {
+  assert.deepEqual(kinds(transition(base(cap), call, f).effects), ["block"]);
+  assert.deepEqual(kinds(transition(base(cap), { type: "tool_call", tool: "context_handoff", id: "c" }, f).effects), []);
+  assert.deepEqual(kinds(transition(base(cap), { type: "handoff_prepare" }, f).effects), ["write_handoff"]);
+  const written = transition(base(cap), { type: "handoff_written", handoff: h }, f).state;
+  assert.equal(written.phase, "handoff-pending-commit");
+  const done = transition(written, turn, f);
+  assert.deepEqual(done.effects.filter(e => e.type === "commit").length, 1);
+  assert.equal(done.state.count, 11);
+  assert.notEqual(done.state.phase, "degraded"); assert.notEqual(done.state.phase, "fallback-armed");
+  assert.deepEqual(policyStatus(base({ ...cap, tokens: 300 }), f), { phase: "handoff-required", action: "handoff", fallbackReason: null });
+});
+test("unwrapped cap at hard: tools blocked, no relaunch, stored handoff commits in place", () => {
+  const hard = { ...f, tokens: 1200 };
+  assert.deepEqual(kinds(transition(base(cap), call, hard).effects), ["block"]);
+  const set = transition(base(cap), settled, hard).effects;
+  assert.equal(set.some(e => e.type === "relaunch"), false);
+  assert.ok(set.some(e => e.type === "log" && e.event === "relaunch_unavailable"));
+  const turned = transition(base({ ...cap, stored: h }), turn, hard);
+  assert.equal(turned.effects.filter(e => e.type === "commit").length, 1);
+});
+test("unwrapped cap: advisory once per turn, again next turn, never on wrapped", () => {
+  const s0 = base({ ...cap, softNotified: true });
+  const t1 = transition(s0, turn, f);
+  assert.equal(t1.effects.filter(e => e.type === "notify_cap_advisory").length, 1);
+  assert.ok(t1.effects.some(e => e.type === "log" && e.event === "cap_advisory" && e.data?.count === 10 && e.data?.cap === 10));
+  const set = transition(t1.state, settled, f);
+  assert.equal(set.effects.some(e => e.type === "notify_cap_advisory"), false);
+  const t2 = transition(set.state, turn, f);
+  assert.equal(t2.effects.filter(e => e.type === "notify_cap_advisory").length, 1);
+  const w = { ...f, wrapped: true };
+  assert.equal(transition(s0, turn, w).effects.some(e => e.type === "notify_cap_advisory"), false);
+  assert.deepEqual(policyStatus(base(cap), w).phase, "fallback-armed");
+  assert.equal(policyStatus(base(cap), w).action, "relaunch");
+  assert.deepEqual(kinds(transition(base({ ...cap, stored: h }), settled, w).effects), ["relaunch"]);
+});
+test("unwrapped loop: notice every turn and still unblocked", () => {
+  const st = base({ handoffTurns: [0, 0, 0] });
+  const t1 = transition(st, turn, f), t2 = transition(t1.state, turn, f);
+  for (const r of [t1, t2]) assert.equal(r.effects.filter(e => e.type === "notify_degraded").length, 1);
+  assert.deepEqual(kinds(transition(t2.state, call, f).effects), []);
+  assert.equal(transition(t2.state, settled, f).effects.some(e => e.type === "notify_degraded"), false);
+});
+test("unwrapped loop at hard self-heals after a successful non-handoff tool (no deadlock)", () => {
+  const hard = { ...f, tokens: 1200 };
+  let s = base({ handoffTurns: [0, 0, 0] });
+  assert.deepEqual(kinds(transition(s, call, hard).effects), []);
+  s = transition(s, { type: "tool_end", tool: "write", id: "a", error: false }, hard).state;
+  assert.deepEqual(s.handoffTurns, []);
+  assert.deepEqual(kinds(transition(s, call, hard).effects), ["block"]);
+  assert.deepEqual(kinds(transition(s, { type: "handoff_prepare" }, hard).effects), ["write_handoff"]);
+  s = transition(s, { type: "handoff_written", handoff: h }, hard).state;
+  assert.equal(transition(s, turn, hard).effects.filter(e => e.type === "commit").length, 1);
+});
+test("unwrapped cap at hard: after commit the next tool call is not blocked", () => {
+  const hard = { ...f, tokens: 1200 };
+  const s = transition(base({ ...cap, pending: h }), turn, hard).state;
+  assert.deepEqual(kinds(transition(s, call, { ...f, tokens: null }).effects), []);
 });
