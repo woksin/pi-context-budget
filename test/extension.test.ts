@@ -120,6 +120,33 @@ test("hard fallback writes marker before shutdown only in wrapper; provider erro
   await err.emit("agent_settled", { aborted: false });
   assert.equal(err.counters().shutdown, 0);
 });
+test("emergency backstop carries the prior goal, constraints and read-first files verbatim", async () => {
+  const h = await harness();
+  await h.turn(100);
+  await h.handoff({ ...required, goal: "Finish issue eight", user_constraints: "Do not push.\nKeep this exact.", files_to_read: [join(h.dir, "notes.md")] } as never);
+  await h.turn();
+  await h.emit("tool_call", { toolName: "read" });
+  const result = await h.emit("session_before_compact", { preparation: { tokensBefore: 300 }, reason: "overflow" });
+  assert.match(result.compaction.summary, /Emergency handoff; previous goal: Finish issue eight/);
+  assert.match(result.compaction.summary, /## User constraints \(verbatim\)\nDo not push\.\nKeep this exact\./);
+  assert.ok(result.compaction.summary.includes(`## Read first\n${join(h.dir, "notes.md")}`));
+  assert.match(result.compaction.summary, /Previous handoff: .*\.md/);
+});
+
+test("handoff collects persisted user messages, touched repositories and exposed inventory only", async () => {
+  const h = await harness();
+  h.branch.push({ type: "message", timestamp: "2026-01-01", message: { role: "user", content: [{ type: "text", text: 'Keep "quotes"\nverbatim' }] } });
+  await h.turn(100);
+  const result = await h.handoff();
+  const handoff = result.details.handoff;
+  assert.match(handoff.text, /Repositories touched:/);
+  assert.match(handoff.text, /## User messages since previous handoff \(verbatim\)\nKeep "quotes"\nverbatim/);
+  assert.match(handoff.text, /scheduled agents: not exposed by registry/);
+  const sidecar = JSON.parse(readFileSync(handoff.path.replace(/\.md$/, ".json"), "utf8"));
+  assert.ok(Array.isArray(sidecar.auto.repos));
+  assert.equal(sidecar.auto.userMessages, 'Keep "quotes"\nverbatim');
+});
+
 test("backstop summaries are unique; stale stored handoff is replaced mechanically", async () => {
   const h = await harness();
   await h.turn(100);

@@ -1,9 +1,10 @@
 import { execFileSync } from "node:child_process";
-import { appendFileSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { boundedAutoState, isSubagent, type AutoState, type Handoff, type RecordedJob } from "./core.ts";
+import { collectRepositories, collectHead, finishedState, porcelainDirty, scheduledState, type RepoDeps, type JobManager } from "./collect.ts";
 
 /** A CLI process has one primary runtime; SDK children bind while it remains alive.
  * Fork/resume tear down that primary BEFORE binding its replacement. No ancestry inference.
@@ -54,22 +55,32 @@ export function writeMarker(path: string, marker: Marker): void {
   }
   atomicJson(path, marker);
 }
-function git(cwd: string, ...args: string[]): string | undefined {
-  try { return execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8", timeout: 1500, maxBuffer: 65536, stdio: ["ignore", "pipe", "ignore"] }).trim(); }
+export function git(cwd: string, args: string[], timeout = 1500): string | undefined {
+  try { return execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8", timeout, maxBuffer: 65536, stdio: ["ignore", "pipe", "ignore"] }).trim(); }
   catch { return undefined; }
 }
 export function gitState(cwd: string): Pick<AutoState, "cwd" | "root" | "branch" | "head"> {
-  return { cwd: resolve(cwd), root: git(cwd, "rev-parse", "--show-toplevel") || resolve(cwd), branch: git(cwd, "branch", "--show-current") || "unknown/detached", head: git(cwd, "rev-parse", "HEAD") || "unknown" };
+  return { cwd: resolve(cwd), root: git(cwd, ["rev-parse", "--show-toplevel"]) || resolve(cwd), branch: git(cwd, ["branch", "--show-current"]) || "unknown/detached", head: git(cwd, ["rev-parse", "HEAD"]) || "unknown" };
 }
 /** Working-tree and upstream detail for handoffs only (gitState runs on every handoff attempt). */
 export function gitDetail(cwd: string): { dirty: string[]; sync: string } {
-  const status = git(cwd, "status", "--short");
+  const status = git(cwd, ["status", "--short"]);
   const lines = status ? status.split("\n").map(line => Array.from(line).slice(0, 200).join("")) : [];
   const dirty = lines.length > 30 ? [...lines.slice(0, 30), `…(${lines.length - 30} more)`] : lines;
-  const counts = git(cwd, "rev-list", "--left-right", "--count", "@{u}...HEAD")?.split(/\s+/);
-  const sync = status === undefined ? "unknown" : counts === undefined ? (git(cwd, "rev-parse", "--abbrev-ref", "@{u}") === undefined ? "no upstream" : "unknown")
+  const counts = git(cwd, ["rev-list", "--left-right", "--count", "@{u}...HEAD"])?.split(/\s+/);
+  const sync = status === undefined ? "unknown" : counts === undefined ? (git(cwd, ["rev-parse", "--abbrev-ref", "@{u}"]) === undefined ? "no upstream" : "unknown")
     : `ahead ${counts[1]}, behind ${counts[0]} (upstream)`;
   return { dirty, sync };
+}
+function repoDeps(): RepoDeps {
+  return { git, home: homedir(), exists: existsSync, isDirectory: path => statSync(path).isDirectory(), now: Date.now };
+}
+export function collectRepos(cwd: string, branch: readonly unknown[], claims: unknown[]) {
+  const result = collectRepositories(cwd, branch, claims, repoDeps());
+  return { ...result, dirty: porcelainDirty(result.cwdStatus) };
+}
+export function handoffHead(cwd: string, branch: readonly unknown[]): string {
+  return collectHead(cwd, branch, repoDeps());
 }
 /** Launch-prompt text is stored beside the handoff so the relaunch marker always references an absolute file. */
 export function writeLaunchPrompt(path: string, text: string): void {
@@ -83,14 +94,15 @@ export function subagentTaskDir(cwd: string, sessionId: string): string {
   const encoded = cwd.replace(/[/\\]/g, "-").replace(/^[A-Za-z]:-/, "").replace(/^-+/, "");
   return join(tmpdir(), `pi-subagents-${process.getuid?.() ?? 0}`, encoded, sessionId, "tasks");
 }
-export function runningState(knownIds: string[] = [], session?: { cwd: string; sessionId: string; taskDir?: string }): Pick<AutoState, "jobs" | "subagents" | "unavailable"> {
+export function runningState(knownIds: string[] = [], session?: { cwd: string; sessionId: string; taskDir?: string }, sinceMs?: number): Pick<AutoState, "jobs" | "subagents" | "scheduled" | "finishedJobs" | "unavailable"> {
   const global = globalThis as Record<symbol, unknown>;
   const unavailable: string[] = [];
   const subagents: unknown[] = [], jobs: unknown[] = [];
+  let scheduled: string[] = [], finishedJobs: string[] = [];
   const brief = (r: RunningRecord) => ({ id: r.id ?? r.agentId, status: r.status, cwd: r.cwd, command: r.command, kind: r.kind, label: r.label, until: r.until, intervalSeconds: r.intervalSeconds, timeoutSeconds: r.timeoutSeconds, logPath: r.logPath, description: r.description });
   try {
     const sub = global[Symbol.for("pi-subagents:manager")] as SubRegistry | undefined;
-    if (!sub) unavailable.push("pi-subagents registry absent");
+    if (!sub) unavailable.push("pi-subagents registry absent", "scheduled agents: not exposed by registry");
     else {
       let enumerated = !!sub.listAgents;
       const ids = new Set(knownIds);
@@ -107,6 +119,8 @@ export function runningState(knownIds: string[] = [], session?: { cwd: string; s
         }
       }
       const records = sub.listAgents?.() ?? [...ids].map(id => sub.getRecord?.(id)).filter((r): r is RunningRecord => !!r);
+      const pending = scheduledState(records);
+      scheduled = pending.scheduled; unavailable.push(...pending.unavailable);
       subagents.push(...records.filter(r => r.status === "running" || r.status === "queued").map(brief));
       if (sub.hasRunning?.() && !subagents.length) {
         subagents.push({ status: "running", detail: "Registry reports pending work; ids unavailable" });
@@ -114,13 +128,16 @@ export function runningState(knownIds: string[] = [], session?: { cwd: string; s
       }
       if (!enumerated) unavailable.push("pi-subagents enumeration unavailable; captured known ids only");
     }
-  } catch { unavailable.push("pi-subagents registry unreadable"); }
+  } catch { unavailable.push("pi-subagents registry unreadable", "scheduled agents: not exposed by registry"); }
   try {
     const managers = global[Symbol.for("pi-jobs.liveManagers")] as Set<JobRegistry> | undefined;
     if (!managers) unavailable.push("pi-jobs registry absent");
     else for (const manager of managers) jobs.push(...manager.list().filter(r => r.status === "running").map(brief));
   } catch { unavailable.push("pi-jobs registry unreadable"); }
-  return { jobs, subagents, unavailable };
+  const finished = finishedState(global[Symbol.for("pi-jobs.liveManagers")] as Set<JobManager> | undefined, sinceMs, Date.now());
+  finishedJobs = finished.finishedJobs;
+  unavailable.push(...finished.unavailable.filter(message => !unavailable.includes(message)));
+  return { jobs, subagents, scheduled, finishedJobs, unavailable };
 }
 export function issueClaims(path: string, sessionId: string): unknown[] {
   const views = new Map<string, Record<string, unknown>>();
@@ -139,7 +156,8 @@ export function issueClaims(path: string, sessionId: string): unknown[] {
 }
 
 /** Optional pi-questions integration. Read only the latest immutable revision per item. */
-export function pendingQuestions(home: string, sessionId: string): string[] {
+export function pendingQuestions(home: string, match: { sessionIds: string[] } | string): string[] {
+  const identity = typeof match === "string" ? { sessionIds: [match] } : match;
   try {
     const lines: string[] = [];
     const items = join(home, "items");
@@ -159,7 +177,8 @@ export function pendingQuestions(home: string, sessionId: string): string[] {
           .sort((a, b) => Number(b.slice(1, -5)) - Number(a.slice(1, -5)));
         if (!revisions.length) continue;
         const item = JSON.parse(readFileSync(join(dir, revisions[0]), "utf8"));
-        if (item.id !== id || item.asker?.sessionId !== sessionId || item.status !== "open" || typeof item.title !== "string") continue;
+        const sameChain = identity.sessionIds.includes(item.asker?.sessionId);
+        if (item.id !== id || !sameChain || item.status !== "open" || typeof item.title !== "string") continue;
         lines.push(Array.from(`${id} | ${item.status} | ${item.title.replace(/[\r\n]/g, " ")}`).slice(0, 200).join(""));
       } catch { /* An unreadable/latest corrupt item must not resurrect an older revision. */ }
     }

@@ -1,5 +1,6 @@
 import { matchesGlob, isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
+import { bytePrefix, type PreviousHandoff } from "./collect.ts";
 
 export type Mode = "off" | "observe" | "enforce";
 export interface Thresholds { soft: number; handoff: number; hard: number; minProgress: number }
@@ -464,11 +465,14 @@ export interface HandoffInput {
   decisions?: string; user_constraints?: string; open_items?: string; hypotheses?: string;
   files_to_read?: string[]; launch_prompt?: string;
 }
+export interface RepoState { root: string; branch: string; head: string; dirty: number; sync: string }
 export interface AutoState {
   cwd: string; root: string; branch: string; head: string;
   jobs: unknown[]; subagents: unknown[]; claims: unknown[]; unavailable: string[];
   resumeCheck?: string;
   questions?: string[];
+  repos?: RepoState[]; userMessages?: string; scheduled?: string[]; finishedJobs?: string[];
+  previous?: PreviousHandoff;
   /** `git status --short` lines and upstream ahead/behind; collected only for handoffs. */
   dirty?: string[]; sync?: string;
 }
@@ -572,12 +576,19 @@ export function boundedAutoState(auto: AutoState): AutoState {
     if (out.length < records.length) out.push({ omitted: records.length - out.length });
     return out;
   };
+  const expanded = auto.repos !== undefined || auto.userMessages !== undefined || auto.scheduled !== undefined || auto.finishedJobs !== undefined;
+  const chars = (line: string) => Array.from(line).slice(0, 200).join("");
   return { cwd: short(auto.cwd), root: short(auto.root), branch: short(auto.branch), head: short(auto.head),
-    jobs: boundedLines(auto.jobs, jobLine, 16 * 1024), subagents: boundedLines(auto.subagents, subagentLine, 4 * 1024),
+    jobs: boundedLines(auto.jobs, jobLine, (expanded ? 12 : 16) * 1024), subagents: boundedLines(auto.subagents, subagentLine, (expanded ? 3 : 4) * 1024),
     claims: list(auto.claims), unavailable: auto.unavailable.slice(0, 8).map(short), resumeCheck: auto.resumeCheck,
-    questions: auto.questions?.slice(0, 20).map(line => Array.from(line).slice(0, 200).join("")),
-    dirty: auto.dirty && boundedLines(auto.dirty.slice(0, 31), String, 6 * 1024).map(line => Array.from(line).slice(0, 200).join("")),
-    sync: auto.sync === undefined ? undefined : short(auto.sync) };
+    questions: auto.questions && (expanded ? boundedLines(auto.questions.slice(0, 20), r => chars(String(r)), 2 * 1024) : auto.questions.slice(0, 20).map(chars)),
+    dirty: auto.dirty && boundedLines(auto.dirty.slice(0, 31), String, (expanded ? 1 : 6) * 1024).map(chars),
+    sync: auto.sync === undefined ? undefined : short(auto.sync),
+    repos: auto.repos?.slice(0, 8).map(r => ({ root: bytePrefix(r.root, 120), branch: bytePrefix(r.branch, 40), head: bytePrefix(r.head, 64), dirty: r.dirty, sync: bytePrefix(r.sync, 50) })),
+    userMessages: auto.userMessages === undefined ? undefined : bytePrefix(auto.userMessages, 4096),
+    scheduled: auto.scheduled && boundedLines(auto.scheduled.slice(0, 10), r => chars(String(r)), 1024),
+    finishedJobs: auto.finishedJobs && boundedLines(auto.finishedJobs.slice(0, 10), r => chars(String(r)), 2 * 1024),
+    previous: auto.previous && { path: short(auto.previous.path), goal: bytePrefix(auto.previous.goal, 4096), constraints: auto.previous.constraints && bytePrefix(auto.previous.constraints, 4096), filesToRead: auto.previous.filesToRead.slice(0, 20).map(short) } };
 }
 export function renderHandoff(p: HandoffInput, auto: AutoState, id: string, n: number, path: string, at: string): Handoff {
   validateHandoff(p);
@@ -597,8 +608,13 @@ export function renderHandoff(p: HandoffInput, auto: AutoState, id: string, n: n
     `## Next step\n${p.next_step}`, p.files_to_read?.length && `## Read first\n${p.files_to_read.join("\n")}`,
     `## Automatically collected state\nCwd: ${auto.cwd}\nRepository root: ${auto.root}\nBranch: ${auto.branch}\nHEAD: ${auto.head}\n` +
       (auto.dirty ? `Working tree:\n${auto.dirty.join("\n") || "clean"}\nSync: ${auto.sync ?? "unknown"}\n` : "") + `Launch prompt: ${p.launch_prompt ?? "not supplied"}\n` +
-      `Running jobs / watches:\n${auto.jobs.join("\n") || "none"}\nRunning subagents:\n${auto.subagents.join("\n") || "none"}\nIssue claims: ${JSON.stringify(auto.claims)}\nUnavailable: ${auto.unavailable.join(", ") || "none"}`,
+      (auto.repos ? `Repositories touched:\n${auto.repos.map(r => `${r.root} | ${r.branch} | ${r.head.slice(0, 12)} | dirty ${r.dirty} | ${r.sync}`).join("\n") || "none"}\n` : "") +
+      `Running jobs / watches:\n${auto.jobs.join("\n") || "none"}\nRunning subagents:\n${auto.subagents.join("\n") || "none"}\n` +
+      (auto.scheduled ? `Scheduled agents:\n${auto.scheduled.join("\n") || "none exposed"}\n` : "") +
+      (auto.finishedJobs ? `Finished jobs — Finished since last handoff (results not yet acted on):\n${auto.finishedJobs.join("\n") || "none"}\n` : "") +
+      `Issue claims: ${JSON.stringify(auto.claims)}\nUnavailable: ${auto.unavailable.join(", ") || "none"}`,
     auto.questions?.length && `## Pending questions\n${auto.questions.join("\n")}`,
+    auto.userMessages && `## User messages since previous handoff (verbatim)\n${auto.userMessages}`,
     auto.resumeCheck && `## Resume check\n${auto.resumeCheck}`,
     "Resume now from Next step without asking the user. Verify current git HEAD and re-establish external state before trusting prior review/CI/issue facts.",
   ];

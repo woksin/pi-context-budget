@@ -8,7 +8,8 @@ import { effectiveMode, modelThresholds, parseConfig, renderHandoff, validateHan
   restoreHistory, handoffBackoff, forced, degradedFor, type Effect, type Frame, type MachineEvent, type Handoff, type HandoffInput, type HistoryItem } from "./core.ts";
 import { OverflowRecovery } from "./overflow-recovery.ts";
 import { resumeCommand, runResumeCheck } from "./resume-check.ts";
-import { appendEvent, atomicJson, gitDetail, gitState, issueClaims, runningState, writeHandoff, writeLaunchPrompt, writeMarker, processSessionHosts, pendingQuestions, watchCheck, type SessionHosts } from "./storage.ts";
+import { appendEvent, atomicJson, collectRepos, handoffHead, issueClaims, runningState, writeHandoff, writeLaunchPrompt, writeMarker, processSessionHosts, pendingQuestions, watchCheck, type SessionHosts } from "./storage.ts";
+import { chainIdentity, emergencyHandoff, emergencySummary, previousHandoff, primaryHead, userMessagesSince } from "./collect.ts";
 
 type ActionResult = BoundaryResult & ToolCallEventResult & SessionBeforeCompactResult;
 type StatusState = "active" | "ended";
@@ -83,12 +84,17 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
       } catch (error) { log(ctx, "status_error", { error: String(error) }); }
     }
     function autoState(ctx: ExtensionContext) {
-      const running = runningState([...knownIds], { cwd: ctx.cwd, sessionId: ctx.sessionManager.getSessionId() });
+      const id = ctx.sessionManager.getSessionId(), branch = ctx.sessionManager.getBranch();
+      const running = runningState([...knownIds], { cwd: ctx.cwd, sessionId: id }, state.lastHandoff ? Date.parse(state.lastHandoff.at) : undefined);
       let claims: unknown[] = [];
-      try { claims = issueClaims(join(agentDir, "issue-work/registry.jsonl"), ctx.sessionManager.getSessionId()); }
+      try { claims = issueClaims(join(agentDir, "issue-work/registry.jsonl"), id); }
       catch { running.unavailable.push("issue_work registry absent/unreadable"); }
-      return { ...gitState(ctx.cwd), ...gitDetail(ctx.cwd), ...running, claims,
-        questions: pendingQuestions(process.env.PI_QUESTIONS_HOME || join(agentDir, "user-questions"), ctx.sessionManager.getSessionId()) };
+      const collected = collectRepos(ctx.cwd, branch, claims), primary = collected.repos.find(repo => repo.root === collected.cwdRoot);
+      const home = process.env.PI_QUESTIONS_HOME || join(agentDir, "user-questions");
+      return { cwd: resolve(ctx.cwd), root: collected.cwdRoot ?? resolve(ctx.cwd), branch: primary?.branch ?? (collected.repos.length ? "see repositories below" : "unknown/detached"),
+        head: primary?.head ?? primaryHead(collected.repos), dirty: collected.dirty, sync: primary?.sync ?? "unknown", ...running,
+        repos: collected.repos, claims: collected.claims, userMessages: userMessagesSince(branch, state.lastHandoff?.at),
+        questions: pendingQuestions(home, chainIdentity(branch, id, state.lastHandoff?.path)) };
     }
     function checkCommand(ctx: ExtensionContext) {
       if (host?.subagent) return undefined;
@@ -119,11 +125,9 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
       return h;
     }
     function emergencyInput(ctx: ExtensionContext): HandoffInput {
-      const requests = ctx.sessionManager.getBranch().flatMap(e => e.type === "message" && e.message.role === "user"
-        ? [JSON.stringify(e.message.content).slice(0, 600)] : []).slice(-3).join("\n");
-      return { goal: `Emergency handoff. Recent user requests:\n${requests || "Recover the original request from the session file."}`,
-        facts: `No fresh structured handoff. Recheck previous tests/review/CI/issue claims. Session file: ${(ctx.sessionManager.getSessionFile() ?? "unavailable").slice(0, 400)}`,
-        next_step: "Re-establish state from files and git, re-read user constraints in the session file, then continue. Do not assume any prior check passed." };
+      const branch = ctx.sessionManager.getBranch();
+      const previous = previousHandoff(branch, state.lastHandoff, path => readFileSync(path, "utf8"));
+      return emergencyHandoff(branch, ctx.sessionManager.getSessionFile(), previous, state.lastHandoff?.at);
     }
     async function compact(ctx: ExtensionContext, attempt: number): Promise<void> {
       await new Promise<void>(done => {
@@ -173,7 +177,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
           case "backstop": {
             // Mechanical recovery must fit and work even if handoff storage/metadata is unavailable.
             const h = effect.handoff, emergency = h ? undefined : emergencyInput(ctx);
-            const summary = `${h?.text ?? `# Emergency handoff\n${emergency!.goal}\n${emergency!.facts}\n${emergency!.next_step}`}\nCompaction instance: ${randomUUID()}\n`;
+            const summary = `${h?.text ?? emergencySummary(emergency!)}\nCompaction instance: ${randomUUID()}\n`;
             log(ctx, "backstop", { path: h?.path, reason: "machine-authorized" });
             result = { compaction: { summary, firstKeptEntryId: null as unknown as string, tokensBefore: effect.tokensBefore,
               details: { kind: "handoff", path: h?.path, n: h?.n, source: effect.source } } }; break;
@@ -273,7 +277,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
         validateHandoff(input);
         checkLaunchPrompt(input);
         const f = frame(ctx);
-        const refusal = handoffBackoff(input, state.lastHandoff, gitState(ctx.cwd).head, Boolean(forced(state, f)));
+        const refusal = handoffBackoff(input, state.lastHandoff, handoffHead(ctx.cwd, ctx.sessionManager.getBranch()), Boolean(forced(state, f)));
         if (refusal) throw new Error(refusal);
         const handoff = await createHandoff(ctx, input);
         await run({ type: "handoff_written", handoff }, ctx);
