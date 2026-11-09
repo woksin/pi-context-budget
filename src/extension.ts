@@ -5,12 +5,13 @@ import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
 import { effectiveMode, modelThresholds, parseConfig, renderHandoff, validateHandoff, ownsWrapper, effectiveThresholds, launchPromptKind, shorten, RETRY, normalizeFilesToRead, SOFT_NOTICE, initialState, transition, policyStatus,
-  restoreHistory, handoffBackoff, forced, degradedFor, type Effect, type Frame, type MachineEvent, type Handoff, type HandoffInput, type HistoryItem } from "./core.ts";
+  restoreHistory, handoffBackoff, forced, fallbackFor, degradedFor, type Effect, type Frame, type MachineEvent, type AutoState, type Handoff, type HandoffInput, type HistoryItem } from "./core.ts";
+import { checkHandoff } from "./validate.ts";
 import { OverflowRecovery } from "./overflow-recovery.ts";
 import { graceEligible } from "./grace.ts";
 import { resumeCommand, runResumeCheck } from "./resume-check.ts";
 import { appendEvent, atomicJson, collectRepos, handoffHead, issueClaims, runningState, writeHandoff, writeLaunchPrompt, writeMarker, processSessionHosts, pendingQuestions, watchCheck, type SessionHosts } from "./storage.ts";
-import { chainIdentity, emergencyHandoff, emergencySummary, previousHandoff, primaryHead, userMessagesSince } from "./collect.ts";
+import { bytePrefix, chainIdentity, emergencyHandoff, emergencySummary, previousHandoff, primaryHead, userMessagesSince } from "./collect.ts";
 
 type ActionResult = BoundaryResult & ToolCallEventResult & SessionBeforeCompactResult;
 type StatusState = "active" | "ended";
@@ -31,6 +32,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
     const overflow = new OverflowRecovery({ pi, log, frame, run, refresh: reload, model: ctx => ref(ctx), emergencyInput,
       guardOff: ctx => modeStatus(ctx).reason === "context guard off", tokens: () => state.tokens, relaunchSent: () => state.relaunchSent });
     const knownIds = new Set<string>();
+    let handoffRejections = 0;
     let resumeBoundary: string | undefined, resumeMessage: string | undefined;
     let mismatchLogged: string | undefined;
     let isGuardOff: ((name: string) => boolean) | undefined;
@@ -84,9 +86,9 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
         });
       } catch (error) { log(ctx, "status_error", { error: String(error) }); }
     }
-    function autoState(ctx: ExtensionContext) {
+    function autoState(ctx: ExtensionContext, observed?: ReturnType<typeof runningState>) {
       const id = ctx.sessionManager.getSessionId(), branch = ctx.sessionManager.getBranch();
-      const running = runningState([...knownIds], { cwd: ctx.cwd, sessionId: id }, state.lastHandoff ? Date.parse(state.lastHandoff.at) : undefined);
+      const running = observed ?? runningState([...knownIds], { cwd: ctx.cwd, sessionId: id }, state.lastHandoff ? Date.parse(state.lastHandoff.at) : undefined);
       let claims: unknown[] = [];
       try { claims = issueClaims(join(agentDir, "issue-work/registry.jsonl"), id); }
       catch { running.unavailable.push("issue_work registry absent/unreadable"); }
@@ -107,11 +109,19 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
         throw new Error(`launch_prompt file not found: ${shorten(input.launch_prompt)}; pass prompt text or an existing absolute path. ${RETRY}`);
       }
     }
-    async function createHandoff(ctx: ExtensionContext, input: HandoffInput): Promise<Handoff> {
+    function validateObserved(ctx: ExtensionContext, input: HandoffInput, running: ReturnType<typeof runningState>, enforce: boolean) {
+      const checked = checkHandoff(input, { running, knownIds: [...knownIds], exists: isFile,
+        mtimeMs: path => { try { const s = statSync(path); return s.isFile() ? s.mtimeMs : undefined; } catch { return undefined; } },
+        branch: ctx.sessionManager.getBranch(), enforce });
+      if (checked.lint.length) log(ctx, "handoff_lint", { warnings: checked.lint });
+      return checked;
+    }
+    async function createHandoff(ctx: ExtensionContext, input: HandoffInput, lint: string[] = [], observed?: ReturnType<typeof runningState>): Promise<Handoff> {
       validateHandoff(input);
       const command = checkCommand(ctx);
       const resumeCheck = command ? await runResumeCheck(command, ctx.cwd) : undefined;
-      const auto = { ...autoState(ctx), resumeCheck }, id = ctx.sessionManager.getSessionId();
+      const auto: AutoState = { ...autoState(ctx, observed), resumeCheck, lint, discarded: state.discarded };
+      const id = ctx.sessionManager.getSessionId();
       let path: string;
       do { path = join(auto.root, ".ai-work/handoffs", `${id}-${++sequence}.md`); } while (existsSync(path));
       // Prompt text becomes a file beside the handoff, so the relaunch marker always holds an absolute file path.
@@ -122,6 +132,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
       }
       const h = renderHandoff(input, auto, id, sequence, path, new Date().toISOString());
       writeHandoff(h, auto, input);
+      handoffRejections = 0;
       log(ctx, "handoff_written", { path, n: h.n, bytes: Buffer.byteLength(h.text) });
       return h;
     }
@@ -181,7 +192,8 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
           case "backstop": {
             // Mechanical recovery must fit and work even if handoff storage/metadata is unavailable.
             const h = effect.handoff, emergency = h ? undefined : emergencyInput(ctx);
-            const summary = `${h?.text ?? emergencySummary(emergency!)}\nCompaction instance: ${randomUUID()}\n`;
+            const lint = emergency ? validateObserved(ctx, emergency, runningState([...knownIds], { cwd: ctx.cwd, sessionId: ctx.sessionManager.getSessionId() }), false).lint : [];
+            const summary = `${h?.text ?? emergencySummary(emergency!)}${lint.length ? `\n## Handoff lint\n${bytePrefix(lint.join("\n"), 1024)}` : ""}\nCompaction instance: ${randomUUID()}\n`;
             log(ctx, "backstop", { path: h?.path, reason: "machine-authorized" });
             result = { compaction: { summary, firstKeptEntryId: null as unknown as string, tokensBefore: effect.tokensBefore,
               details: { kind: "handoff", path: h?.path, n: h?.n, source: effect.source } } }; break;
@@ -211,7 +223,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
     };
     function reset(ctx: ExtensionContext): void {
       host?.release(); host = hosts.acquire(ctx.sessionManager.getSessionId());
-      reload(ctx); overflow.reset(ctx); knownIds.clear(); resumeBoundary = resumeMessage = mismatchLogged = undefined;
+      reload(ctx); overflow.reset(ctx); knownIds.clear(); handoffRejections = 0; resumeBoundary = resumeMessage = mismatchLogged = undefined;
       const history: HistoryItem[] = ctx.sessionManager.getBranch().flatMap((e): HistoryItem[] => {
         if (e.type === "compaction") {
           const details = e.details as { kind?: string; source?: string } | undefined;
@@ -246,7 +258,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
           const path = (boundary.details as { path?: string }).path;
           const handoff = state.lastHandoff?.path === path ? state.lastHandoff
             : path ? JSON.parse(readFileSync(path.replace(/\.md$/, ".json"), "utf8")) as Handoff : undefined;
-          watchMessage = watchCheck(handoff?.recordedJobs);
+          watchMessage = handoff && watchCheck(handoff);
         } catch { /* Optional recorded/live watch state unavailable. */ }
         resumeMessage = checks.join("\n\n") || undefined;
       }
@@ -266,7 +278,11 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
         user_constraints: { type: "string", description: "User constraints, verbatim." },
         open_items: { type: "string", description: "Unfinished work and open questions." },
         hypotheses: { type: "string", description: "Unverified theories, kept separate from facts." },
-        files_to_read: { type: "array", items: { type: "string", description: "ABSOLUTE path (relative paths are resolved against the cwd)." }, description: "Files to read first on resume." },
+        files_to_read: { type: "array", items: { type: "string", description: "ABSOLUTE path (relative paths are resolved against the cwd)." }, description: "Existing files to read first on resume; relative paths resolve against cwd. Keep state files current." },
+        watch_actions: { type: "array", maxItems: 20, description: "Required for each running watch/job/subagent. Use its exact id (or a unique prefix of at least 8 characters), target and completion follow-up.", items: { type: "object", properties: {
+          id: { type: "string", minLength: 1, maxLength: 300 }, target: { type: "string", minLength: 1, maxLength: 300 },
+          on_complete: { type: "string", minLength: 1, maxLength: 300 }, cancel: { type: "string", minLength: 1, maxLength: 300 },
+        }, required: ["id", "target", "on_complete"], additionalProperties: false } },
         launch_prompt: { type: "string", description: "Optional. The prompt to start the relaunched session with: either the prompt text (saved to a file for you) or an ABSOLUTE path to an existing file containing it." },
       }, required: ["goal", "next_step", "facts"], additionalProperties: false } as never,
       async execute(_id, input: HandoffInput, _signal, _update, ctx) {
@@ -280,16 +296,23 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
         if (input.files_to_read === undefined) delete input.files_to_read;
         validateHandoff(input);
         checkLaunchPrompt(input);
-        const f = frame(ctx);
+        const f = frame(ctx), observed = runningState([...knownIds], { cwd: ctx.cwd, sessionId: ctx.sessionManager.getSessionId() }, state.lastHandoff ? Date.parse(state.lastHandoff.at) : undefined);
+        const checked = validateObserved(ctx, input, observed, !fallbackFor(state, f) && handoffRejections < 2);
+        if (checked.errors.length) {
+          handoffRejections++;
+          log(ctx, "handoff_rejected", { reasons: checked.errors.length, kinds: checked.errors.map(error => error.startsWith("files_to_read") ? "missing_files" : error.startsWith("Unknown") ? "unknown_ids" : "missing_actions") });
+          throw new Error(checked.errors.join("\n"));
+        }
         const refusal = handoffBackoff(input, state.lastHandoff, handoffHead(ctx.cwd, ctx.sessionManager.getBranch()), Boolean(forced(state, f)));
         if (refusal) throw new Error(refusal);
-        const handoff = await createHandoff(ctx, input);
+        const handoff = await createHandoff(ctx, input, checked.lint, observed);
+        const lintNotice = checked.lint.length ? " Handoff lint recorded warnings; they are in the handoff file." : "";
         await run({ type: "handoff_written", handoff }, ctx);
         const degraded = degradedFor(state, frame(ctx));
         if (degraded) {
-          return { content: [{ type: "text", text: `Handoff written to ${handoff.path}. The session reached its handoff loop limit and cannot relaunch, so the context will not reset: continue the task, and ask the user to start a fresh session from this handoff.` }], details: { handoff } };
+          return { content: [{ type: "text", text: `Handoff written to ${handoff.path}. The session reached its handoff loop limit and cannot relaunch, so the context will not reset: continue the task, and ask the user to start a fresh session from this handoff.${lintNotice}` }], details: { handoff } };
         }
-        return { content: [{ type: "text", text: intent.idleOnly ? "Handoff stored. End this turn without further tools; the context resets at the end of this turn." : "Handoff stored. End this turn without further tools; recovery continues automatically." }], details: { handoff } };
+        return { content: [{ type: "text", text: (intent.idleOnly ? "Handoff stored. End this turn without further tools; the context resets at the end of this turn." : "Handoff stored. End this turn without further tools; recovery continues automatically.") + lintNotice }], details: { handoff } };
       },
     });
     pi.on("tool_call", safe((e, ctx) => run({ type: "tool_call", tool: e.toolName, id: e.toolCallId, graceEligible: graceEligible(e.toolName, e.input, ctx.cwd) }, ctx)));
@@ -330,6 +353,9 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
       overflow.nativeCompaction(ctx, e.reason); await run({ type: "session_compact", owned: !!state.compaction && e.fromExtension }, ctx); status(ctx);
     }));
     pi.on("session_compact_failed", safe(async (e, ctx) => { overflow.nativeCompaction(ctx, e.reason); await run(e, ctx); }));
-    pi.on("session_shutdown", safe((_e, ctx) => { overflow.shutdown(); status(ctx, "ended"); host?.release(); host = undefined; log(ctx, "session_shutdown"); }));
+    pi.on("session_shutdown", safe((_e, ctx) => {
+      const held = state.pending ?? state.stored;
+      if (mode(ctx) === "enforce" && held && held.path !== state.committedPath) log(ctx, "handoff_discarded", { path: held.path, reason: "session shutdown before commit" });
+      overflow.shutdown(); status(ctx, "ended"); host?.release(); host = undefined; log(ctx, "session_shutdown"); }));
   };
 }

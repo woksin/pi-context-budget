@@ -26,7 +26,7 @@ const cases: { name: string; state?: Partial<MachineState>; event: MachineEvent;
   { name: "repeat settle never loops", state: { settleRequest: "budget" }, event: { type: "agent_before_settle", pendingWork: false }, phase: "handoff-required", effects: [] },
   { name: "idle continuation retains intent across agent_start", state: { settleRequest: "idle" }, event: { type: "agent_start" }, frame: { tokens: 100 }, phase: "idle", effects: [] },
   { name: "idle handoff pending commit", state: { settleRequest: "idle" }, event: { type: "handoff_written", handoff: h }, frame: { tokens: 100 }, phase: "handoff-pending-commit", effects: [] },
-  { name: "fresh external prompt invalidates idle snapshot", state: { stored: h, settleRequest: "idle" }, event: { type: "before_agent_start" }, frame: { tokens: 100 }, phase: "idle", effects: [] },
+  { name: "fresh external prompt invalidates idle snapshot", state: { stored: h, settleRequest: "idle" }, event: { type: "before_agent_start" }, frame: { tokens: 100 }, phase: "idle", effects: ["log"] },
   { name: "idle input compacts", state: { stored: h, lastSettled: 1 }, event: { type: "input", now: 4000000, streaming: false, alreadyCompacted: false }, frame: { tokens: 40000 }, phase: "compacting", effects: ["compact"] },
   { name: "already compacted input skips", state: { stored: h, lastSettled: 1 }, event: { type: "input", now: 4000000, streaming: false, alreadyCompacted: true }, frame: { tokens: 40000 }, phase: "fallback-armed", effects: [] },
   { name: "backstop IO failure is a machine-authorized cancellation", event: { type: "backstop_failed", reason: "overflow", errorMessage: "EACCES" }, frame: { tokens: 100 }, phase: "fallback-armed", effects: ["log", "cancel_compaction"] },

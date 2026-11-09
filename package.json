@@ -1,6 +1,6 @@
 {
   "name": "@woksin/pi-context-budget",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "Structured context handoffs and bounded continuous sessions for pi",
   "license": "MIT",
   "author": "woksin",
@@ -35,7 +35,7 @@
     "node": ">=22.19.0"
   },
   "bin": {
-    "pi-session": "./bin/pi-session"
+    "pi-session": "bin/pi-session"
   },
   "scripts": {
     "test": "node --test --test-timeout=30000 'test/*.test.ts'",

@@ -193,7 +193,7 @@ export function userMessagesSince(branch: readonly unknown[], previousAt?: strin
 export interface PreviousHandoff { goal: string; constraints?: string; filesToRead: string[]; path: string }
 export function parseHandoffSections(text: string): Omit<PreviousHandoff, "path"> {
   const headings = ["Goal", "Verified facts (agent-reported; verify before relying on them)", "Decisions and why", "User constraints (verbatim)",
-    "Open items", "Hypotheses (unverified)", "Next step", "Read first", "Automatically collected state", "Pending questions", "User messages since previous handoff (verbatim)", "Resume check"];
+    "Open items", "Hypotheses (unverified)", "Next step", "Read first", "Watch actions", "Discarded earlier handoffs", "Handoff lint", "Automatically collected state", "Pending questions", "User messages since previous handoff (verbatim)", "Resume check"];
   const section = (name: string) => {
     const heading = `## ${name}\n`, start = text.indexOf(heading);
     if (start < 0) return "";

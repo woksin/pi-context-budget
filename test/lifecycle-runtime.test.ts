@@ -165,7 +165,7 @@ test("real Pi applies an idle handoff despite queued steering and follow-ups, th
   const seen: string[] = [];
   h.faux.setResponses([
     h.reply("waiting for background work"),
-    h.reply([h.ai.fauxToolCall("context_handoff", { goal: "wait", facts: "pending background job", next_step: "consume notifications" })]),
+    h.reply([h.ai.fauxToolCall("context_handoff", { goal: "wait", facts: "pending background job", next_step: "consume notifications", watch_actions: [{ id: "waiting", target: "background work", on_complete: "consume notifications" }] })]),
     (context: any) => {
       const boundary = h.sessionManager.getBranch().find((e: any) => e.type === "compaction");
       assert.equal(boundary.details.source, "idle");

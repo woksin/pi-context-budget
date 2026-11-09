@@ -48,6 +48,109 @@ async function harness(mode = "enforce", overrides: Record<string, unknown> = {}
     events: () => readFileSync(join(dir, "state/events.jsonl"), "utf8").trim().split("\n").map(l => JSON.parse(l)),
     status: () => JSON.parse(readFileSync(join(dir, "state/status", `${sid}.json`), "utf8")) };
 }
+test("manual validation combines objective failures before resume checks or artifact writes", async () => {
+  const h = await harness("enforce", { resumeChecks: { default: "touch resume-ran" } });
+  (h.ctx.sessionManager as any).getSessionName = () => "default";
+  const global = globalThis as Record<symbol, unknown>, key = Symbol.for("pi-jobs.liveManagers"), old = global[key];
+  try {
+    global[key] = new Set([{ list: () => [{ id: "job", command: "wait", status: "running" }] }]);
+    await assert.rejects(h.handoff({ ...required, files_to_read: ["missing.md"], launch_prompt: "save this prompt" } as never), (error: Error) => error.message.includes("files_to_read") && error.message.includes("watch_actions") && error.message.includes("job"));
+    assert.equal(existsSync(join(h.dir, "resume-ran")), false);
+    assert.equal(existsSync(join(h.dir, ".ai-work/handoffs")), false);
+    assert.ok(!h.events().some(e => e.event === "handoff_written"));
+    writeFileSync(join(h.dir, "present.md"), "read me");
+    const result = await h.handoff({ ...required, files_to_read: ["present.md"], watch_actions: [{ id: "job", target: "gate", on_complete: "read result" }] } as never);
+    assert.ok(existsSync(join(h.dir, "resume-ran")));
+    assert.deepEqual(result.details.handoff.watchActions, [{ id: "job", target: "gate", on_complete: "read result" }]);
+    const draft = await h.turn();
+    h.branch.push({ ...draft.entries[0], id: "boundary" });
+    global[key] = new Set([{ list: () => [] }]);
+    const resumed = await h.emit("context", { messages: [] });
+    assert.match(resumed.messages[0].content, /job \| gate \| read result/);
+    const repeated = await h.emit("context", { messages: [] });
+    assert.ok(!repeated?.messages.some((m: any) => m.content.includes("## Watch check")));
+  } finally { global[key] = old; }
+});
+for (const [name, previousMinutes, beforeMinutes, afterMinutes] of [
+  ["recent", 30, 60, 15], ["older than two hours", 240, 300, 180],
+] as const) test(`finished jobs retain the ${name} previous-handoff cutoff`, async () => {
+  const h = await harness(), now = Date.now();
+  const previous = await h.handoff();
+  h.branch.push({ type: "message", message: { role: "toolResult", toolName: "context_handoff", details: {
+    handoff: { ...previous.details.handoff, at: new Date(now - previousMinutes * 60_000).toISOString() },
+  } } });
+  await h.emit("session_tree");
+  const global = globalThis as Record<symbol, unknown>, key = Symbol.for("pi-jobs.liveManagers"), old = global[key];
+  try {
+    global[key] = new Set([{ list: () => [
+      { id: "already-reported", status: "completed", finishedAt: now - beforeMinutes * 60_000 },
+      { id: "unhandled-result", status: "completed", finishedAt: now - afterMinutes * 60_000 },
+    ] }]);
+    const result = await h.handoff({ ...required, facts: "Second episode has fresh observations" });
+    assert.doesNotMatch(result.details.handoff.text, /already-reported/);
+    assert.match(result.details.handoff.text, /unhandled-result \| - \| completed/);
+    const sidecar = JSON.parse(readFileSync(result.details.handoff.path.replace(/\.md$/, ".json"), "utf8"));
+    assert.equal(sidecar.auto.finishedJobs.length, 1);
+    assert.match(sidecar.auto.finishedJobs[0], /^unhandled-result/);
+  } finally { global[key] = old; }
+});
+test("objective rejections are capped at two and fallback attempts never reject", async () => {
+  const h = await harness();
+  const invalid = { ...required, files_to_read: ["absent.md"] } as never;
+  await assert.rejects(h.handoff(invalid), /files_to_read/);
+  await assert.rejects(h.handoff(invalid), /files_to_read/);
+  const result = await h.handoff(invalid);
+  assert.match(result.details.handoff.text, /\(missing\)/);
+  assert.match(result.content[0].text, /Handoff lint recorded warnings/);
+  assert.equal(h.events().filter(e => e.event === "handoff_rejected").length, 2);
+  await h.emit("tool_execution_end", { toolName: "read", toolCallId: "other", isError: false });
+  await assert.rejects(h.handoff(invalid), /files_to_read/);
+  const hard = await harness();
+  await hard.turn(1200);
+  assert.match((await hard.handoff(invalid)).details.handoff.text, /\(missing\)/);
+  assert.ok(!hard.events().some(e => e.event === "handoff_rejected"));
+});
+test("shutdown logs only an uncommitted draft", async () => {
+  const h = await harness();
+  await h.handoff();
+  await h.emit("session_shutdown");
+  assert.ok(h.events().some(e => e.event === "handoff_discarded" && e.reason === "session shutdown before commit"));
+  const committed = await harness();
+  await committed.handoff(); await committed.turn();
+  await committed.emit("session_shutdown");
+  assert.ok(!committed.events().some(e => e.event === "handoff_discarded"));
+});
+test("backstop validation downgrades missing previous files and uncovered work to lint", async () => {
+  const h = await harness();
+  const path = join(h.dir, "notes.md");
+  writeFileSync(path, "notes");
+  await h.handoff({ ...required, files_to_read: [path] } as never);
+  await h.turn();
+  unlinkSync(path);
+  await h.emit("tool_call", { toolName: "read", toolCallId: "next" });
+  const global = globalThis as Record<symbol, unknown>, key = Symbol.for("pi-jobs.liveManagers"), old = global[key];
+  try {
+    global[key] = new Set([{ list: () => [{ id: "job", status: "running" }] }]);
+    const result = await h.emit("session_before_compact", { preparation: { tokensBefore: 300 }, reason: "overflow" });
+    assert.match(result.compaction.summary, /Handoff lint[\s\S]*\(missing\).*notes.md[\s\S]*watch_actions missing running ids: job/);
+    assert.ok(h.events().some(e => e.event === "handoff_lint"));
+  } finally { global[key] = old; }
+});
+test("stale state warns without rejection and invalid handoff inputs are inert outside enforce", async () => {
+  const h = await harness();
+  const path = join(h.dir, "STATE.md");
+  writeFileSync(path, "old state");
+  h.branch.push({ timestamp: "2099-01-01", message: { role: "assistant", content: [{ type: "toolCall", name: "edit", arguments: { path: "src.ts" } }] } });
+  const result = await h.handoff({ ...required, files_to_read: [path] } as never);
+  assert.match(result.details.handoff.text, /Handoff lint[\s\S]*State file/);
+  assert.ok(h.events().some(e => e.event === "handoff_lint"));
+  for (const mode of ["observe", "off"]) {
+    const inactive = await harness(mode);
+    await inactive.handoff({ ...required, watch_actions: "bad", files_to_read: ["absent"] } as never);
+    assert.equal(existsSync(join(inactive.dir, ".ai-work/handoffs")), false);
+    assert.ok(!inactive.events().some(e => /handoff_(?:lint|discarded)/.test(e.event)));
+  }
+});
 test("same-turn retain-none handoff, floor reset, successful progress, advisory once", async () => {
   const h = await harness();
   await h.turn(100);
@@ -123,6 +226,7 @@ test("hard fallback writes marker before shutdown only in wrapper; provider erro
 test("emergency backstop carries the prior goal, constraints and read-first files verbatim", async () => {
   const h = await harness();
   await h.turn(100);
+  writeFileSync(join(h.dir, "notes.md"), "resume notes");
   await h.handoff({ ...required, goal: "Finish issue eight", user_constraints: "Do not push.\nKeep this exact.", files_to_read: [join(h.dir, "notes.md")] } as never);
   await h.turn();
   await h.emit("tool_call", { toolName: "read" });
@@ -171,7 +275,7 @@ test("idle requires pending work, commits this turn, tolerates Nothing to compac
   try {
     assert.equal((await h.emit("agent_before_settle")).continue, true);
     await h.emit("agent_start"); // Internal continuation: must NOT erase the idle request.
-    await h.handoff();
+    await h.handoff({ ...required, watch_actions: [{ id: "watch", target: "work", on_complete: "read result" }] } as never);
     assert.equal((await h.turn(100)).entries[0].type, "compaction"); // Same-turn reset, not stored only.
     await h.emit("agent_settled", { aborted: false });
     const now = Date.now;
@@ -195,7 +299,7 @@ test("idle handoff resets before a notification or new run within the idle windo
     assert.equal(request.continue, true);
     assert.match(request.entries[0].content, /context resets at the end of this turn/i);
     await h.emit("agent_start");
-    const result = await h.handoff();
+    const result = await h.handoff({ ...required, watch_actions: [{ id: "watch", target: "work", on_complete: "read result" }] } as never);
     assert.match(result.content[0].text, /context resets at the end of this turn/i);
     assert.equal(await h.emit("agent_before_settle"), undefined);
     await assert.rejects(h.handoff(), /already stored/);
@@ -458,7 +562,8 @@ test("enforced in-process subagents skip inherited and configured resume checks 
     assert.ok(!handoff.details.handoff.text.includes("## Resume check"));
     const committed = await h.turn();
     h.branch.push({ ...committed.entries[0], id });
-    assert.equal(await h.emit("context", { messages: [] }), undefined);
+    const context = await h.emit("context", { messages: [] });
+    assert.ok(!context?.messages.some((m: any) => m.content.includes("## Resume check")));
     assert.equal(existsSync(join(h.dir, "should-not-run")), false);
   };
   assert.equal(h.status().role, "subagent");
@@ -475,7 +580,7 @@ test("queued wake starting a run cannot discard an idle handoff before its turn 
   try {
     await h.turn(100);
     await h.emit("agent_before_settle");
-    const stored = await h.handoff();
+    const stored = await h.handoff({ ...required, watch_actions: [{ id: "j1", target: "work", on_complete: "read result" }] } as never);
     await h.emit("input", { streamingBehavior: "followUp", text: "wake notification" });
     await h.emit("before_agent_start");
     const boundary = await h.turn(100);
@@ -513,7 +618,7 @@ test("first resumed call checks missing jobs with full commands, including after
   const command = "echo " + "x".repeat(800);
   global[key] = new Set([{ list: () => [{ id: "watch-1", label: "CI", command, status: "running" }] }]);
   try {
-    await h.handoff();
+    await h.handoff({ ...required, watch_actions: [{ id: "watch-1", target: "CI", on_complete: "read result" }] } as never);
     const committed = await h.turn(100);
     h.branch.push({ ...committed.entries[0], id: "watch-reset" });
     await h.emit("session_tree"); // metadata must also work when tool results were pruned
@@ -612,6 +717,8 @@ test("launch_prompt text is saved beside the handoff and the marker references t
   process.env.PI_RELAUNCH_MARKER = join(h.dir, "relaunch", `${process.pid}-${nonce}.json`);
   const text = "Continue the work.\nRead the handoff first.";
   await h.turn(100);
+  mkdirSync(join(h.dir, "src"));
+  writeFileSync(join(h.dir, "src/a.ts"), "export {};");
   const result = await h.handoff({ ...required, launch_prompt: text, files_to_read: ["src/a.ts"] } as never);
   const handoff = result.details.handoff;
   const promptPath = handoff.path.replace(/\.md$/, ".launch-prompt.md");
