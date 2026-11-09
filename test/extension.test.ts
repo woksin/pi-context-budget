@@ -71,6 +71,29 @@ test("manual validation combines objective failures before resume checks or arti
     assert.ok(!repeated?.messages.some((m: any) => m.content.includes("## Watch check")));
   } finally { global[key] = old; }
 });
+for (const [name, previousMinutes, beforeMinutes, afterMinutes] of [
+  ["recent", 30, 60, 15], ["older than two hours", 240, 300, 180],
+] as const) test(`finished jobs retain the ${name} previous-handoff cutoff`, async () => {
+  const h = await harness(), now = Date.now();
+  const previous = await h.handoff();
+  h.branch.push({ type: "message", message: { role: "toolResult", toolName: "context_handoff", details: {
+    handoff: { ...previous.details.handoff, at: new Date(now - previousMinutes * 60_000).toISOString() },
+  } } });
+  await h.emit("session_tree");
+  const global = globalThis as Record<symbol, unknown>, key = Symbol.for("pi-jobs.liveManagers"), old = global[key];
+  try {
+    global[key] = new Set([{ list: () => [
+      { id: "already-reported", status: "completed", finishedAt: now - beforeMinutes * 60_000 },
+      { id: "unhandled-result", status: "completed", finishedAt: now - afterMinutes * 60_000 },
+    ] }]);
+    const result = await h.handoff({ ...required, facts: "Second episode has fresh observations" });
+    assert.doesNotMatch(result.details.handoff.text, /already-reported/);
+    assert.match(result.details.handoff.text, /unhandled-result \| - \| completed/);
+    const sidecar = JSON.parse(readFileSync(result.details.handoff.path.replace(/\.md$/, ".json"), "utf8"));
+    assert.equal(sidecar.auto.finishedJobs.length, 1);
+    assert.match(sidecar.auto.finishedJobs[0], /^unhandled-result/);
+  } finally { global[key] = old; }
+});
 test("objective rejections are capped at two and fallback attempts never reject", async () => {
   const h = await harness();
   const invalid = { ...required, files_to_read: ["absent.md"] } as never;

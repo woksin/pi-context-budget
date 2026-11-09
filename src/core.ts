@@ -595,7 +595,7 @@ export function validateHandoff(p: HandoffInput): void {
 }
 // 12 KiB narrative remains available alongside 16 KiB jobs, 4 KiB agents,
 // 4 KiB resume output, 768 B claims, bounded metadata/headings, and up to 4 KiB
-// watch actions and lint (52 KiB total).
+// watch actions and lint, plus 1 KiB for discarded references (52 KiB total).
 export const MAX_HANDOFF_BYTES = 52 * 1024;
 function stateField(value: unknown): string {
   return value === undefined || value === null ? "-" : String(value).replace(/\r/g, "\\r").replace(/\n/g, "\\n");
@@ -652,7 +652,7 @@ export function boundedAutoState(auto: AutoState): AutoState {
     scheduled: auto.scheduled && boundedLines(auto.scheduled.slice(0, 10), r => chars(String(r)), 1024),
     finishedJobs: auto.finishedJobs && boundedLines(auto.finishedJobs.slice(0, 10), r => chars(String(r)), 2 * 1024),
     lint: auto.lint && boundedLines(auto.lint.slice(0, 8), line => bytePrefix(String(line), 300), 1024),
-    discarded: auto.discarded?.slice(-5).map(item => ({ path: bytePrefix(item.path, 120), reason: bytePrefix(item.reason, 120) })),
+    discarded: auto.discarded?.slice(-5).map(item => ({ path: item.path, reason: bytePrefix(item.reason, 120) })),
     previous: auto.previous && { path: short(auto.previous.path), goal: bytePrefix(auto.previous.goal, 4096), constraints: auto.previous.constraints && bytePrefix(auto.previous.constraints, 4096), filesToRead: auto.previous.filesToRead.slice(0, 20).map(short) } };
 }
 export function renderHandoff(p: HandoffInput, auto: AutoState, id: string, n: number, path: string, at: string): Handoff {
@@ -675,6 +675,12 @@ export function renderHandoff(p: HandoffInput, auto: AutoState, id: string, n: n
     actions.push(line);
   }
   if (actions.length < (p.watch_actions?.length ?? 0)) actions.push(`omitted: ${p.watch_actions!.length - actions.length}`);
+  // Reserve room for the explanation and omission counts; never cut a path.
+  const discarded = boundedLines((auto.discarded ?? []).slice(-5), r => {
+    const item = r as { path: string; reason: string };
+    return `${item.path} — ${bytePrefix(item.reason, 120)}`;
+  }, 900);
+  if ((auto.discarded?.length ?? 0) > 5) discarded.push(`omitted: ${auto.discarded!.length - 5} earlier records`);
   auto = boundedAutoState(auto);
   const sections = [
     `# Handoff ${id}-${n}`, `Timestamp: ${at}\nHandoff file: ${path}`,
@@ -694,9 +700,8 @@ export function renderHandoff(p: HandoffInput, auto: AutoState, id: string, n: n
     auto.questions?.length && `## Pending questions\n${auto.questions.join("\n")}`,
     auto.userMessages && `## User messages since previous handoff (verbatim)\n${auto.userMessages}`,
     auto.resumeCheck && `## Resume check\n${auto.resumeCheck}`,
-    ((auto.lint?.length ?? 0) + (auto.discarded?.length ?? 0) > 0) && `## Handoff lint\n${bytePrefix([
-      ...(auto.lint ?? []), ...(auto.discarded ?? []).map(item => `Discarded earlier handoffs (stored, never committed; re-read if you rely on them): ${item.path} — ${item.reason}`),
-    ].join("\n"), 1024)}`,
+    discarded.length && `## Discarded earlier handoffs\nStored, never committed; re-read if you rely on them:\n${discarded.join("\n")}`,
+    auto.lint?.length && `## Handoff lint\n${bytePrefix(auto.lint.join("\n"), 1024)}`,
     "Resume now from Next step without asking the user. Verify current git HEAD and re-establish external state before trusting prior review/CI/issue facts.",
   ];
   const text = sections.filter(Boolean).join("\n\n") + "\n";

@@ -296,7 +296,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
         if (input.files_to_read === undefined) delete input.files_to_read;
         validateHandoff(input);
         checkLaunchPrompt(input);
-        const f = frame(ctx), observed = runningState([...knownIds], { cwd: ctx.cwd, sessionId: ctx.sessionManager.getSessionId() }, undefined);
+        const f = frame(ctx), observed = runningState([...knownIds], { cwd: ctx.cwd, sessionId: ctx.sessionManager.getSessionId() }, state.lastHandoff ? Date.parse(state.lastHandoff.at) : undefined);
         const checked = validateObserved(ctx, input, observed, !fallbackFor(state, f) && handoffRejections < 2);
         if (checked.errors.length) {
           handoffRejections++;

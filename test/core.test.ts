@@ -96,7 +96,7 @@ test("watch actions, lint and discarded drafts render without corrupting read-fi
     { ...auto, lint: ["stale state"], discarded: [{ path: "/old.md", reason: "replaced" }], subagents: [{ id: "agent", description: "review" }] }, "s", 1, "/h.md", "now");
   assert.match(h.text, /## Watch actions\nagent \| review \| read result \| cancel agent/);
   assert.match(h.text, /## Handoff lint\nstale state/);
-  assert.match(h.text, /Discarded earlier handoffs.*\/old.md — replaced/);
+  assert.match(h.text, /Discarded earlier handoffs[\s\S]*\/old.md — replaced/);
   assert.deepEqual(parseHandoffSections(h.text).filesToRead, ["/read.md"]);
   assert.equal(h.recordedSubagents?.[0].id, "agent");
   assert.ok(Buffer.byteLength(h.text) <= MAX_HANDOFF_BYTES);
@@ -135,6 +135,32 @@ test("watch actions and lint have independent UTF-8 budgets and explicit omissio
   assert.ok(Buffer.byteLength(lint) <= 1024);
   assert.ok(Buffer.byteLength(h.text) <= MAX_HANDOFF_BYTES);
   assert.ok(!h.text.includes("�"));
+});
+test("discarded references remain complete ahead of maximum lint, or are omitted whole", () => {
+  const paths = Array.from({ length: 5 }, (_, i) => `/repo/${"deep/".repeat(40)}.ai-work/handoffs/session-${i}.md`);
+  const discarded = paths.map(path => ({ path, reason: "tool call after handoff" }));
+  const artifact = join(dir(), "long-paths.md");
+  const h = renderHandoff({ ...input, files_to_read: ["/read.md"] }, { ...auto, lint: Array(8).fill("warning ".repeat(37)), discarded }, "s", 1, artifact, "now");
+  writeHandoff(h, { ...auto, discarded });
+  const sidecar = JSON.parse(readFileSync(artifact.replace(/\.md$/, ".json"), "utf8"));
+  assert.deepEqual(sidecar.auto.discarded.map((item: { path: string }) => item.path), paths);
+  const refs = h.text.split("## Discarded earlier handoffs\n")[1]?.split("\n\n")[0];
+  assert.ok(refs, "discarded references have a reserved section separate from lint");
+  assert.ok(h.text.indexOf("## Discarded earlier handoffs") < h.text.indexOf("## Handoff lint"));
+  assert.ok(Buffer.byteLength(refs) <= 1024);
+  assert.ok(refs.includes(paths[0]), "a long path retains its session suffix");
+  const included = paths.filter(path => refs.includes(path));
+  for (const line of refs.split("\n").filter(line => line.startsWith("/repo/"))) assert.ok(paths.some(path => line.startsWith(`${path} — `)));
+  assert.match(refs, new RegExp(`omitted: ${paths.length - included.length} records`));
+  assert.deepEqual(parseHandoffSections(h.text).filesToRead, ["/read.md"]);
+  assert.ok(Buffer.byteLength(h.text) <= MAX_HANDOFF_BYTES);
+  const oversized = renderHandoff(input, { ...auto, discarded: [{ path: "/" + "long/".repeat(300) + "session.md", reason: "replaced" }] }, "s", 1, "/h.md", "now");
+  assert.match(oversized.text, /Discarded earlier handoffs[\s\S]*omitted: 1 records/);
+  assert.ok(!oversized.text.includes("long/"));
+  const capped = renderHandoff(input, { ...auto, discarded: Array.from({ length: 6 }, (_, i) => ({ path: `/draft-${i}.md`, reason: "replaced" })) }, "s", 1, "/h.md", "now");
+  assert.match(capped.text, /omitted: 1 earlier records/);
+  assert.ok(!capped.text.includes("/draft-0.md"));
+  assert.ok(capped.text.includes("/draft-5.md"));
 });
 test("discard history is capped, records once and clears after the next write", () => {
   const frame = { mode: "enforce" as const, tokens: 1, thresholds: t, config, wrapped: false };
