@@ -2,13 +2,14 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs, { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
 import { appendEvent, EVENT_LOG_KEEP, EVENT_LOG_MAX_BYTES, TURN_LOG_KEEP } from "../src/storage.ts";
 
-const root = resolve(import.meta.dirname, "../.ai-work/pcb-12/fixtures");
+const root = mkdtempSync(join(tmpdir(), "pcb-event-log-"));
+test.after(() => rmSync(root, { recursive: true, force: true }));
 function fixture() {
-  mkdirSync(root, { recursive: true });
   return mkdtempSync(join(root, "event-log-"));
 }
 const archives = (dir: string, base = "events") => readdirSync(dir).filter(name => name.startsWith(`${base}-`) && name.endsWith(".jsonl")).sort();
@@ -47,6 +48,14 @@ test("rotation prunes all but the newest keep archives", () => {
   assert.equal(archives(dir).length, 3);
   assert.deepEqual(archives(dir).flatMap(name => lines(dir, name)), [{ id: 4 }, { id: 5 }, { id: 6 }]);
   assert.deepEqual(lines(dir, "events.jsonl"), [{ id: 7 }]);
+});
+
+test("same-millisecond rotations keep the newest archives", () => {
+  const dir = fixture();
+  for (let id = 0; id < 6; id++) appendEvent(dir, { id }, { maxBytes: 1, keep: 3, now });
+  assert.deepEqual(archives(dir), ["events-20260102T030405006Z-002.jsonl", "events-20260102T030405006Z-003.jsonl", "events-20260102T030405006Z-004.jsonl"]);
+  assert.deepEqual(readdirSync(dir).filter(name => name.startsWith("events-")).flatMap(name => lines(dir, name)).map(line => line.id).sort(), [2, 3, 4]);
+  assert.deepEqual(lines(dir, "events.jsonl"), [{ id: 5 }]);
 });
 
 test("turns are separate, rotate independently, and use their own retention default", () => {

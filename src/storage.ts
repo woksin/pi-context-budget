@@ -75,15 +75,22 @@ function takeLogLock(lock: string, now: () => number): Stats | undefined {
 }
 function logArchive(dir: string, base: string, now: () => number): string {
   const stamp = new Date(now()).toISOString().replace(/[-:.]/g, "");
-  let path = join(dir, `${base}-${stamp}.jsonl`), collision = 0;
-  while (existsSync(path)) {
-    const suffix = collision++ ? `-${collision}` : "";
-    path = join(dir, `${base}-${stamp}-${process.pid}${suffix}.jsonl`);
-  }
+  // Rotation runs under the lock, so a same-millisecond collision gets a counter
+  // above every existing one for that stamp (pruned names are never reused);
+  // archiveOrder sorts these after the plain stamp.
+  const prefix = `${base}-${stamp}`, taken = readdirSync(dir).filter(name => name.startsWith(prefix) && name.endsWith(".jsonl"));
+  if (!taken.length) return join(dir, `${prefix}.jsonl`);
+  const counter = Math.max(0, ...taken.map(name => Number(/-(\d+)\.jsonl$/.exec(name.slice(prefix.length))?.[1] ?? 0)));
+  let path: string, next = counter;
+  do path = join(dir, `${prefix}-${String(++next).padStart(3, "0")}.jsonl`); while (existsSync(path));
   return path;
 }
+const archiveOrder = (a: string, b: string): number => {
+  const x = a.slice(0, -".jsonl".length), y = b.slice(0, -".jsonl".length);
+  return x < y ? -1 : x > y ? 1 : 0;
+};
 function pruneLog(dir: string, base: string, keep: number): void {
-  const archives = readdirSync(dir).filter(name => name.startsWith(`${base}-`) && name.endsWith(".jsonl")).sort();
+  const archives = readdirSync(dir).filter(name => name.startsWith(`${base}-`) && name.endsWith(".jsonl")).sort(archiveOrder);
   for (const name of archives.slice(0, Math.max(0, archives.length - keep))) {
     try { rmSync(join(dir, name)); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
