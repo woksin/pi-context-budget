@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync, type Stats } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { boundedAutoState, isSubagent, type AutoState, type Handoff, type HandoffInput, type RecordedJob } from "./core.ts";
@@ -116,6 +116,92 @@ export function appendEvent(dir: string, data: unknown, opts: EventLogOptions = 
     if (logSize(file) >= maxBytes) rotateLog(dir, base, { maxBytes, keep: opts.keep ?? (base === "turns" ? TURN_LOG_KEEP : EVENT_LOG_KEEP), now: opts.now ?? Date.now });
   } catch { /* Rotation is best-effort: telemetry must still append if it fails. */ }
   appendFileSync(file, JSON.stringify(data) + "\n", { mode: 0o600 });
+}
+interface StatusPruneOptions {
+  now?: () => number;
+  retentionMs?: number;
+  throttleMs?: number;
+  maxFiles?: number;
+  maxMs?: number;
+  currentSessionId?: string;
+  pidAlive?: (pid: number) => boolean;
+}
+interface PruneStamp { at: number; cursor: string }
+function pruneStamp(path: string): PruneStamp {
+  try {
+    const stamp = JSON.parse(readFileSync(path, "utf8"));
+    if (typeof stamp.at === "number" && typeof stamp.cursor === "string") return stamp;
+  } catch { /* Missing or invalid stamps start a new pass. */ }
+  return { at: -Infinity, cursor: "" };
+}
+function statusPidAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; }
+  catch (error) { return (error as NodeJS.ErrnoException).code !== "ESRCH"; }
+}
+function markerPending(marker: unknown): boolean {
+  if (marker === undefined || marker === null) return false;
+  if (typeof marker !== "string" || !marker) return true;
+  try { statSync(marker); return true; }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+function statusCanPrune(record: { pid: number; sessionId?: string; relaunchMarker?: unknown }, pidAlive: (pid: number) => boolean, currentSessionId?: string): boolean {
+  if (currentSessionId !== undefined && record.sessionId === currentSessionId) return false;
+  if (!Number.isSafeInteger(record.pid) || record.pid <= 0) return false;
+  return pidAlive(record.pid) === false && !markerPending(record.relaunchMarker);
+}
+function pruneStatusFile(path: string, cutoff: number, pidAlive: (pid: number) => boolean, currentSessionId?: string): boolean {
+  if (currentSessionId !== undefined && basename(path) === `${currentSessionId}.json`) return false;
+  const before = statSync(path);
+  if (!before.isFile() || before.mtimeMs >= cutoff) return false;
+  if (!statusCanPrune(JSON.parse(readFileSync(path, "utf8")), pidAlive, currentSessionId)) return false;
+  // Status writes are atomic renames. Leave a refreshed/replaced record alone.
+  if (!sameLock(before, statSync(path))) return false;
+  rmSync(path);
+  return true;
+}
+interface PruneCounts { examined: number; removed: number; kept: number; errors: number; capped: boolean }
+function scanStatus(dir: string, stamp: PruneStamp, started: number, counts: PruneCounts,
+  { now = Date.now, retentionMs = 7 * 24 * 60 * 60 * 1000, maxFiles = 5000, maxMs = 200, currentSessionId, pidAlive = statusPidAlive }: StatusPruneOptions): string {
+  const names = readdirSync(dir).filter(name => name.endsWith(".json") && name > stamp.cursor).sort();
+  let cursor = stamp.cursor;
+  for (const name of names) {
+    if (counts.examined >= maxFiles || now() - started >= maxMs) { counts.capped = true; break; }
+    cursor = name;
+    counts.examined++;
+    try {
+      if (pruneStatusFile(join(dir, name), started - retentionMs, pidAlive, currentSessionId)) counts.removed++;
+      else counts.kept++;
+    } catch { counts.kept++; counts.errors++; /* Unreadable/corrupt/unknown means keep. */ }
+  }
+  return counts.capped ? cursor : "";
+}
+function statusPrunePass(dir: string, opts: StatusPruneOptions): void {
+  const now = opts.now ?? Date.now, started = now(), statusDir = join(dir, "status");
+  const stampPath = join(statusDir, ".last-prune"), throttleMs = opts.throttleMs ?? 24 * 60 * 60 * 1000;
+  if (started - pruneStamp(stampPath).at < throttleMs) return;
+  const lock = join(statusDir, ".prune.lock"), owner = takeLogLock(lock, now);
+  if (!owner) return;
+  const counts = { examined: 0, removed: 0, kept: 0, errors: 0, capped: false };
+  try {
+    // Recheck under the lock: another starter may have just completed a pass.
+    const stamp = pruneStamp(stampPath);
+    if (started - stamp.at < throttleMs) return;
+    const cursor = scanStatus(statusDir, stamp, started, counts, opts);
+    atomicJson(stampPath, { at: started, cursor });
+  } catch { counts.errors++; }
+  finally {
+    try { if (sameLock(owner, statSync(lock))) rmdirSync(lock); } catch { /* Best-effort release. */ }
+    try { appendEvent(dir, { at: new Date(started).toISOString(), event: "status_pruned", ...counts }); }
+    catch { /* Pruning telemetry must not break a session either. */ }
+  }
+}
+/** Best-effort, bounded cleanup of old status records with a confirmed dead PID. */
+export function pruneStatus(dir: string, opts: StatusPruneOptions = {}): void {
+  try { statusPrunePass(dir, opts); }
+  catch { /* Missing/unwritable status directories or locks simply defer pruning. */ }
 }
 export function writeHandoff(h: Handoff, auto: AutoState, input?: HandoffInput): void {
   mkdirSync(dirname(h.path), { recursive: true, mode: 0o700 });
