@@ -135,7 +135,7 @@ test("optional Symbol registries degrade gracefully and retain pending watches/s
   const oldS = global[sk], oldJ = global[jk];
   try {
     delete global[sk]; delete global[jk];
-    assert.equal(runningState().unavailable.length, 2);
+    assert.deepEqual(runningState().unavailable, ["pi-subagents registry absent", "scheduled agents: not exposed by registry", "pi-jobs registry absent"]);
     global[sk] = { hasRunning: () => true, getRecord: () => ({ id: "a", status: "running" }) };
     global[jk] = new Set([{ list: () => [{ id: "watch", kind: "watch", status: "running" }, { status: "succeeded" }] }]);
     assert.equal(runningState(["a"]).subagents.length, 1);

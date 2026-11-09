@@ -51,6 +51,16 @@ test("questions are session-scoped, latest-revision-only, read-only and bounded"
   assert.deepEqual(pendingQuestions(file, "s"), []);
 });
 
+test("questions include only current and earlier chain sessions, never cwd alone", () => {
+  const home = mkdtempSync(join(root, "question-chain-"));
+  for (const [n, sessionId] of [[1, "earlier"], [2, "another"], [3, "other"], [4, "current"]] as const) {
+    const dir = join(home, "items", `Q-${n}`);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "r00000001.json"), JSON.stringify({ id: `Q-${n}`, status: "open", title: `question ${n}`, asker: { sessionId, cwd: "/shared" } }));
+  }
+  assert.deepEqual(pendingQuestions(home, { sessionIds: ["current", "earlier"] }).map(line => line.split(" | ")[0]), ["Q-1", "Q-4"]);
+});
+
 test("watch diff is absent for live work or absent/unreadable registries", () => {
   const key = Symbol.for("pi-jobs.liveManagers"), global = globalThis as Record<symbol, unknown>, old = global[key];
   const recorded = [{ id: "j1", label: "watch", command: "echo hello | cat" }];

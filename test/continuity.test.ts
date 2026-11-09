@@ -48,7 +48,7 @@ test("session task ids enumerate registry-authoritative running/queued agents wi
   try {
     const r = runningState([], { cwd: "/repo", sessionId: "s1", taskDir: dir });
     assert.deepEqual(r.subagents.map(subagentLine), ["active | running | implement change", "queued | queued | review change"]);
-    assert.deepEqual(r.unavailable, []);
+    assert.deepEqual(r.unavailable, ["scheduled agents: not exposed by registry"]);
     assert.equal(jobLine(r.jobs[0]), "j1 | CI | watch | success | 5 | test | /repo | /log");
     const h = renderHandoff({ goal: "g", facts: "f", next_step: "n" }, { ...auto, ...r }, "s", 1, "/h", "now");
     assert.ok(h.text.includes("active | running | implement change\nqueued | queued | review change"));
