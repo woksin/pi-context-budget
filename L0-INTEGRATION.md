@@ -27,7 +27,7 @@ PY
 
 Join by exact cwd/sessionId, not display labels or parsed terminal titles. A null token measurement immediately after compaction is expected; wait for the next completed assistant usage before evaluating progress. Status files are retained after exit: check PID and session-file identity/mtime before treating one as live. A stale file or an old/dead PID alone does **not** authorize killing another process, cleaning up work or closing an issue.
 
-Observe events are measurements, not instructions. Useful alerts: repeated blocked tools, `relaunch_unavailable`, `hook_error`, `config_error`, `backstop_error`, cap/loop fallback, missing fresh status for a known-live lane. A main/child floor persistently above handoff indicates a misconfigured budget, not a reason to lower thresholds further.
+Observe events are measurements, not instructions. Useful alerts: repeated blocked tools, `relaunch_unavailable`, `cap_advisory`, `hook_error`, `config_error`, `backstop_error`, cap/loop fallback, missing fresh status for a known-live lane. A main/child floor persistently above handoff indicates a misconfigured budget, not a reason to lower thresholds further.
 
 Watch the existing session JSONL (append entries), not `session_compact` notifications: draft compactions at `turn_end` emit no `session_compact`. Match:
 
@@ -93,7 +93,7 @@ Restore any lane-specific CLI/environment settings from the original reviewed la
 
 In-process handoffs preserve children/jobs/watches and issue_work session claims. Relaunch does not: shutdown kills in-flight work and creates a new sessionId. The successor must inspect jobs/CI/PR/issue state and re-establish claims rather than trusting stale handoff claims or auto-retrying a still-running external action.
 
-Current pi-subagents binds children without a shutdown action. They inherit the root process environment, but are **not** independent wrapper processes. This extension refuses to write the root marker for a child. A child's valid hard-limit handoff now commits in-process. For exhausted loop/cap or unrecoverable compaction failure, L0/parent receives `relaunch_unavailable`; stop/replace that child using the parent integration after saving/reviewing its handoff. Do not kill the main lane PID on behalf of a child. Registry enumeration limitations are recorded in each handoff (README.md).
+Current pi-subagents binds children without a shutdown action. They inherit the root process environment, but are **not** independent wrapper processes. This extension refuses to write the root marker for a child. A child's valid hard-limit handoff now commits in-process; past the handoff cap an unwrapped child keeps working in place and emits `cap_advisory`. For an exhausted loop (self-clears on progress), unrecoverable compaction failure, L0/parent receives `relaunch_unavailable`; stop/replace that child using the parent integration after saving/reviewing its handoff. Do not kill the main lane PID on behalf of a child. Registry enumeration limitations are recorded in each handoff (README.md).
 
 ## Trial acceptance
 

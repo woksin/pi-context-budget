@@ -1,4 +1,5 @@
-import { matchesGlob, isAbsolute, resolve } from "node:path";
+import { matchesGlob, isAbsolute, join, resolve } from "node:path";
+import { homedir } from "node:os";
 
 export type Mode = "off" | "observe" | "enforce";
 export interface Thresholds { soft: number; handoff: number; hard: number; minProgress: number }
@@ -125,20 +126,22 @@ export interface MachineState {
   phase: Phase; mode: Mode; tokens: number | null; floor: number | null;
   turn: number; count: number; handoffTurns: number[]; softNotified: boolean;
   settleRequest: "none" | "budget" | "idle";
+  /** The in-turn "handoff required" notice was already delivered since the last reset. */
+  requiredNoticed: boolean;
   pending?: Handoff; pendingSource?: CommitSource; stored?: Handoff; lastHandoff?: Handoff;
   failures: number; compactionFallback: boolean;
   compaction?: { id: number; origin: "idle" | "backstop" };
   attempt: number; blockedCalls: string[]; lastSettled: number; observedIdle: boolean;
   providerFailure: "none" | "error" | "overflow" | "aborted";
   relaunchSent: boolean; lastAction: BudgetAction;
-  /** Unwrapped cap/loop notice already emitted (once per session). */
-  degradedNotified?: boolean;
+  /** Turn on which the unwrapped cap/loop notice was last emitted (at most once per turn). */
+  advisoryNoticeTurn?: number;
   /** Counterfactual policy state only; never mixed into actual history or action execution. */
   observation?: MachineState;
 }
 export interface Frame { mode: Mode; tokens: number | null; thresholds: Thresholds; config: Config; wrapped: boolean }
 export type MachineEvent =
-  | { type: "turn_end"; usage?: number; failure?: MachineState["providerFailure"] }
+  | { type: "turn_end"; usage?: number; failure?: MachineState["providerFailure"]; continues?: boolean }
   | { type: "tool_call"; tool: string; id: string }
   | { type: "tool_end"; tool: string; id: string; error: boolean }
   | { type: "handoff_prepare" }
@@ -156,7 +159,9 @@ export type MachineEvent =
 export type Effect =
   | { type: "log"; event: string; data?: Record<string, unknown> }
   | { type: "notify" }
-  | { type: "notify_degraded"; reason: "cap" | "loop" }
+  | { type: "notice_required" }
+  | { type: "notify_degraded"; reason: "loop" }
+  | { type: "notify_cap_advisory"; count: number; cap: number }
   | { type: "write_handoff"; idleOnly: boolean }
   | { type: "reject_handoff"; reason: string }
   | { type: "block"; reason: string }
@@ -169,7 +174,7 @@ export type Effect =
 type LogEffect = Extract<Effect, { type: "log" }>;
 export function initialState(mode: Mode = "observe"): MachineState {
   return { phase: "idle", mode, tokens: null, floor: null, turn: 0, count: 0, handoffTurns: [], softNotified: false,
-    settleRequest: "none", failures: 0, compactionFallback: false, attempt: 0, blockedCalls: [], lastSettled: 0,
+    settleRequest: "none", requiredNoticed: false, failures: 0, compactionFallback: false, attempt: 0, blockedCalls: [], lastSettled: 0,
     observedIdle: false, providerFailure: "none", relaunchSent: false, lastAction: "none" };
 }
 export function classifyFailure(e: { aborted?: boolean; errorMessage?: string }): FailureClass {
@@ -180,18 +185,41 @@ export function classifyFailure(e: { aborted?: boolean; errorMessage?: string })
 }
 export function fallbackFor(s: MachineState, f: Frame): Fallback | undefined {
   if (s.handoffTurns.filter(t => s.turn - t <= f.config.loop.withinTurns).length > f.config.loop.maxHandoffsWithoutProgress) return "loop";
-  if (s.count >= f.config.maxHandoffsPerSession) return "cap";
+  if (f.wrapped && s.count >= f.config.maxHandoffsPerSession) return "cap";
   if (s.compactionFallback) return "compaction";
   if (s.tokens !== null && s.tokens >= f.thresholds.hard) return "hard";
   return undefined;
 }
-/** Cap/loop with no wrapper cannot relaunch: enforcement degrades to notify-only. */
-export function degradedFor(s: MachineState, f: Frame): "cap" | "loop" | undefined {
-  const fb = fallbackFor(s, f);
-  return (fb === "cap" || fb === "loop") && !f.wrapped ? fb : undefined;
+/** Loop with no wrapper cannot relaunch: enforcement degrades to notify-only. Unwrapped cap is advisory only (see capAdvisory). */
+export function degradedFor(s: MachineState, f: Frame): "loop" | undefined {
+  return fallbackFor(s, f) === "loop" && !f.wrapped ? "loop" : undefined;
+}
+/** soft/handoff are minimums; with a known floor they move up with it (floor + minProgress). Hard stays absolute and wins. */
+export function effectiveThresholds(floor: number | null, t: Thresholds): { soft: number; handoff: number } {
+  if (floor === null) return { soft: t.soft, handoff: t.handoff };
+  const handoff = Math.min(t.hard, Math.max(t.handoff, floor + t.minProgress));
+  return { soft: Math.min(handoff, Math.max(t.soft, handoff - (t.handoff - t.soft))), handoff };
 }
 function handoffRequired(s: MachineState, f: Frame): boolean {
-  return s.tokens !== null && s.floor !== null && s.tokens >= f.thresholds.handoff && s.tokens - s.floor >= f.thresholds.minProgress;
+  return s.tokens !== null && s.floor !== null && s.tokens >= effectiveThresholds(s.floor, f.thresholds).handoff;
+}
+/** Unwrapped sessions cannot relaunch at the cap: it only warns, in-place enforcement continues. */
+function capAdvisory(s: MachineState, f: Frame): boolean {
+  return !f.wrapped && s.count >= f.config.maxHandoffsPerSession;
+}
+/** Loud, per-turn (deduplicated) notices for unwrapped cap advisory and loop degradation. */
+function notices(s: MachineState, e: MachineEvent, f: Frame): Effect[] {
+  if (e.type !== "turn_end" && e.type !== "agent_settled") return [];
+  const loop = degradedFor(s, f), cap = capAdvisory(s, f);
+  if ((!loop && !cap) || s.advisoryNoticeTurn === s.turn) return [];
+  s.advisoryNoticeTurn = s.turn;
+  const effects: Effect[] = [];
+  if (cap) {
+    const data = { count: s.count, cap: f.config.maxHandoffsPerSession };
+    effects.push({ type: "log", event: "cap_advisory", data }, { type: "notify_cap_advisory", ...data });
+  }
+  if (loop) effects.push({ type: "log", event: "relaunch_unavailable", data: { reason: loop } }, { type: "notify_degraded", reason: loop });
+  return effects;
 }
 /** Back-off must never block the only tool allowed by enforcement. */
 export function forced(s: MachineState, f: Frame): Fallback | boolean {
@@ -201,15 +229,15 @@ function committed(s: MachineState, source: CommitSource): void {
   if (source !== "idle") { s.count++; s.handoffTurns.push(s.turn); }
   s.tokens = s.floor = null;
   s.stored = s.pending ?? s.stored; s.pending = undefined; s.pendingSource = undefined;
-  s.softNotified = false; s.settleRequest = "none";
+  s.softNotified = false; s.settleRequest = "none"; s.requiredNoticed = false;
   s.compaction = undefined; s.failures = 0; s.compactionFallback = s.relaunchSent = false;
 }
 function resetEnforcement(s: MachineState): void {
   s.pending = s.stored = undefined; s.pendingSource = undefined; s.compaction = undefined; s.blockedCalls = [];
   s.settleRequest = "none"; s.failures = 0; s.compactionFallback = s.relaunchSent = false;
-  s.lastAction = "none";
+  s.lastAction = "none"; s.requiredNoticed = false;
 }
-const REQUIRED = "Call context_handoff now with goal, next_step and verified facts; preserve user_constraints verbatim and hypotheses separately. Then end the turn without further tools. Only the user may disable enforcement via config or the optional /guards off context.";
+export const REQUIRED = "Call context_handoff now with goal, next_step and verified facts; preserve user_constraints verbatim and hypotheses separately. Then end the turn without further tools. Only the user may disable enforcement via config or the optional /guards off context.";
 function phase(s: MachineState, f: Frame): Phase {
   if (s.mode === "off") return "idle";
   if (s.mode === "observe" && s.observation) s = s.observation;
@@ -250,7 +278,9 @@ function wouldLog(effect: Effect, s: MachineState, f: Frame): LogEffect {
       event = aliases[effect.event] ?? `would_${effect.event}`; break;
     }
     case "notify": event = "would_soft_notice"; break;
+    case "notice_required": event = "would_required_notice"; break;
     case "notify_degraded": event = `would_${effect.reason}_degraded`; break;
+    case "notify_cap_advisory": event = "would_cap_advisory"; break;
     case "write_handoff": event = effect.idleOnly ? "would_idle_handoff_write" : "would_handoff_write"; break;
     case "reject_handoff": event = "would_handoff_rejected"; break;
     case "block": event = "would_block"; break;
@@ -291,17 +321,18 @@ function compactionFailed(s: MachineState, e: Extract<MachineEvent, { type: "ses
     data: { classification, failures: s.failures, retry: "next eligible input or automatic compaction boundary" } }];
 }
 function active(s: MachineState, e: MachineEvent, f: Frame): Effect[] {
+  const notice = notices(s, e, f);
+  return [...notice, ...decide(s, e, f)];
+}
+function decide(s: MachineState, e: MachineEvent, f: Frame): Effect[] {
   const fallback = fallbackFor(s, f);
-  // Cap/loop with no wrapper cannot relaunch: degrade to notify-only so the session is never deadlocked.
+  // Loop with no wrapper cannot relaunch: degrade to notify-only so the session is never deadlocked.
   const degraded = degradedFor(s, f);
   if (degraded) {
     switch (e.type) {
       case "tool_call": case "agent_before_settle": return [];
       case "handoff_prepare": s.pending = undefined; s.pendingSource = undefined; return [{ type: "write_handoff", idleOnly: s.settleRequest === "idle" }];
-      case "agent_settled":
-        if (s.degradedNotified) return [];
-        s.degradedNotified = true;
-        return [{ type: "log", event: "relaunch_unavailable", data: { reason: degraded } }, { type: "notify_degraded", reason: degraded }];
+      case "agent_settled": return [];
       default: break;
     }
   }
@@ -335,8 +366,14 @@ function active(s: MachineState, e: MachineEvent, f: Frame): Effect[] {
         const source = s.pendingSource ?? "budget";
         committed(s, source); return [{ type: "commit", handoff: usable, source }];
       }
-      if (s.tokens === null || s.tokens < f.thresholds.soft) s.softNotified = false;
-      if (!s.softNotified && (s.tokens ?? 0) >= f.thresholds.soft) { s.softNotified = true; return [{ type: "notify" }]; }
+      const required = handoffRequired(s, f);
+      if (!required) s.requiredNoticed = false;
+      if (e.continues && required && !s.pending && !s.stored && !s.requiredNoticed && !fallback) {
+        s.requiredNoticed = true; return [{ type: "notice_required" }];
+      }
+      const soft = effectiveThresholds(s.floor, f.thresholds).soft;
+      if (s.tokens === null || s.tokens < soft) s.softNotified = false;
+      if (!s.softNotified && (s.tokens ?? 0) >= soft) { s.softNotified = true; return [{ type: "notify" }]; }
       return [];
     }
     case "agent_before_settle":
@@ -432,6 +469,8 @@ export interface AutoState {
   jobs: unknown[]; subagents: unknown[]; claims: unknown[]; unavailable: string[];
   resumeCheck?: string;
   questions?: string[];
+  /** `git status --short` lines and upstream ahead/behind; collected only for handoffs. */
+  dirty?: string[]; sync?: string;
 }
 export interface RecordedJob { id: string; label: string; command: string }
 export interface Handoff {
@@ -453,17 +492,40 @@ export function handoffBackoff(input: HandoffInput, previous: Handoff | undefine
     return `Near-duplicate handoff (narrative similarity > 0.9) with unchanged repository HEAD; retry after ${new Date(until).toISOString()} (15 min back-off).`;
   }
 }
+export const RETRY = "Re-call context_handoff with the same fields, corrected.";
+export const MAX_LAUNCH_PROMPT_BYTES = 16 * 1024;
+/** JSON-quoted, code-point-safe excerpt of an offending value for error messages. */
+export function shorten(value: unknown, n = 80): string {
+  const text = JSON.stringify(value) ?? String(value);
+  const chars = Array.from(text);
+  return chars.length > n ? `${chars.slice(0, n).join("")}…(${chars.length} chars)` : text;
+}
+/** Relative entries resolve against cwd and `~/` against home; non-strings pass through so validation reports them. */
+export function normalizeFilesToRead(list: unknown, cwd: string, home = homedir()): unknown {
+  if (!Array.isArray(list)) return list;
+  return list.map(entry => typeof entry !== "string" || !entry ? entry : entry.startsWith("~/") ? join(home, entry.slice(2)) : resolve(cwd, entry));
+}
+/** A single-line absolute existing file is a path; a single-line absolute token that is not a file is a typo; anything else is prompt text. */
+export function launchPromptKind(value: string, isFile: (path: string) => boolean): "path" | "text" | "missing" {
+  if (value.includes("\n") || !isAbsolute(value)) return "text";
+  if (isFile(value)) return "path";
+  return /\s/.test(value) ? "text" : "missing";
+}
 export function validateHandoff(p: HandoffInput): void {
   for (const field of ["goal", "next_step", "facts"] as const) {
-    if (typeof p[field] !== "string" || !p[field].trim()) throw new Error(`${field} is required and must be nonempty`);
+    if (typeof p[field] !== "string" || !p[field].trim()) throw new Error(`${field} is required and must be nonempty text, got ${shorten(p[field])}. ${RETRY}`);
   }
   for (const key of ["decisions", "user_constraints", "open_items", "hypotheses", "launch_prompt"] as const) {
-    if (p[key] !== undefined && (typeof p[key] !== "string" || !p[key]!.trim())) throw new Error(`${key} must be nonempty text`);
+    if (p[key] !== undefined && (typeof p[key] !== "string" || !p[key]!.trim())) throw new Error(`${key} must be nonempty text, got ${shorten(p[key])}. ${RETRY}`);
   }
-  if (p.files_to_read !== undefined && (!Array.isArray(p.files_to_read) || !p.files_to_read.every(f => typeof f === "string" && isAbsolute(f)))) {
-    throw new Error("files_to_read must contain absolute paths");
+  const prompt = p.launch_prompt;
+  if (prompt !== undefined && (prompt.includes("\0") || Buffer.byteLength(prompt) > MAX_LAUNCH_PROMPT_BYTES)) {
+    throw new Error(`launch_prompt must not contain NUL and must be at most ${MAX_LAUNCH_PROMPT_BYTES} bytes, got ${shorten(prompt)}. ${RETRY}`);
   }
-  if (p.launch_prompt !== undefined && !isAbsolute(p.launch_prompt)) throw new Error("launch_prompt must be an absolute path");
+  const files = p.files_to_read;
+  if (files !== undefined && !Array.isArray(files)) throw new Error(`files_to_read must be an array of absolute paths, got ${shorten(files)}. ${RETRY}`);
+  const bad = files?.findIndex(f => typeof f !== "string" || !isAbsolute(f)) ?? -1;
+  if (bad >= 0) throw new Error(`files_to_read[${bad}] must be an absolute path, got ${shorten(files![bad])}. ${RETRY}`);
 }
 // 12 KiB narrative remains available alongside 16 KiB jobs, 4 KiB agents,
 // 4 KiB resume output, 768 B claims and bounded metadata/headings (48 KiB total).
@@ -513,7 +575,9 @@ export function boundedAutoState(auto: AutoState): AutoState {
   return { cwd: short(auto.cwd), root: short(auto.root), branch: short(auto.branch), head: short(auto.head),
     jobs: boundedLines(auto.jobs, jobLine, 16 * 1024), subagents: boundedLines(auto.subagents, subagentLine, 4 * 1024),
     claims: list(auto.claims), unavailable: auto.unavailable.slice(0, 8).map(short), resumeCheck: auto.resumeCheck,
-    questions: auto.questions?.slice(0, 20).map(line => Array.from(line).slice(0, 200).join("")) };
+    questions: auto.questions?.slice(0, 20).map(line => Array.from(line).slice(0, 200).join("")),
+    dirty: auto.dirty && boundedLines(auto.dirty.slice(0, 31), String, 6 * 1024).map(line => Array.from(line).slice(0, 200).join("")),
+    sync: auto.sync === undefined ? undefined : short(auto.sync) };
 }
 export function renderHandoff(p: HandoffInput, auto: AutoState, id: string, n: number, path: string, at: string): Handoff {
   validateHandoff(p);
@@ -531,7 +595,8 @@ export function renderHandoff(p: HandoffInput, auto: AutoState, id: string, n: n
     p.user_constraints && `## User constraints (verbatim)\n${p.user_constraints}`,
     p.open_items && `## Open items\n${p.open_items}`, p.hypotheses && `## Hypotheses (unverified)\n${p.hypotheses}`,
     `## Next step\n${p.next_step}`, p.files_to_read?.length && `## Read first\n${p.files_to_read.join("\n")}`,
-    `## Automatically collected state\nCwd: ${auto.cwd}\nRepository root: ${auto.root}\nBranch: ${auto.branch}\nHEAD: ${auto.head}\nLaunch prompt: ${p.launch_prompt ?? "not supplied"}\n` +
+    `## Automatically collected state\nCwd: ${auto.cwd}\nRepository root: ${auto.root}\nBranch: ${auto.branch}\nHEAD: ${auto.head}\n` +
+      (auto.dirty ? `Working tree:\n${auto.dirty.join("\n") || "clean"}\nSync: ${auto.sync ?? "unknown"}\n` : "") + `Launch prompt: ${p.launch_prompt ?? "not supplied"}\n` +
       `Running jobs / watches:\n${auto.jobs.join("\n") || "none"}\nRunning subagents:\n${auto.subagents.join("\n") || "none"}\nIssue claims: ${JSON.stringify(auto.claims)}\nUnavailable: ${auto.unavailable.join(", ") || "none"}`,
     auto.questions?.length && `## Pending questions\n${auto.questions.join("\n")}`,
     auto.resumeCheck && `## Resume check\n${auto.resumeCheck}`,

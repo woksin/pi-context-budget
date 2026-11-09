@@ -61,7 +61,7 @@ export class OverflowRecovery {
   async turn(event: TurnEndEvent, ctx: ExtensionContext): Promise<ActionResult | undefined> {
     const message = event.message, usage = message.role === "assistant" ? message.usage : undefined;
     const result = await this.adapter.run({ type: "turn_end", usage: usage ? usage.input + usage.output + usage.cacheRead + usage.cacheWrite : undefined,
-      failure: assistantFailure(message) }, ctx);
+      failure: assistantFailure(message), continues: Array.isArray(event.toolResults) && event.toolResults.length > 0 }, ctx);
     this.detect(message, ctx);
     this.warnings.observe(ctx, this.adapter, this.adapter.frame(ctx));
     return result;

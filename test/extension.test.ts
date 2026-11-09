@@ -575,3 +575,48 @@ test("missing UI does not emit mode-mismatch status errors", async () => {
   await h.turn(10);
   assert.ok(!h.events().some(e => e.event === "status_error" || e.event === "hook_error"));
 });
+test("launch_prompt text is saved beside the handoff and the marker references that file", async () => {
+  const h = await harness("enforce", { maxHandoffsPerSession: 1 });
+  const nonce = "b".repeat(32);
+  process.env.PI_SESSION_WRAPPER = "1";
+  process.env.PI_SESSION_WRAPPER_PID = String(process.pid); process.env.PI_SESSION_LAUNCH_ID = nonce;
+  process.env.PI_RELAUNCH_MARKER = join(h.dir, "relaunch", `${process.pid}-${nonce}.json`);
+  const text = "Continue the work.\nRead the handoff first.";
+  await h.turn(100);
+  const result = await h.handoff({ ...required, launch_prompt: text, files_to_read: ["src/a.ts"] } as never);
+  const handoff = result.details.handoff;
+  const promptPath = handoff.path.replace(/\.md$/, ".launch-prompt.md");
+  assert.equal(handoff.launchPrompt, promptPath);
+  assert.equal(readFileSync(promptPath, "utf8"), text);
+  assert.ok(handoff.text.includes(join(h.dir, "src/a.ts")));
+  await h.turn(1200);
+  await h.emit("agent_settled", { aborted: false });
+  assert.equal(JSON.parse(readFileSync(process.env.PI_RELAUNCH_MARKER, "utf8")).launchPrompt, promptPath);
+});
+test("a typo'd absolute launch_prompt path fails with a clear error and an existing file is used as is", async () => {
+  const h = await harness();
+  await h.turn(100);
+  await assert.rejects(h.handoff({ ...required, launch_prompt: join(h.dir, "missing.md") } as never), /launch_prompt file not found: .*pass prompt text or an existing absolute path/);
+  const file = join(h.dir, "prompt.md");
+  writeFileSync(file, "go");
+  const result = await h.handoff({ ...required, launch_prompt: file } as never);
+  assert.equal(result.details.handoff.launchPrompt, file);
+});
+test("handoff auto state lists the working tree and sync", async () => {
+  const h = await harness();
+  await h.turn(100);
+  const result = await h.handoff();
+  assert.match(result.details.handoff.text, /Working tree:\n[\s\S]*\nSync: (no upstream|ahead|unknown)/);
+});
+test("the required notice rides a continuing turn without continue; status shows effective thresholds", async () => {
+  const h = await harness("enforce", { main: { soft: 100, handoff: 200, hard: 1000, minProgress: 150 } });
+  await h.turn(100);
+  const event = (tokens: number, toolResults: unknown[]) => ({ message: { role: "assistant", usage: { input: tokens, output: 0, cacheRead: 0, cacheWrite: 0 } }, toolResults });
+  h.setTokens(300);
+  const result = await h.emit("turn_end", event(300, [{}]));
+  assert.equal(result.continue, undefined);
+  assert.equal(result.entries[0].customType, "context-budget");
+  assert.ok(h.events().some(e => e.event === "required_notice"));
+  assert.deepEqual(h.status().effectiveThresholds, { soft: 150, handoff: 250 });
+  assert.equal(await h.emit("turn_end", event(300, [{}])), undefined);
+});
