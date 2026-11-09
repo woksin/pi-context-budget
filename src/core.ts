@@ -130,7 +130,7 @@ export const MAX_COMPACTION_RETRIES = 2;
 export interface MachineState {
   phase: Phase; mode: Mode; tokens: number | null; floor: number | null;
   turn: number; count: number; handoffTurns: number[]; softNotified: boolean;
-  softModelNoticed: boolean; graceUsed: number;
+  softModelNoticed: boolean; graceUsed: number; graceCalls: string[];
   settleRequest: "none" | "budget" | "idle";
   /** The in-turn "handoff required" notice was already delivered since the last reset. */
   requiredNoticed: boolean;
@@ -181,7 +181,7 @@ export type Effect =
 type LogEffect = Extract<Effect, { type: "log" }>;
 export function initialState(mode: Mode = "observe"): MachineState {
   return { phase: "idle", mode, tokens: null, floor: null, turn: 0, count: 0, handoffTurns: [], softNotified: false,
-    settleRequest: "none", requiredNoticed: false, softModelNoticed: false, graceUsed: 0, failures: 0, compactionFallback: false, attempt: 0, blockedCalls: [], lastSettled: 0,
+    settleRequest: "none", requiredNoticed: false, softModelNoticed: false, graceUsed: 0, graceCalls: [], failures: 0, compactionFallback: false, attempt: 0, blockedCalls: [], lastSettled: 0,
     observedIdle: false, providerFailure: "none", relaunchSent: false, lastAction: "none" };
 }
 export function classifyFailure(e: { aborted?: boolean; errorMessage?: string }): FailureClass {
@@ -241,7 +241,7 @@ function committed(s: MachineState, source: CommitSource): void {
   s.compaction = undefined; s.failures = 0; s.compactionFallback = s.relaunchSent = false;
 }
 function resetEnforcement(s: MachineState): void {
-  s.pending = s.stored = undefined; s.pendingSource = undefined; s.compaction = undefined; s.blockedCalls = [];
+  s.pending = s.stored = undefined; s.pendingSource = undefined; s.compaction = undefined; s.blockedCalls = []; s.graceCalls = [];
   s.settleRequest = "none"; s.failures = 0; s.compactionFallback = s.relaunchSent = false;
   s.lastAction = "none"; s.requiredNoticed = false;
   s.softModelNoticed = false; s.graceUsed = 0;
@@ -256,7 +256,7 @@ function graceRemaining(s: MachineState, f: Frame): number {
   return Math.max(0, calls - s.graceUsed);
 }
 function graceHint(remaining: number): string {
-  return remaining > 0 ? ` You may still make ${remaining} edit/write calls to .ai-work/**/*.md or read-only git status/diff/log calls to record state, then call context_handoff.` : "";
+  return remaining > 0 ? ` You may still make ${remaining} edit/write calls to .ai-work/**/*.md or safe read-only git calls (diff requires --no-ext-diff --no-textconv; log requires --oneline --no-show-signature) to record state, then call context_handoff.` : "";
 }
 function phase(s: MachineState, f: Frame): Phase {
   if (s.mode === "off") return "idle";
@@ -361,7 +361,7 @@ function decide(s: MachineState, e: MachineEvent, f: Frame): Effect[] {
     case "tool_call":
       if (!handoffRequired(s, f)) s.graceUsed = 0;
       if (e.tool !== "context_handoff" && e.graceEligible && graceRemaining(s, f) > 0) {
-        s.graceUsed++;
+        s.graceUsed++; s.graceCalls.push(e.id);
         return [{ type: "log", event: "grace_allowed", data: { used: s.graceUsed, calls: f.config.handoffGrace.calls } }];
       }
       if (e.tool !== "context_handoff" && (s.pending || fallback || handoffRequired(s, f))) {
@@ -372,9 +372,11 @@ function decide(s: MachineState, e: MachineEvent, f: Frame): Effect[] {
       return [];
     case "tool_end": {
       if (s.blockedCalls.includes(e.id)) { s.blockedCalls = s.blockedCalls.filter(id => id !== e.id); return []; }
+      const grace = s.graceCalls.includes(e.id);
+      s.graceCalls = s.graceCalls.filter(id => id !== e.id);
       if (e.tool !== "context_handoff") {
         s.pending = s.stored = undefined; s.pendingSource = undefined;
-        if (!e.error) s.handoffTurns = [];
+        if (!e.error && !grace) s.handoffTurns = [];
       }
       return [];
     }
@@ -439,7 +441,7 @@ function decide(s: MachineState, e: MachineEvent, f: Frame): Effect[] {
 /** Pure, immutable policy boundary. Inactive modes can emit ONLY telemetry, never action effects. */
 export function transition(previous: MachineState, event: MachineEvent, frame: Frame): { state: MachineState; effects: Effect[] } {
   if (frame.mode === "observe") return observe(previous, event, frame);
-  const s: MachineState = { ...previous, observation: undefined, handoffTurns: [...previous.handoffTurns], blockedCalls: [...previous.blockedCalls], tokens: frame.tokens };
+  const s: MachineState = { ...previous, observation: undefined, handoffTurns: [...previous.handoffTurns], blockedCalls: [...previous.blockedCalls], graceCalls: [...previous.graceCalls], tokens: frame.tokens };
   if (s.mode !== frame.mode) { resetEnforcement(s); s.mode = frame.mode; }
   if ((event.type === "session_compact" || event.type === "session_compact_failed") && event.attempt !== undefined && s.compaction?.id !== event.attempt) {
     s.phase = phase(s, frame);

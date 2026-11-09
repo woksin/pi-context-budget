@@ -364,6 +364,39 @@ test("grace counts only granted calls and blocks at exhaustion", () => {
   assert.equal(exhausted.state.graceUsed, 4);
   assert.deepEqual(exhausted.state.blockedCalls, ["grace"]);
 });
+test("handoffs separated only by successful grace calls still trip the loop guard", () => {
+  let state = base();
+  for (let cycle = 0; cycle <= config.loop.maxHandoffsWithoutProgress; cycle++) {
+    const call = transition(state, { ...graceCall, id: `grace-${cycle}` }, f);
+    assert.deepEqual(kinds(call.effects), ["log"]);
+    assert.deepEqual(call.state.graceCalls, [`grace-${cycle}`]);
+    assert.deepEqual(state.graceCalls, [], "transition must not mutate previous call ids");
+    const ended = transition(call.state, { type: "tool_end", tool: "edit", id: `grace-${cycle}`, error: false }, f);
+    assert.deepEqual(ended.state.handoffTurns, state.handoffTurns);
+    assert.deepEqual(ended.state.graceCalls, []);
+    assert.deepEqual(call.state.graceCalls, [`grace-${cycle}`]);
+    const committed = transition({ ...ended.state, pending: h }, turn, f);
+    assert.ok(committed.effects.some(e => e.type === "commit"));
+    state = { ...committed.state, floor: 100, stored: undefined };
+  }
+  assert.equal(policyStatus(state, { ...f, wrapped: true }).fallbackReason, "loop");
+  assert.deepEqual(kinds(transition(state, graceCall, { ...f, wrapped: true }).effects), ["block"]);
+  const progress = transition(state, { type: "tool_end", tool: "edit", id: "real-progress", error: false }, f);
+  assert.deepEqual(progress.state.handoffTurns, []);
+});
+test("grace completion after a commit preserves loop history and still invalidates stale handoffs", () => {
+  const call = transition(base(), graceCall, f);
+  const committed = transition({ ...call.state, pending: h }, turn, f).state;
+  const ended = transition(committed, { type: "tool_end", tool: "edit", id: "grace", error: false }, { ...f, tokens: 100 }).state;
+  assert.deepEqual(ended.handoffTurns, committed.handoffTurns);
+  assert.deepEqual(ended.graceCalls, []);
+  assert.equal(ended.stored, undefined);
+  assert.equal(ended.pending, undefined);
+  const failed = transition(call.state, { type: "tool_end", tool: "edit", id: "grace", error: true }, f).state;
+  assert.deepEqual(failed.graceCalls, []);
+  const changed = transition(call.state, { type: "mode_changed" }, { ...f, mode: "off" }).state;
+  assert.deepEqual(changed.graceCalls, []);
+});
 test("grace fails closed at ceiling, hard, fallback, snapshots or disabled config", () => {
   for (const tokens of [600, 1000, 1200]) assert.deepEqual(kinds(transition(base(), graceCall, { ...f, tokens }).effects), ["block"]);
   assert.deepEqual(kinds(transition(base(), graceCall, { ...f, tokens: 599 }).effects), ["log"]);
