@@ -323,3 +323,129 @@ test("required notice flag resets after commit and when below the requirement", 
   const below = transition(floorState(100000, { requiredNoticed: true }), { type: "turn_end", usage: 100000, continues: true }, ff(100000));
   assert.equal(below.state.requiredNoticed, false);
 });
+
+test("soft model notice waits for a continuing turn, fires once and resets", () => {
+  const event: MachineEvent = { type: "turn_end", continues: true };
+  const softFrame = { ...f, tokens: 100 };
+  const first = transition(base(), event, softFrame);
+  assert.deepEqual(kinds(first.effects), ["notify", "notice_soft"]);
+  assert.deepEqual(kinds(transition(first.state, event, softFrame).effects), []);
+  const userOnly = transition(base(), { type: "turn_end" }, softFrame);
+  assert.deepEqual(kinds(userOnly.effects), ["notify"]);
+  assert.deepEqual(kinds(transition(userOnly.state, event, softFrame).effects), ["notice_soft"]);
+  const below = transition(first.state, event, { ...f, tokens: 99 });
+  assert.equal(below.state.softModelNoticed, false);
+  assert.equal(below.state.softNotified, false);
+  assert.deepEqual(kinds(transition(below.state, event, softFrame).effects), ["notify", "notice_soft"]);
+  const committed = transition({ ...first.state, pending: h }, turn, f).state;
+  assert.equal(committed.softModelNoticed, false);
+  assert.equal(committed.softNotified, false);
+  const observe = transition(initialState(), event, { ...softFrame, mode: "observe" });
+  assert.ok(observe.effects.some(e => e.type === "log" && e.event === "would_soft_model_notice"));
+});
+const graceCall: MachineEvent = { type: "tool_call", tool: "edit", id: "grace", graceEligible: true };
+test("grace counts only granted calls and blocks at exhaustion", () => {
+  let state = base();
+  const blocked = transition(state, { ...graceCall, graceEligible: false }, f);
+  assert.deepEqual(kinds(blocked.effects), ["block"]);
+  assert.equal(blocked.state.graceUsed, 0);
+  for (let used = 1; used <= 4; used++) {
+    const next = transition(state, graceCall, f);
+    assert.deepEqual(kinds(next.effects), ["log"]);
+    assert.ok(next.effects.some(e => e.type === "log" && e.event === "grace_allowed" && e.data?.used === used && e.data.calls === 4));
+    assert.equal(next.state.graceUsed, used);
+    assert.deepEqual(next.state.blockedCalls, []);
+    state = transition(next.state, { type: "tool_end", tool: "edit", id: "grace", error: false }, f).state;
+    assert.equal(state.pending, undefined);
+    assert.equal(state.stored, undefined);
+  }
+  const exhausted = transition(state, graceCall, f);
+  assert.deepEqual(kinds(exhausted.effects), ["block"]);
+  assert.equal(exhausted.state.graceUsed, 4);
+  assert.deepEqual(exhausted.state.blockedCalls, ["grace"]);
+});
+test("handoffs separated only by successful grace calls still trip the loop guard", () => {
+  let state = base();
+  for (let cycle = 0; cycle <= config.loop.maxHandoffsWithoutProgress; cycle++) {
+    const call = transition(state, { ...graceCall, id: `grace-${cycle}` }, f);
+    assert.deepEqual(kinds(call.effects), ["log"]);
+    assert.deepEqual(call.state.graceCalls, [`grace-${cycle}`]);
+    assert.deepEqual(state.graceCalls, [], "transition must not mutate previous call ids");
+    const ended = transition(call.state, { type: "tool_end", tool: "edit", id: `grace-${cycle}`, error: false }, f);
+    assert.deepEqual(ended.state.handoffTurns, state.handoffTurns);
+    assert.deepEqual(ended.state.graceCalls, []);
+    assert.deepEqual(call.state.graceCalls, [`grace-${cycle}`]);
+    const committed = transition({ ...ended.state, pending: h }, turn, f);
+    assert.ok(committed.effects.some(e => e.type === "commit"));
+    state = { ...committed.state, floor: 100, stored: undefined };
+  }
+  assert.equal(policyStatus(state, { ...f, wrapped: true }).fallbackReason, "loop");
+  assert.deepEqual(kinds(transition(state, graceCall, { ...f, wrapped: true }).effects), ["block"]);
+  const progress = transition(state, { type: "tool_end", tool: "edit", id: "real-progress", error: false }, f);
+  assert.deepEqual(progress.state.handoffTurns, []);
+});
+test("grace completion after a commit preserves loop history and still invalidates stale handoffs", () => {
+  const call = transition(base(), graceCall, f);
+  const committed = transition({ ...call.state, pending: h }, turn, f).state;
+  const ended = transition(committed, { type: "tool_end", tool: "edit", id: "grace", error: false }, { ...f, tokens: 100 }).state;
+  assert.deepEqual(ended.handoffTurns, committed.handoffTurns);
+  assert.deepEqual(ended.graceCalls, []);
+  assert.equal(ended.stored, undefined);
+  assert.equal(ended.pending, undefined);
+  const failed = transition(call.state, { type: "tool_end", tool: "edit", id: "grace", error: true }, f).state;
+  assert.deepEqual(failed.graceCalls, []);
+  const changed = transition(call.state, { type: "mode_changed" }, { ...f, mode: "off" }).state;
+  assert.deepEqual(changed.graceCalls, []);
+});
+test("grace fails closed at ceiling, hard, fallback, snapshots or disabled config", () => {
+  for (const tokens of [600, 1000, 1200]) assert.deepEqual(kinds(transition(base(), graceCall, { ...f, tokens }).effects), ["block"]);
+  assert.deepEqual(kinds(transition(base(), graceCall, { ...f, tokens: 599 }).effects), ["log"]);
+  for (const state of [base({ pending: h }), base({ stored: h }), base({ compactionFallback: true }), base({ count: 10 })]) {
+    assert.deepEqual(kinds(transition(state, graceCall, { ...f, wrapped: true }).effects), ["block"]);
+  }
+  const disabled = parseConfig({ handoffGrace: { enabled: false } });
+  assert.deepEqual(kinds(transition(base(), graceCall, { ...f, config: disabled }).effects), ["block"]);
+  for (const mode of ["observe", "off"] as const) {
+    const next = transition(initialState(mode), graceCall, { ...f, mode });
+    assert.ok(next.effects.every(e => e.type === "log"));
+    assert.equal(next.state.graceUsed, 0);
+  }
+  // Floor-relative handoff is 270k, so the ceiling is 335k, not 310k.
+  assert.deepEqual(kinds(transition(floorState(150000), graceCall, ff(330000)).effects), ["log"]);
+  assert.deepEqual(kinds(transition(floorState(150000), graceCall, ff(335000)).effects), ["block"]);
+});
+test("grace resets below requirement, after commit and on mode changes", () => {
+  for (const event of [graceCall, { type: "turn_end" } as MachineEvent]) {
+    assert.equal(transition(base({ graceUsed: 4 }), event, { ...f, tokens: 199 }).state.graceUsed, 0);
+  }
+  for (const event of [turn, { type: "session_compact", owned: true } as MachineEvent]) {
+    assert.equal(transition(base({ graceUsed: 4, pending: h }), event, f).state.graceUsed, 0);
+  }
+  const changed = transition(base({ graceUsed: 4, softModelNoticed: true }), { type: "mode_changed" }, { ...f, mode: "off" });
+  assert.equal(changed.state.graceUsed, 0);
+  assert.equal(changed.state.softModelNoticed, false);
+});
+test("required notices and blocks advertise remaining grace only when available", () => {
+  for (const used of [0, 3, 4]) {
+    const state = base({ graceUsed: used });
+    const block: Effect | undefined = transition(state, { ...graceCall, graceEligible: false }, f).effects.find(e => e.type === "block");
+    const notice = transition(state, { type: "turn_end", continues: true }, f).effects.find(e => e.type === "notice_required");
+    assert.ok(block?.type === "block" && notice?.type === "notice_required");
+    assert.equal(block.reason.includes(`You may still make ${4 - used}`), used < 4);
+    assert.equal(notice.content.includes(`You may still make ${4 - used}`), used < 4);
+  }
+  for (const frame of [{ ...f, tokens: 600 }, { ...f, config: parseConfig({ handoffGrace: { enabled: false } }) }]) {
+    const effects: Effect[] = transition(base(), { ...graceCall, graceEligible: false }, frame).effects;
+    assert.ok(effects.every(e => e.type !== "block" || !e.reason.includes("You may still")));
+    const notice = transition(base(), { type: "turn_end", continues: true }, frame).effects;
+    assert.ok(notice.every(e => e.type !== "notice_required" || !e.content.includes("You may still")));
+  }
+});
+test("handoffGrace config defaults, partial overrides and validation", () => {
+  assert.deepEqual(parseConfig({}).handoffGrace, { enabled: true, calls: 4, fraction: 0.5 });
+  assert.deepEqual(parseConfig({ handoffGrace: { calls: 2 } }).handoffGrace, { enabled: true, calls: 2, fraction: 0.5 });
+  assert.deepEqual(parseConfig({ handoffGrace: { enabled: false, fraction: 1 } }).handoffGrace, { enabled: false, calls: 4, fraction: 1 });
+  for (const handoffGrace of [null, [], { calls: 0 }, { calls: -1 }, { calls: 1.5 }, { calls: "4" }, { fraction: 0 }, { fraction: -0.5 }, { fraction: 1.1 }, { fraction: Infinity }, { enabled: "true" }]) {
+    assert.throws(() => parseConfig({ handoffGrace }));
+  }
+});

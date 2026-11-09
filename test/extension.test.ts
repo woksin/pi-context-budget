@@ -120,6 +120,35 @@ test("hard fallback writes marker before shutdown only in wrapper; provider erro
   await err.emit("agent_settled", { aborted: false });
   assert.equal(err.counters().shutdown, 0);
 });
+test("emergency backstop carries the prior goal, constraints and read-first files verbatim", async () => {
+  const h = await harness();
+  await h.turn(100);
+  await h.handoff({ ...required, goal: "Finish issue eight", user_constraints: "Do not push.\nKeep this exact.", files_to_read: [join(h.dir, "notes.md")] } as never);
+  await h.turn();
+  await h.emit("tool_call", { toolName: "read" });
+  const result = await h.emit("session_before_compact", { preparation: { tokensBefore: 300 }, reason: "overflow" });
+  assert.match(result.compaction.summary, /Emergency handoff; previous goal: Finish issue eight/);
+  assert.match(result.compaction.summary, /## User constraints \(verbatim\)\nDo not push\.\nKeep this exact\./);
+  assert.ok(result.compaction.summary.includes(`## Read first\n${join(h.dir, "notes.md")}`));
+  assert.match(result.compaction.summary, /Previous handoff: .*\.md/);
+});
+
+test("handoff collects persisted user messages, touched repositories and exposed inventory only", async () => {
+  const h = await harness();
+  h.branch.push({ type: "message", timestamp: "2026-01-01", message: { role: "user", content: [{ type: "text", text: 'Keep "quotes"\nverbatim' }] } });
+  await h.turn(100);
+  // pi persists the assistant message before invoking its tools.
+  h.branch.push({ type: "message", message: { role: "assistant", content: [{ type: "toolCall", id: "in-flight", name: "context_handoff", arguments: required }] } });
+  const result = await h.handoff();
+  const handoff = result.details.handoff;
+  assert.match(handoff.text, /Repositories touched:/);
+  assert.match(handoff.text, /## User messages since previous handoff \(verbatim\)\nKeep "quotes"\nverbatim/);
+  assert.match(handoff.text, /scheduled agents: not exposed by registry/);
+  const sidecar = JSON.parse(readFileSync(handoff.path.replace(/\.md$/, ".json"), "utf8"));
+  assert.ok(Array.isArray(sidecar.auto.repos));
+  assert.equal(sidecar.auto.userMessages, 'Keep "quotes"\nverbatim');
+});
+
 test("backstop summaries are unique; stale stored handoff is replaced mechanically", async () => {
   const h = await harness();
   await h.turn(100);
@@ -619,4 +648,38 @@ test("the required notice rides a continuing turn without continue; status shows
   assert.ok(h.events().some(e => e.event === "required_notice"));
   assert.deepEqual(h.status().effectiveThresholds, { soft: 150, handoff: 250 });
   assert.equal(await h.emit("turn_end", event(300, [{}])), undefined);
+});
+test("soft model notice rides the next continuing turn without an extra request", async () => {
+  const h = await harness();
+  assert.equal(await h.turn(100), undefined);
+  assert.equal(h.notifications.length, 1);
+  assert.ok(!h.notifications[0].includes("No handoff is required"));
+  const event = { message: { role: "assistant", usage: { input: 100, output: 0, cacheRead: 0, cacheWrite: 0 } }, toolResults: [{}] };
+  const result = await h.emit("turn_end", event);
+  assert.equal(result.continue, undefined);
+  assert.equal(result.entries[0].customType, "context-budget");
+  assert.match(result.entries[0].content, /STATE\.md/);
+  assert.match(result.entries[0].content, /prepare your handoff/);
+  assert.equal(await h.emit("turn_end", event), undefined);
+  assert.ok(h.events().some(e => e.event === "soft_model_notice"));
+  const crossing = await harness();
+  const first = await crossing.emit("turn_end", event);
+  assert.equal(first.continue, undefined);
+  assert.equal(first.entries[0].customType, "context-budget");
+  assert.equal(crossing.notifications.length, 1);
+});
+test("adapter grants four state calls, blocks other tools and retains settle behavior", async () => {
+  const h = await harness();
+  await h.turn(100); await h.turn(300);
+  const call = (toolName: string, input: unknown, toolCallId = "state") => h.emit("tool_call", { toolName, input, toolCallId });
+  assert.equal((await call("edit", { path: "src/x.ts" }, "bad")).block, true);
+  for (const [tool, input] of [["edit", { path: ".ai-work/t/STATE.md" }], ["write", { file_path: ".ai-work/t/notes.md" }], ["bash", { command: "git status" }], ["read", { path: ".ai-work/t" }]] as const) {
+    assert.equal(await call(tool, input), undefined);
+    await h.emit("tool_execution_end", { toolName: tool, toolCallId: "state", isError: false });
+  }
+  assert.equal((await call("edit", { path: ".ai-work/t/STATE.md" })).block, true);
+  assert.equal(h.events().filter(e => e.event === "grace_allowed").length, 4);
+  assert.equal((await h.emit("agent_before_settle")).continue, true);
+  assert.equal(await h.emit("agent_before_settle"), undefined);
+  assert.ok(h.events().some(e => e.event === "settle_handoff_requested"));
 });
