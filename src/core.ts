@@ -136,6 +136,7 @@ export interface MachineState {
   /** The in-turn "handoff required" notice was already delivered since the last reset. */
   requiredNoticed: boolean;
   pending?: Handoff; pendingSource?: CommitSource; stored?: Handoff; lastHandoff?: Handoff;
+  committedPath?: string; discarded: { path: string; reason: string }[];
   failures: number; compactionFallback: boolean;
   compaction?: { id: number; origin: "idle" | "backstop" };
   attempt: number; blockedCalls: string[]; lastSettled: number; observedIdle: boolean;
@@ -183,7 +184,7 @@ type LogEffect = Extract<Effect, { type: "log" }>;
 export function initialState(mode: Mode = "observe"): MachineState {
   return { phase: "idle", mode, tokens: null, floor: null, turn: 0, count: 0, handoffTurns: [], softNotified: false,
     settleRequest: "none", requiredNoticed: false, softModelNoticed: false, graceUsed: 0, graceCalls: [], failures: 0, compactionFallback: false, attempt: 0, blockedCalls: [], lastSettled: 0,
-    observedIdle: false, providerFailure: "none", relaunchSent: false, lastAction: "none" };
+    discarded: [], observedIdle: false, providerFailure: "none", relaunchSent: false, lastAction: "none" };
 }
 export function classifyFailure(e: { aborted?: boolean; errorMessage?: string }): FailureClass {
   if (e.aborted || /cancelled|canceled|aborted/i.test(e.errorMessage ?? "")) return "cancelled";
@@ -236,6 +237,7 @@ export function forced(s: MachineState, f: Frame): Fallback | boolean {
 function committed(s: MachineState, source: CommitSource): void {
   if (source !== "idle") { s.count++; s.handoffTurns.push(s.turn); }
   s.tokens = s.floor = null;
+  s.committedPath = (s.pending ?? s.stored)?.path;
   s.stored = s.pending ?? s.stored; s.pending = undefined; s.pendingSource = undefined;
   s.softNotified = s.softModelNoticed = false; s.graceUsed = 0;
   s.settleRequest = "none"; s.requiredNoticed = false;
@@ -325,7 +327,7 @@ function observe(previous: MachineState, event: MachineEvent, frame: Frame): { s
   if (previous.mode !== "observe") resetEnforcement(seed);
   const projected = transition({ ...seed, mode: "enforce" }, event, { ...frame, mode: "enforce" });
   const state: MachineState = { ...actual.state, mode: "observe", observation: projected.state, phase: projected.state.phase };
-  return { state, effects: projected.effects.map(effect => wouldLog(effect, projected.state, frame)) };
+  return { state, effects: projected.effects.filter(effect => effect.type !== "log" || effect.event !== "handoff_discarded").map(effect => wouldLog(effect, projected.state, frame)) };
 }
 function startCompaction(s: MachineState, origin: "idle" | "backstop"): void {
   if (!s.compaction) s.compaction = { id: ++s.attempt, origin };
@@ -385,6 +387,7 @@ function decide(s: MachineState, e: MachineEvent, f: Frame): Effect[] {
       ? [{ type: "reject_handoff", reason: "A handoff is already stored. End this turn without further tools." }]
       : [{ type: "write_handoff", idleOnly: s.settleRequest === "idle" }];
     case "handoff_written":
+      s.discarded = [];
       s.lastHandoff = s.stored = s.pending = e.handoff;
       s.pendingSource = s.settleRequest === "idle" ? "idle" : "budget";
       return [];
@@ -442,7 +445,7 @@ function decide(s: MachineState, e: MachineEvent, f: Frame): Effect[] {
 /** Pure, immutable policy boundary. Inactive modes can emit ONLY telemetry, never action effects. */
 export function transition(previous: MachineState, event: MachineEvent, frame: Frame): { state: MachineState; effects: Effect[] } {
   if (frame.mode === "observe") return observe(previous, event, frame);
-  const s: MachineState = { ...previous, observation: undefined, handoffTurns: [...previous.handoffTurns], blockedCalls: [...previous.blockedCalls], graceCalls: [...previous.graceCalls], tokens: frame.tokens };
+  const s: MachineState = { ...previous, discarded: [...previous.discarded], observation: undefined, handoffTurns: [...previous.handoffTurns], blockedCalls: [...previous.blockedCalls], graceCalls: [...previous.graceCalls], tokens: frame.tokens };
   if (s.mode !== frame.mode) { resetEnforcement(s); s.mode = frame.mode; }
   if ((event.type === "session_compact" || event.type === "session_compact_failed") && event.attempt !== undefined && s.compaction?.id !== event.attempt) {
     s.phase = phase(s, frame);
@@ -468,6 +471,17 @@ export function transition(previous: MachineState, event: MachineEvent, frame: F
     s.lastSettled = event.now; s.observedIdle = event.pendingWork && (s.tokens ?? 0) >= frame.config.idleMinTokens;
   }
   if (event.type === "input") s.observedIdle = false;
+  const held = previous.pending ?? previous.stored;
+  if ((s.mode === "enforce" || previous.mode === "enforce") && held && held.path !== s.committedPath && held.path !== (s.pending ?? s.stored)?.path) {
+    const reasons: Partial<Record<MachineEvent["type"], string>> = {
+      tool_call: "tool call after handoff (agent kept working)", tool_end: "tool call after handoff (agent kept working)",
+      before_agent_start: "new run started before commit (aborted/failed turn or queued wake)",
+      handoff_written: "replaced by a newer handoff", input: "user input before commit", mode_changed: "mode changed",
+    };
+    const reason = previous.mode !== frame.mode ? "mode changed" : reasons[event.type] ?? event.type;
+    s.discarded = [...s.discarded, { path: held.path, reason }].slice(-5);
+    effects.push({ type: "log", event: "handoff_discarded", data: { path: held.path, n: held.n, reason } });
+  }
   s.phase = phase(s, frame);
   return { state: s, effects: s.mode === "enforce" ? [...policyTrace(s, event, frame), ...effects] : effects };
 }
@@ -481,6 +495,7 @@ export function restoreHistory(history: HistoryItem[], mode: Mode): MachineState
     if (e.type === "input") s.stored = undefined;
     if (e.type === "usage") { s.turn++; s.tokens = e.tokens; s.floor ??= e.tokens; }
     if (e.type === "compaction") {
+      if (e.owned) s.committedPath = s.stored?.path;
       s.tokens = s.floor = null;
       if (e.owned && e.source !== "idle") { s.count++; s.handoffTurns.push(s.turn); }
     }
@@ -492,10 +507,11 @@ export function restoreHistory(history: HistoryItem[], mode: Mode): MachineState
   return s;
 }
 
+export interface WatchAction { id: string; target: string; on_complete: string; cancel?: string }
 export interface HandoffInput {
   goal: string; next_step: string; facts: string;
   decisions?: string; user_constraints?: string; open_items?: string; hypotheses?: string;
-  files_to_read?: string[]; launch_prompt?: string;
+  files_to_read?: string[]; launch_prompt?: string; watch_actions?: WatchAction[];
 }
 export interface RepoState { root: string; branch: string; head: string; dirty: number; sync: string }
 export interface AutoState {
@@ -505,6 +521,7 @@ export interface AutoState {
   questions?: string[];
   repos?: RepoState[]; userMessages?: string; scheduled?: string[]; finishedJobs?: string[];
   previous?: PreviousHandoff;
+  lint?: string[]; discarded?: { path: string; reason: string }[];
   /** `git status --short` lines and upstream ahead/behind; collected only for handoffs. */
   dirty?: string[]; sync?: string;
 }
@@ -512,6 +529,7 @@ export interface RecordedJob { id: string; label: string; command: string }
 export interface Handoff {
   text: string; path: string; n: number; at: string; launchPrompt?: string;
   narrativeTokens?: string[]; head?: string; recordedJobs?: RecordedJob[];
+  watchActions?: WatchAction[]; recordedSubagents?: { id: string; description?: string }[]; repos?: RepoState[];
 }
 /** Lowercase Unicode word-set Jaccard on goal + facts + next_step; order is ignored. */
 export function narrativeTokens(input: HandoffInput): string[] {
@@ -558,14 +576,27 @@ export function validateHandoff(p: HandoffInput): void {
   if (prompt !== undefined && (prompt.includes("\0") || Buffer.byteLength(prompt) > MAX_LAUNCH_PROMPT_BYTES)) {
     throw new Error(`launch_prompt must not contain NUL and must be at most ${MAX_LAUNCH_PROMPT_BYTES} bytes, got ${shorten(prompt)}. ${RETRY}`);
   }
+  const actions = p.watch_actions;
+  if (actions !== undefined && (!Array.isArray(actions) || actions.length > 20)) throw new Error(`watch_actions must be an array of at most 20 entries. ${RETRY}`);
+  const ids = new Set<string>();
+  actions?.forEach((action, i) => {
+    for (const field of ["id", "target", "on_complete", "cancel"] as const) {
+      const value = action?.[field];
+      if (field === "cancel" && value === undefined) continue;
+      if (typeof value !== "string" || !value.trim() || value.length > 300) throw new Error(`watch_actions[${i}].${field} must be nonempty text of at most 300 characters. ${RETRY}`);
+    }
+    if (ids.has(action.id)) throw new Error(`watch_actions[${i}].id duplicates ${shorten(action.id)}; use one entry per id. ${RETRY}`);
+    ids.add(action.id);
+  });
   const files = p.files_to_read;
   if (files !== undefined && !Array.isArray(files)) throw new Error(`files_to_read must be an array of absolute paths, got ${shorten(files)}. ${RETRY}`);
   const bad = files?.findIndex(f => typeof f !== "string" || !isAbsolute(f)) ?? -1;
   if (bad >= 0) throw new Error(`files_to_read[${bad}] must be an absolute path, got ${shorten(files![bad])}. ${RETRY}`);
 }
 // 12 KiB narrative remains available alongside 16 KiB jobs, 4 KiB agents,
-// 4 KiB resume output, 768 B claims and bounded metadata/headings (48 KiB total).
-export const MAX_HANDOFF_BYTES = 48 * 1024;
+// 4 KiB resume output, 768 B claims, bounded metadata/headings, and up to 4 KiB
+// watch actions and lint (52 KiB total).
+export const MAX_HANDOFF_BYTES = 52 * 1024;
 function stateField(value: unknown): string {
   return value === undefined || value === null ? "-" : String(value).replace(/\r/g, "\\r").replace(/\n/g, "\\n");
 }
@@ -620,6 +651,8 @@ export function boundedAutoState(auto: AutoState): AutoState {
     userMessages: auto.userMessages === undefined ? undefined : bytePrefix(auto.userMessages, 4096),
     scheduled: auto.scheduled && boundedLines(auto.scheduled.slice(0, 10), r => chars(String(r)), 1024),
     finishedJobs: auto.finishedJobs && boundedLines(auto.finishedJobs.slice(0, 10), r => chars(String(r)), 2 * 1024),
+    lint: auto.lint && boundedLines(auto.lint.slice(0, 8), line => bytePrefix(String(line), 300), 1024),
+    discarded: auto.discarded?.slice(-5).map(item => ({ path: bytePrefix(item.path, 120), reason: bytePrefix(item.reason, 120) })),
     previous: auto.previous && { path: short(auto.previous.path), goal: bytePrefix(auto.previous.goal, 4096), constraints: auto.previous.constraints && bytePrefix(auto.previous.constraints, 4096), filesToRead: auto.previous.filesToRead.slice(0, 20).map(short) } };
 }
 export function renderHandoff(p: HandoffInput, auto: AutoState, id: string, n: number, path: string, at: string): Handoff {
@@ -630,6 +663,18 @@ export function renderHandoff(p: HandoffInput, auto: AutoState, id: string, n: n
     return typeof r.id === "string" && typeof r.command === "string"
       ? [{ id: r.id, label: typeof r.label === "string" ? r.label : "-", command: r.command }] : [];
   });
+  const recordedSubagents = auto.subagents.flatMap(record => {
+    const r = (record ?? {}) as Record<string, unknown>, id = r.id ?? r.agentId;
+    return typeof id === "string" ? [{ id, description: typeof r.description === "string" ? r.description : undefined }] : [];
+  }).slice(0, 20);
+  const repos = auto.repos?.slice(0, 8);
+  const actions: string[] = [];
+  for (const action of p.watch_actions ?? []) {
+    const line = [action.id, action.target, action.on_complete, action.cancel ?? "-"].map(stateField).join(" | ");
+    if (Buffer.byteLength([...actions, line].join("\n")) > 3000) break;
+    actions.push(line);
+  }
+  if (actions.length < (p.watch_actions?.length ?? 0)) actions.push(`omitted: ${p.watch_actions!.length - actions.length}`);
   auto = boundedAutoState(auto);
   const sections = [
     `# Handoff ${id}-${n}`, `Timestamp: ${at}\nHandoff file: ${path}`,
@@ -638,6 +683,7 @@ export function renderHandoff(p: HandoffInput, auto: AutoState, id: string, n: n
     p.user_constraints && `## User constraints (verbatim)\n${p.user_constraints}`,
     p.open_items && `## Open items\n${p.open_items}`, p.hypotheses && `## Hypotheses (unverified)\n${p.hypotheses}`,
     `## Next step\n${p.next_step}`, p.files_to_read?.length && `## Read first\n${p.files_to_read.join("\n")}`,
+    actions.length && `## Watch actions\n${actions.join("\n")}`,
     `## Automatically collected state\nCwd: ${auto.cwd}\nRepository root: ${auto.root}\nBranch: ${auto.branch}\nHEAD: ${auto.head}\n` +
       (auto.dirty ? `Working tree:\n${auto.dirty.join("\n") || "clean"}\nSync: ${auto.sync ?? "unknown"}\n` : "") + `Launch prompt: ${p.launch_prompt ?? "not supplied"}\n` +
       (auto.repos ? `Repositories touched:\n${auto.repos.map(r => `${r.root} | ${r.branch} | ${r.head.slice(0, 12)} | dirty ${r.dirty} | ${r.sync}`).join("\n") || "none"}\n` : "") +
@@ -648,10 +694,13 @@ export function renderHandoff(p: HandoffInput, auto: AutoState, id: string, n: n
     auto.questions?.length && `## Pending questions\n${auto.questions.join("\n")}`,
     auto.userMessages && `## User messages since previous handoff (verbatim)\n${auto.userMessages}`,
     auto.resumeCheck && `## Resume check\n${auto.resumeCheck}`,
+    ((auto.lint?.length ?? 0) + (auto.discarded?.length ?? 0) > 0) && `## Handoff lint\n${bytePrefix([
+      ...(auto.lint ?? []), ...(auto.discarded ?? []).map(item => `Discarded earlier handoffs (stored, never committed; re-read if you rely on them): ${item.path} — ${item.reason}`),
+    ].join("\n"), 1024)}`,
     "Resume now from Next step without asking the user. Verify current git HEAD and re-establish external state before trusting prior review/CI/issue facts.",
   ];
   const text = sections.filter(Boolean).join("\n\n") + "\n";
   const bytes = Buffer.byteLength(text);
   if (bytes > MAX_HANDOFF_BYTES) throw new Error(`Handoff is ${bytes} bytes; limit is ${MAX_HANDOFF_BYTES}. Shorten narrative and reference absolute files; do not omit user constraints.`);
-  return { text, path, n, at, launchPrompt: p.launch_prompt, narrativeTokens: narrativeTokens(p), head: auto.head, recordedJobs };
+  return { text, path, n, at, launchPrompt: p.launch_prompt, narrativeTokens: narrativeTokens(p), head: auto.head, recordedJobs, recordedSubagents, watchActions: p.watch_actions, repos };
 }

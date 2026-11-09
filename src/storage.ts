@@ -4,7 +4,8 @@ import { dirname, join, resolve } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { boundedAutoState, isSubagent, type AutoState, type Handoff, type HandoffInput, type RecordedJob } from "./core.ts";
-import { collectRepositories, collectHead, finishedState, porcelainDirty, scheduledState, type RepoDeps, type JobManager } from "./collect.ts";
+import { matchesId, recordId } from "./validate.ts";
+import { bytePrefix, repoState, collectRepositories, collectHead, finishedState, porcelainDirty, scheduledState, type RepoDeps, type JobManager } from "./collect.ts";
 
 /** A CLI process has one primary runtime; SDK children bind while it remains alive.
  * Fork/resume tear down that primary BEFORE binding its replacement. No ancestry inference.
@@ -46,7 +47,7 @@ export function appendEvent(dir: string, data: unknown): void {
 export function writeHandoff(h: Handoff, auto: AutoState, input?: HandoffInput): void {
   mkdirSync(dirname(h.path), { recursive: true, mode: 0o700 });
   writeFileSync(h.path, h.text, { flag: "wx", mode: 0o600 });
-  const fields = input && { goal: input.goal, user_constraints: input.user_constraints, files_to_read: input.files_to_read };
+  const fields = input && { goal: input.goal, user_constraints: input.user_constraints, files_to_read: input.files_to_read, watch_actions: input.watch_actions };
   writeFileSync(h.path.replace(/\.md$/, ".json"), JSON.stringify({ ...h, input: fields, auto: boundedAutoState(auto) }) + "\n", { flag: "wx", mode: 0o600 });
 }
 export interface Marker { cwd: string; launchPrompt: string | null; handoff: string; sessionFile: string | null }
@@ -187,12 +188,45 @@ export function pendingQuestions(home: string, match: { sessionIds: string[] } |
   } catch { return []; }
 }
 /** Missing/unreadable registries are not evidence that recorded work stopped. */
-export function watchCheck(recorded: RecordedJob[] = []): string | undefined {
-  const live = runningState();
-  if (live.unavailable.some(message => message.startsWith("pi-jobs"))) return;
-  const ids = new Set(live.jobs.map(job => (job as RunningRecord).id));
-  const missing = recorded.filter(job => !ids.has(job.id));
-  if (!missing.length) return;
+function repoWatchCheck(repos: Handoff["repos"]): string | undefined {
+  if (!repos?.length) return undefined;
+  const deadline = Date.now() + 2000;
+  return `## Re-verify per repository\n${repos.slice(0, 8).map(repo => {
+    const current = repoState(repo.root, (root, ...args) => {
+      const remaining = deadline - Date.now();
+      return remaining > 0 ? git(root, args, Math.min(800, remaining)) : undefined;
+    });
+    const now = current.head === "unknown" ? "not inspected" : `${current.branch}@${current.head.slice(0, 7)} | dirty ${current.dirty}`;
+    return `${repo.root} | recorded ${repo.branch}@${repo.head.slice(0, 7)} | current ${now}; re-verify CI/review/issue facts.`;
+  }).join("\n")}`;
+}
+export function watchCheck(recorded: Pick<Handoff, "recordedJobs" | "recordedSubagents" | "watchActions" | "repos"> | RecordedJob[] = []): string | undefined {
+  const handoff = Array.isArray(recorded) ? { recordedJobs: recorded } : recorded;
+  const ids = [...handoff.recordedJobs ?? [], ...handoff.recordedSubagents ?? []].map(r => r.id);
+  const live = runningState([...ids, ...handoff.watchActions?.map(w => w.id) ?? []]), missing: string[] = [];
   const field = (text: string) => text.replace(/\r/g, "\\r").replace(/\n/g, "\\n");
-  return `## Watch check\nNo longer running; re-arm as needed:\n${missing.map(job => [job.id, job.label, job.command].map(field).join(" | ")).join("\n")}`;
+  const describe = (id: string, target?: string, action?: string) => {
+    const watch = handoff.watchActions?.find(w => matchesId(w.id, id, ids));
+    return [id, watch?.target ?? target ?? "target unknown", watch?.on_complete ?? action ?? "follow-up unknown"].map(field).join(" | ");
+  };
+  if (!live.unavailable.some(message => message.startsWith("pi-jobs"))) {
+    const running = new Set(live.jobs.map(recordId));
+    for (const job of handoff.recordedJobs ?? []) if (!running.has(job.id)) {
+      const details = [job.id, job.label, job.command].map(field).join(" | ");
+      const watch = handoff.watchActions?.some(w => matchesId(w.id, job.id, ids));
+      missing.push(details + (watch ? `; ${describe(job.id, job.label, job.command)}` : ""));
+    }
+  }
+  if (!live.unavailable.some(message => message.startsWith("pi-subagents"))) {
+    const running = new Set(live.subagents.map(recordId));
+    const agents = [...handoff.recordedSubagents ?? []];
+    for (const watch of handoff.watchActions ?? []) {
+      if (![...agents, ...handoff.recordedJobs ?? []].some(r => matchesId(watch.id, r.id, ids))) agents.push({ id: watch.id });
+    }
+    for (const agent of agents) if (![...running].some(id => id && matchesId(agent.id, id, [...running].filter((id): id is string => !!id)))) {
+      missing.push(`Not running (finished, failed or lost): ${describe(agent.id, agent.description)} — check its result and perform the on_complete action`);
+    }
+  }
+  return bytePrefix([missing.length ? `## Watch check\nNo longer running; re-arm as needed:\n${missing.join("\n")}` : undefined,
+    repoWatchCheck(handoff.repos)].filter(Boolean).join("\n\n"), 4096) || undefined;
 }

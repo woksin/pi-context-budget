@@ -1,7 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { isContextOverflowError, guardOffCrossings, parseConfig, effectiveMode, isSubagent, ownsWrapper, modelThresholds, renderHandoff, MAX_HANDOFF_BYTES, validateHandoff, shorten, RETRY, launchPromptKind, normalizeFilesToRead, effectiveThresholds } from "../src/core.ts";
-import { atomicJson, issueClaims, runningState, writeHandoff, writeMarker, SessionHosts } from "../src/storage.ts";
+import { initialState, transition, restoreHistory, type MachineEvent } from "../src/core.ts";
+import { parseHandoffSections } from "../src/collect.ts";
+import { atomicJson, issueClaims, runningState, watchCheck, writeHandoff, writeMarker, SessionHosts } from "../src/storage.ts";
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
@@ -89,6 +91,82 @@ test("wrapper ownership binds process, hosting and unique launch nonce", () => {
 });
 const input = { goal: "task", next_step: "read files", facts: "HEAD unknown", hypotheses: "untested theory", user_constraints: "Never push." };
 const auto = { cwd: "/repo", root: "/repo", branch: "main", head: "abc", jobs: [], subagents: [], claims: [], unavailable: [] };
+test("watch actions, lint and discarded drafts render without corrupting read-first parsing", () => {
+  const h = renderHandoff({ ...input, files_to_read: ["/read.md"], watch_actions: [{ id: "agent", target: "review", on_complete: "read result", cancel: "cancel agent" }] },
+    { ...auto, lint: ["stale state"], discarded: [{ path: "/old.md", reason: "replaced" }], subagents: [{ id: "agent", description: "review" }] }, "s", 1, "/h.md", "now");
+  assert.match(h.text, /## Watch actions\nagent \| review \| read result \| cancel agent/);
+  assert.match(h.text, /## Handoff lint\nstale state/);
+  assert.match(h.text, /Discarded earlier handoffs.*\/old.md — replaced/);
+  assert.deepEqual(parseHandoffSections(h.text).filesToRead, ["/read.md"]);
+  assert.equal(h.recordedSubagents?.[0].id, "agent");
+  assert.ok(Buffer.byteLength(h.text) <= MAX_HANDOFF_BYTES);
+});
+test("discard detection logs once, keeps history immutable and ignores committed drafts", () => {
+  const handoff = renderHandoff(input, auto, "s", 1, "/old.md", "now");
+  const frame = { mode: "enforce" as const, tokens: 1, thresholds: t, config, wrapped: false };
+  const cases: [MachineEvent, string][] = [
+    [{ type: "tool_call", tool: "read", id: "1" }, "tool call after handoff (agent kept working)"],
+    [{ type: "tool_end", tool: "read", id: "1", error: false }, "tool call after handoff (agent kept working)"],
+    [{ type: "before_agent_start" }, "new run started before commit (aborted/failed turn or queued wake)"],
+    [{ type: "handoff_written", handoff: { ...handoff, path: "/new.md" } }, "replaced by a newer handoff"],
+    [{ type: "mode_changed" }, "mode changed"],
+  ];
+  for (const [event, reason] of cases) {
+    const previous = { ...initialState("enforce"), stored: handoff };
+    const next = transition(previous, event, { ...frame, mode: event.type === "mode_changed" ? "off" : "enforce" });
+    assert.deepEqual(next.state.discarded, [{ path: "/old.md", reason }]);
+    assert.deepEqual(previous.discarded, []);
+    assert.equal(next.effects.filter(e => e.type === "log" && e.event === "handoff_discarded").length, 1);
+    assert.deepEqual(transition({ ...previous, committedPath: handoff.path }, event, frame).state.discarded, []);
+  }
+  const committed = transition({ ...initialState("enforce"), pending: handoff }, { type: "turn_end" }, frame);
+  assert.equal(committed.state.committedPath, handoff.path);
+  assert.deepEqual(transition(committed.state, { type: "tool_call", tool: "read", id: "2" }, frame).state.discarded, []);
+  const restored = restoreHistory([{ type: "tool", handoff }, { type: "compaction", owned: true }], "enforce");
+  assert.deepEqual(transition(restored, { type: "tool_call", tool: "read", id: "2" }, frame).state.discarded, []);
+});
+test("watch actions and lint have independent UTF-8 budgets and explicit omissions", () => {
+  const h = renderHandoff({ ...input, watch_actions: Array.from({ length: 20 }, (_, i) => ({ id: String(i), target: "🦀".repeat(100), on_complete: "🦀".repeat(100), cancel: "🦀".repeat(100) })) },
+    { ...auto, lint: Array(8).fill("🦀".repeat(300)), discarded: Array(5).fill({ path: "/old.md", reason: "not committed" }) }, "s", 1, "/h.md", "now");
+  const actions = h.text.split("## Watch actions\n")[1].split("\n\n")[0];
+  const lint = h.text.split("## Handoff lint\n")[1].split("\n\n")[0];
+  assert.match(actions, /omitted: \d+/);
+  assert.ok(Buffer.byteLength(actions) <= 3072);
+  assert.ok(Buffer.byteLength(lint) <= 1024);
+  assert.ok(Buffer.byteLength(h.text) <= MAX_HANDOFF_BYTES);
+  assert.ok(!h.text.includes("�"));
+});
+test("discard history is capped, records once and clears after the next write", () => {
+  const frame = { mode: "enforce" as const, tokens: 1, thresholds: t, config, wrapped: false };
+  let s = initialState("enforce");
+  for (let i = 0; i < 7; i++) {
+    s = { ...s, stored: { text: "draft", path: `/draft-${i}.md`, n: i, at: "now" } };
+    s = transition(s, { type: "tool_end", tool: "read", id: "1", error: false }, frame).state;
+    assert.ok(!transition(s, { type: "tool_end", tool: "read", id: "1", error: false }, frame).effects.some(e => e.type === "log" && e.event === "handoff_discarded"));
+  }
+  assert.equal(s.discarded.length, 5);
+  assert.equal(s.discarded[0].path, "/draft-2.md");
+  s = transition(s, { type: "handoff_written", handoff: { text: "new", path: "/new.md", n: 8, at: "now" } }, frame).state;
+  assert.deepEqual(s.discarded, []);
+});
+test("post-reset subagents include completion actions and unavailable registries are silent", () => {
+  const global = globalThis as Record<symbol, unknown>, key = Symbol.for("pi-subagents:manager");
+  const old = global[key];
+  const h = { recordedSubagents: [{ id: "agent" }], watchActions: [{ id: "agent", target: "review", on_complete: "read result" }] };
+  try {
+    global[key] = { listAgents: () => [] };
+    assert.match(watchCheck(h)!, /No longer running[\s\S]*agent \| review \| read result/);
+    global[key] = { listAgents: () => [{ id: "agent", status: "running" }] };
+    assert.equal(watchCheck(h), undefined);
+    global[key] = { getRecord: (id: string) => id === "agent" ? { id, status: "running" } : undefined };
+    assert.equal(watchCheck({ watchActions: h.watchActions }), undefined);
+    global[key] = { listAgents: () => [] };
+    assert.match(watchCheck({ watchActions: h.watchActions })!, /Not running.*agent.*read result/);
+    delete global[key];
+    assert.equal(watchCheck(h), undefined);
+    assert.match(watchCheck({ repos: [{ root: "/nonexistent-repository", branch: "main", head: "123456789", dirty: 0, sync: "unknown" }] })!, /Re-verify per repository[\s\S]*main@1234567.*not inspected/);
+  } finally { global[key] = old; }
+});
 test("handoff rendering, validation, byte cap, uniqueness and exclusive persistence", () => {
   const d = dir();
   const h = renderHandoff(input, auto, "session", 1, join(d, "session-1.md"), "2026-10-17T00:00:00Z");
