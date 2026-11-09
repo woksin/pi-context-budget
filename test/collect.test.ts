@@ -1,5 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { execFileSync } from "node:child_process";
+import { git, writeHandoff } from "../src/storage.ts";
 import { touchedPaths, repoRoots, repoState, claimRepos, collectRepositories, userMessagesSince, chainIdentity, parseHandoffSections, previousHandoff, emergencyHandoff, emergencySummary, finishedState, scheduledState, primaryHead, collectHead, porcelainDirty } from "../src/collect.ts";
 import { boundedAutoState, renderHandoff, MAX_HANDOFF_BYTES, handoffBackoff } from "../src/core.ts";
 
@@ -30,6 +34,23 @@ test("roots dedupe worktrees, prefer cwd, inspect file parent and cap at eight",
   assert.ok(calls.includes("/repo/src"));
   assert.equal(repoRoots(Array.from({ length: 20 }, (_, i) => `/r${i}`), git).length, 8);
   assert.deepEqual(repoRoots(["/fail"], () => { throw Error("git"); }), []);
+});
+
+test("collector git disables repository fsmonitor commands and sidecars retain structured input", () => {
+  const root = resolve(import.meta.dirname, "../.ai-work/pcb-8/fixtures");
+  mkdirSync(root, { recursive: true });
+  const dir = mkdtempSync(join(root, "safe-git-")), hook = join(dir, "fsmonitor"), invoked = join(dir, "invoked");
+  execFileSync("git", ["init", "--quiet", dir]);
+  writeFileSync(hook, `#!/bin/sh\nprintf invoked > ${JSON.stringify(invoked)}\n`, { mode: 0o700 });
+  execFileSync("git", ["-C", dir, "config", "core.fsmonitor", hook]);
+  assert.notEqual(git(dir, ["status", "--porcelain=v2", "--branch"]), undefined);
+  assert.equal(existsSync(invoked), false, "inspection must not execute repository-configured programs");
+  const fields = { ...input, user_constraints: "Keep.\n\n## Important\nNever delete data.", files_to_read: ["/read-first.ts"] };
+  const h = renderHandoff(fields, auto, "s", 1, join(dir, "handoff.md"), "2026-01-01");
+  writeHandoff(h, auto, fields);
+  const sidecar = JSON.parse(readFileSync(h.path.replace(/\.md$/, ".json"), "utf8"));
+  assert.deepEqual(sidecar.input, { goal: fields.goal, user_constraints: fields.user_constraints, files_to_read: fields.files_to_read });
+  assert.equal(previousHandoff([], h, path => readFileSync(path, "utf8"))?.constraints, fields.user_constraints);
 });
 
 test("one porcelain-v2 call captures repo state; failure is unknown", () => {
@@ -97,7 +118,72 @@ test("verbatim user messages exclude old boundary and timestamped requests witho
   const branch = [message("user", "old"), { type: "compaction" }, message("user", [{ type: "text", text: 'Keep "quotes"\nnext' }, { type: "image", data: "omit" }]), message("assistant", "ignore"), message("user", "new")];
   assert.equal(userMessagesSince(branch), 'Keep "quotes"\nnext\n\nnew');
   assert.equal(userMessagesSince([message("user", "old", "2026-01-01"), message("user", "new", "2026-01-03")], "2026-01-02"), "new");
-  assert.equal(userMessagesSince([message("user", "old"), call("context_handoff", {}), message("user", "new")]), "new");
+  assert.equal(userMessagesSince([message("user", "old"), call("context_handoff", {}), message("user", "new")]), "old\n\nnew");
+});
+
+test("only committed successful handoffs cut off user messages; in-flight and failed calls do not", () => {
+  const request = message("user", "Keep all instructions");
+  const inFlight = message("assistant", [{ type: "toolCall", id: "h1", name: "context_handoff", arguments: input }]);
+  assert.equal(userMessagesSince([request, inFlight]), "Keep all instructions");
+  const failed = message("toolResult", [{ type: "text", text: "Handoff failed" }]);
+  Object.assign(failed.message, { toolName: "context_handoff", toolCallId: "h1", isError: true });
+  assert.equal(userMessagesSince([request, inFlight, failed, call("context_handoff", {})]), "Keep all instructions");
+  const succeeded = message("toolResult", [{ type: "text", text: "Handoff stored" }]);
+  Object.assign(succeeded.message, { toolName: "context_handoff", toolCallId: "h1", isError: false, details: { handoff: { path: "/h/old.md", at: "2026-01-02" } } });
+  assert.equal(userMessagesSince([request, inFlight, succeeded, message("user", "New instructions"), call("context_handoff", {})]), "New instructions");
+  Object.assign(succeeded.message, { isError: true });
+  assert.equal(userMessagesSince([request, inFlight, succeeded]), "Keep all instructions");
+});
+
+test("hostile option-like paths are absolute before reaching git", () => {
+  const paths = touchedPaths([call("bash", { command: "git -C -c status" }), call("read", { path: "--upload-pack=x" }), call("edit", { path: "-C/evil" })], "/parent", pathDeps);
+  assert.deepEqual(new Set(paths), new Set(["/parent", "/parent/-c", "/parent/--upload-pack=x", "/parent/-C/evil"]));
+  repoRoots(paths, path => { assert.ok(path.startsWith("/")); return path; });
+});
+
+test("handoff paths in assistant and tool results cannot enroll unrelated question sessions", () => {
+  const id = "00000000-0000-0000-0000-000000000099";
+  const branch = [message("assistant", `Handoff file: /h/${id}-1.md`), message("toolResult", [{ type: "text", text: `continue from /h/${id}-2.md` }])];
+  assert.deepEqual(chainIdentity(branch, "current"), { sessionIds: ["current"] });
+});
+
+test("markdown recovery keeps nested headings and structured sidecar fields win verbatim", () => {
+  const constraints = "Keep this.\n\n## Important\nNever delete data.\n\n";
+  const h = renderHandoff({ ...input, user_constraints: constraints, files_to_read: ["/a.ts"] }, auto, "s", 1, "/h/old.md", "2026-01-01");
+  assert.equal(parseHandoffSections(h.text).constraints, constraints);
+  const structured = { goal: "structured goal", user_constraints: constraints + "Exact sidecar content.", files_to_read: ["/structured.ts"] };
+  const prev = previousHandoff([], h, () => JSON.stringify({ text: h.text, input: structured }));
+  assert.deepEqual(prev, { goal: structured.goal, constraints: structured.user_constraints, filesToRead: structured.files_to_read, path: h.path });
+});
+
+test("a near-limit previous handoff cannot overflow emergency summaries or structured handoffs", () => {
+  const constraints = "Never delete data.\n\n## Important\n" + "字😀".repeat(6600);
+  const old = renderHandoff({ ...input, user_constraints: constraints }, auto, "s", 1, "/h/old.md", "2026-01-01");
+  assert.ok(Buffer.byteLength(old.text) > 46_000 && Buffer.byteLength(old.text) < MAX_HANDOFF_BYTES);
+  const previous = { path: old.path, goal: "Previous goal 字".repeat(8000), constraints, filesToRead: Array.from({ length: 100 }, (_, i) => `/file${i}/` + "字".repeat(800)) };
+  const emergency = emergencyHandoff([message("user", "New requests ".repeat(2000))], "/s.jsonl", previous);
+  const summary = emergencySummary(emergency);
+  assert.ok(Buffer.byteLength(summary) < MAX_HANDOFF_BYTES);
+  assert.match(summary, /abbreviated/);
+  assert.match(summary, /Previous handoff: \/h\/old.md/);
+  assert.ok(!summary.includes("\ufffd"));
+  const full = { ...auto, jobs: Array(1000).fill("j".repeat(600)), subagents: Array(1000).fill("a".repeat(400)),
+    claims: Array(100).fill({ issue: "x".repeat(400) }), unavailable: Array(8).fill("字".repeat(1000)),
+    cwd: "字".repeat(300), root: "字".repeat(300), branch: "字".repeat(300), head: "字".repeat(300),
+    dirty: Array(31).fill("d".repeat(200)), sync: "s".repeat(256), questions: Array(20).fill("q".repeat(200)),
+    userMessages: "新".repeat(2000), resumeCheck: "r".repeat(4096), scheduled: Array(10).fill("s".repeat(200)), finishedJobs: Array(10).fill("f".repeat(200)),
+    repos: Array(8).fill({ root: "/" + "r".repeat(300), branch: "b".repeat(300), head: "f".repeat(40), dirty: 123, sync: "s".repeat(300) }) };
+  const rendered = renderHandoff(emergency, full, "s", 2, "/h/new.md", "2026-01-02");
+  assert.ok(Buffer.byteLength(rendered.text) < MAX_HANDOFF_BYTES);
+  const noPrevious = emergencyHandoff([message("user", "A request".repeat(1000))]);
+  assert.ok(!noPrevious.facts.includes("A request"));
+});
+
+test("repo root probes are cached by directory without hiding nested repositories", () => {
+  const calls: string[] = [];
+  const paths = ["/repo", ...Array.from({ length: 60 }, (_, i) => `/repo/src/file${i}.ts`), "/repo/nested/a.ts"];
+  assert.deepEqual(repoRoots(paths, path => { calls.push(path); return path.startsWith("/repo/nested") ? "/repo/nested" : "/repo"; }, 8, pathDeps), ["/repo", "/repo/nested"]);
+  assert.deepEqual(calls, ["/repo", "/repo/src", "/repo/nested"]);
 });
 
 test("verbatim messages are byte bounded, newest kept, unicode safe, oversize message cut in the middle", () => {
@@ -120,7 +206,7 @@ test("previous handoff parser and sidecar carry goal, verbatim constraints, file
   const emergency = emergencyHandoff([], "/session.jsonl", prev);
   assert.match(emergency.goal, /Emergency handoff; previous goal:.*Ship this/s);
   assert.equal(emergency.user_constraints, "Do not push.\nKeep spacing.");
-  const constraints = "Verbatim 字\n".repeat(500);
+  const constraints = "Verbatim 字\n".repeat(50);
   assert.equal(emergencyHandoff([], undefined, { ...prev!, constraints }).user_constraints, constraints);
   assert.deepEqual(emergency.files_to_read, ["/a.ts", "/b.ts"]);
   assert.match(emergency.facts, /Previous handoff: \/handoffs\/old-1.md/);

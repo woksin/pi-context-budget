@@ -3,7 +3,7 @@ import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renam
 import { dirname, join, resolve } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
-import { boundedAutoState, isSubagent, type AutoState, type Handoff, type RecordedJob } from "./core.ts";
+import { boundedAutoState, isSubagent, type AutoState, type Handoff, type HandoffInput, type RecordedJob } from "./core.ts";
 import { collectRepositories, collectHead, finishedState, porcelainDirty, scheduledState, type RepoDeps, type JobManager } from "./collect.ts";
 
 /** A CLI process has one primary runtime; SDK children bind while it remains alive.
@@ -43,10 +43,11 @@ export function appendEvent(dir: string, data: unknown): void {
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   appendFileSync(join(dir, "events.jsonl"), JSON.stringify(data) + "\n", { mode: 0o600 });
 }
-export function writeHandoff(h: Handoff, auto: AutoState): void {
+export function writeHandoff(h: Handoff, auto: AutoState, input?: HandoffInput): void {
   mkdirSync(dirname(h.path), { recursive: true, mode: 0o700 });
   writeFileSync(h.path, h.text, { flag: "wx", mode: 0o600 });
-  writeFileSync(h.path.replace(/\.md$/, ".json"), JSON.stringify({ ...h, auto: boundedAutoState(auto) }) + "\n", { flag: "wx", mode: 0o600 });
+  const fields = input && { goal: input.goal, user_constraints: input.user_constraints, files_to_read: input.files_to_read };
+  writeFileSync(h.path.replace(/\.md$/, ".json"), JSON.stringify({ ...h, input: fields, auto: boundedAutoState(auto) }) + "\n", { flag: "wx", mode: 0o600 });
 }
 export interface Marker { cwd: string; launchPrompt: string | null; handoff: string; sessionFile: string | null }
 export function writeMarker(path: string, marker: Marker): void {
@@ -56,7 +57,7 @@ export function writeMarker(path: string, marker: Marker): void {
   atomicJson(path, marker);
 }
 export function git(cwd: string, args: string[], timeout = 1500): string | undefined {
-  try { return execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8", timeout, maxBuffer: 65536, stdio: ["ignore", "pipe", "ignore"] }).trim(); }
+  try { return execFileSync("git", ["--no-optional-locks", "-c", "core.fsmonitor=false", "-C", cwd, ...args], { encoding: "utf8", timeout, maxBuffer: 65536, stdio: ["ignore", "pipe", "ignore"] }).trim(); }
   catch { return undefined; }
 }
 export function gitState(cwd: string): Pick<AutoState, "cwd" | "root" | "branch" | "head"> {

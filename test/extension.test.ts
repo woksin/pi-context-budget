@@ -137,6 +137,8 @@ test("handoff collects persisted user messages, touched repositories and exposed
   const h = await harness();
   h.branch.push({ type: "message", timestamp: "2026-01-01", message: { role: "user", content: [{ type: "text", text: 'Keep "quotes"\nverbatim' }] } });
   await h.turn(100);
+  // pi persists the assistant message before invoking its tools.
+  h.branch.push({ type: "message", message: { role: "assistant", content: [{ type: "toolCall", id: "in-flight", name: "context_handoff", arguments: required }] } });
   const result = await h.handoff();
   const handoff = result.details.handoff;
   assert.match(handoff.text, /Repositories touched:/);

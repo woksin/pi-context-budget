@@ -120,7 +120,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
         input = { ...input, launch_prompt: promptPath };
       }
       const h = renderHandoff(input, auto, id, sequence, path, new Date().toISOString());
-      writeHandoff(h, auto);
+      writeHandoff(h, auto, input);
       log(ctx, "handoff_written", { path, n: h.n, bytes: Buffer.byteLength(h.text) });
       return h;
     }

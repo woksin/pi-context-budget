@@ -3,13 +3,15 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, readdirSync } from "node:fs";
 import { resolve, join } from "node:path";
 import { spawnSync } from "node:child_process";
+import { chainIdentity, previousHandoff } from "../src/collect.ts";
+import { renderHandoff } from "../src/core.ts";
 
 const root = resolve(import.meta.dirname, "../.ai-work/wrapper");
 mkdirSync(root, { recursive: true });
-function run(kind = "once", extra: string[] = []) {
+function run(kind = "once", extra: string[] = [], handoffName = "hand off.md") {
   const dir = mkdtempSync(join(root, "case-"));
   const cwd = join(dir, "cwd with spaces"); mkdirSync(cwd);
-  const handoff = join(cwd, "hand off.md"), launch = join(cwd, "launch prompt.md");
+  const handoff = join(cwd, handoffName), launch = join(cwd, "launch prompt.md");
   writeFileSync(handoff, "handoff"); writeFileSync(launch, "launch");
   const fake = join(dir, "pi");
   writeFileSync(fake, `#!/usr/bin/env node
@@ -48,6 +50,23 @@ test("wrapper relaunch once in same cwd with original options, PID/nonce-owned m
   assert.notEqual(r.calls[0].nonce, r.calls[1].nonce);
   assert.equal(r.markers.length, 0);
 });
+test("the wrapper's actual relaunch prompt discovers the prior handoff and question-chain session", () => {
+  const ancestor = "00000000-0000-0000-0000-000000000008";
+  const r = run("once", [], `${ancestor}-1.md`);
+  assert.equal(r.status, 0, r.stderr);
+  const prompt = r.calls[1].args.at(-1);
+  const fields = { goal: "Recover the original goal", facts: "verified", next_step: "continue", user_constraints: "Do not delete data.", files_to_read: [join(r.cwd, "read-first.ts")] };
+  const auto = { cwd: r.cwd, root: r.cwd, branch: "main", head: "abc", jobs: [], subagents: [], claims: [], unavailable: [] };
+  writeFileSync(r.handoff, renderHandoff(fields, auto, ancestor, 1, r.handoff, "2026-01-01").text);
+  const branch = [{ type: "message", message: { role: "user", content: prompt } }];
+  assert.deepEqual(chainIdentity(branch, "current").sessionIds, ["current", ancestor]);
+  const previous = previousHandoff(branch, undefined, path => readFileSync(path, "utf8"));
+  assert.equal(previous?.path, r.handoff);
+  assert.equal(previous?.goal, fields.goal);
+  assert.equal(previous?.constraints, fields.user_constraints);
+  assert.deepEqual(previous?.filesToRead, fields.files_to_read);
+});
+
 test("built-in short value flags and tui mode survive relaunch intact", () => {
   const extra = ["-n", "name with spaces", "-t", "read,write,context_handoff", "-xt", "bash", "--tui-mode", "regular"];
   const r = run("once", extra);

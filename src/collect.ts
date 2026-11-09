@@ -53,12 +53,14 @@ export function touchedPaths(branch: readonly unknown[], cwd: string, deps: Path
   return [...paths];
 }
 export function repoRoots(paths: string[], git: Git, cap = 8, deps?: Pick<PathDeps, "isDirectory">): string[] {
-  const roots = new Set<string>();
+  const roots = new Set<string>(), inspected = new Set<string>();
   for (let path of paths) {
     if (roots.size >= cap) break;
     if (deps) {
       try { while (!deps.isDirectory(path) && dirname(path) !== path) path = dirname(path); } catch { continue; }
     }
+    if (inspected.has(path)) continue;
+    inspected.add(path);
     const root = safeGit(git, path, "rev-parse", "--show-toplevel");
     if (root && isAbsolute(root)) roots.add(root);
   }
@@ -141,7 +143,7 @@ export function handoffPaths(branch: readonly unknown[]): string[] {
   for (const entry of branch) {
     const e = record(entry), details = record(e.details);
     if (e.type === "compaction" && typeof details.path === "string") paths.push(details.path);
-    if (record(e.message).role === "user") for (const match of textContent(entry).matchAll(/^Handoff file:\s*(\/[^\r\n]+\.md)\s*$/gm)) paths.push(match[1]);
+    if (record(e.message).role === "user") for (const match of textContent(entry).matchAll(/^(?:Handoff file:|continue from)[ \t]+(\/[^\r\n]+\.md)[ \t]*$/gm)) paths.push(match[1]);
   }
   return paths;
 }
@@ -160,9 +162,14 @@ function middleCut(text: string, budget: number): string {
   const end = Array.from(bytePrefix([...chars].reverse().join(""), Math.floor(allowance * 0.25))).reverse().join("");
   return `${start}…(cut ${chars.length - Array.from(start).length - Array.from(end).length} chars)${end}`;
 }
+function completedHandoff(entry: unknown): boolean {
+  const message = record(record(entry).message), handoff = record(record(message.details).handoff);
+  if (message.role !== "toolResult" || message.toolName !== "context_handoff" || message.isError === true) return false;
+  return typeof handoff.path === "string" && isAbsolute(handoff.path) && typeof handoff.at === "string";
+}
 export function userMessagesSince(branch: readonly unknown[], previousAt?: string, budget = 4096): string {
   let boundary = -1;
-  for (let i = 0; i < branch.length; i++) if (record(branch[i]).type === "compaction" || toolCalls(branch[i]).some(call => call.name === "context_handoff")) boundary = i;
+  for (let i = 0; i < branch.length; i++) if (record(branch[i]).type === "compaction" || completedHandoff(branch[i])) boundary = i;
   const since = previousAt === undefined ? NaN : Date.parse(previousAt);
   const messages = branch.flatMap((entry, index) => {
     const e = record(entry), at = Date.parse(String(e.timestamp ?? ""));
@@ -185,14 +192,25 @@ export function userMessagesSince(branch: readonly unknown[], previousAt?: strin
 }
 export interface PreviousHandoff { goal: string; constraints?: string; filesToRead: string[]; path: string }
 export function parseHandoffSections(text: string): Omit<PreviousHandoff, "path"> {
+  const headings = ["Goal", "Verified facts (agent-reported; verify before relying on them)", "Decisions and why", "User constraints (verbatim)",
+    "Open items", "Hypotheses (unverified)", "Next step", "Read first", "Automatically collected state", "Pending questions", "User messages since previous handoff (verbatim)", "Resume check"];
   const section = (name: string) => {
     const heading = `## ${name}\n`, start = text.indexOf(heading);
     if (start < 0) return "";
-    const from = start + heading.length, end = text.indexOf("\n\n## ", from);
-    return text.slice(from, end < 0 ? undefined : end);
+    const from = start + heading.length;
+    const ends = headings.filter(title => title !== name).map(title => text.indexOf(`\n\n## ${title}\n`, from)).filter(index => index >= 0);
+    return text.slice(from, ends.length ? Math.min(...ends) : undefined);
   };
   return { goal: section("Goal"), constraints: section("User constraints (verbatim)") || undefined,
     filesToRead: section("Read first").split("\n").filter(path => isAbsolute(path)) };
+}
+function structuredPrevious(value: unknown): Omit<PreviousHandoff, "path"> | undefined {
+  const input = record(value);
+  if (typeof input.goal !== "string" || !input.goal.trim()) return;
+  if (input.user_constraints !== undefined && typeof input.user_constraints !== "string") return;
+  const files = input.files_to_read ?? [];
+  if (!Array.isArray(files) || !files.every(path => typeof path === "string" && isAbsolute(path))) return;
+  return { goal: input.goal, constraints: input.user_constraints, filesToRead: files };
 }
 export function previousHandoff(branch: readonly unknown[], last: { path: string } | undefined, readFile: (path: string) => string): PreviousHandoff | undefined {
   const path = last?.path ?? handoffPaths(branch).at(-1);
@@ -200,22 +218,43 @@ export function previousHandoff(branch: readonly unknown[], last: { path: string
   let sections: Omit<PreviousHandoff, "path"> | undefined;
   try {
     const json = JSON.parse(readFile(path.replace(/\.md$/, ".json")));
-    if (typeof json.text === "string") sections = parseHandoffSections(json.text);
+    sections = structuredPrevious(json.input);
+    if (!sections && typeof json.text === "string") sections = parseHandoffSections(json.text);
   } catch { /* Markdown is also sufficient. */ }
   if (!sections?.goal) try { sections = parseHandoffSections(readFile(path)); } catch { return; }
   if (sections?.goal) return { ...sections, path };
 }
+function emergencyExtract(text: string, budget: number): string {
+  if (Buffer.byteLength(text) <= budget) return text;
+  const marker = "\n[…abbreviated; re-read previous handoff/session file]";
+  return bytePrefix(text, budget - Buffer.byteLength(marker)) + marker;
+}
+function emergencyFiles(files: string[] = []): string[] {
+  const kept: string[] = [];
+  let bytes = 0;
+  for (const path of files) {
+    const size = Buffer.byteLength(path) + 1;
+    if (isAbsolute(path) && bytes + size <= 1024 && kept.length < 20) { kept.push(path); bytes += size; }
+  }
+  return kept;
+}
+/** At most 7.5 KiB of narrative, leaving room for the expanded automatic-state budget. */
+function boundedEmergency(input: HandoffInput): HandoffInput {
+  return { goal: emergencyExtract(input.goal, 1024), facts: emergencyExtract(input.facts, 1024), next_step: emergencyExtract(input.next_step, 512),
+    user_constraints: input.user_constraints === undefined ? undefined : emergencyExtract(input.user_constraints, 4096), files_to_read: emergencyFiles(input.files_to_read) };
+}
 export function emergencyHandoff(branch: readonly unknown[], sessionFile?: string, previous?: PreviousHandoff, previousAt?: string): HandoffInput {
   const requests = userMessagesSince(branch, previousAt);
-  return { goal: previous ? `Emergency handoff; previous goal: ${bytePrefix(previous.goal, 4096)}` : `Emergency handoff. Recent user requests:\n${requests || "Recover the original request from the session file."}`,
-    facts: `No fresh structured handoff. Recheck previous tests/review/CI/issue claims. Session file: ${(sessionFile ?? "unavailable").slice(0, 400)}` +
-      (previous ? `\nPrevious handoff: ${previous.path}` : "") + (requests ? `\nRecent user requests (verbatim):\n${requests}` : ""),
+  return boundedEmergency({ goal: previous ? `Emergency handoff; previous goal: ${previous.goal}` : `Emergency handoff. Recent user requests:\n${requests || "Recover the original request from the session file."}`,
+    facts: `No fresh structured handoff. Recheck previous tests/review/CI/issue claims. Session file: ${emergencyExtract(sessionFile ?? "unavailable", 400)}` +
+      (previous ? `\nPrevious handoff: ${previous.path}\nCarried fields are bounded excerpts; re-read the full goal, constraints and read-first files there.` : ""),
     user_constraints: previous?.constraints,
     files_to_read: previous?.filesToRead,
-    next_step: "Re-establish state from files and git, re-read user constraints in the session file, then continue. Do not assume any prior check passed." };
+    next_step: "Re-establish state from files and git, re-read user constraints in the session file, then continue. Do not assume any prior check passed." });
 }
-/** Mechanical backstops have no auto-state dependency, but must retain emergency constraints/files. */
+/** Mechanical backstops have no auto-state dependency, but must retain bounded emergency constraints/files. */
 export function emergencySummary(input: HandoffInput): string {
+  input = boundedEmergency(input);
   return ["# Emergency handoff", input.goal, input.facts,
     input.user_constraints && `\n## User constraints (verbatim)\n${input.user_constraints}`,
     input.files_to_read?.length && `\n## Read first\n${input.files_to_read.join("\n")}`,
