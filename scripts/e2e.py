@@ -85,7 +85,8 @@ if result.returncode:
 entries = []
 for path in (work / "sessions").rglob("*.jsonl"):
     entries.extend(json.loads(line) for line in path.read_text().splitlines())
-events = [json.loads(line) for line in (work / "state/events.jsonl").read_text().splitlines()]
+event_paths = [*sorted((work / "state").glob("events-*.jsonl")), work / "state/events.jsonl"]
+events = [json.loads(line) for path in event_paths for line in path.read_text().splitlines()]
 compactions = [e for e in entries if e.get("type") == "compaction"]
 commits = [e for e in events if e.get("event") == "handoff_committed"]
 blocks = [e for e in events if e.get("event") == "blocked"]

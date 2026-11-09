@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync, type Stats } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
@@ -40,9 +40,75 @@ export function atomicJson(path: string, data: unknown): void {
   writeFileSync(tmp, JSON.stringify(data) + "\n", { mode: 0o600, flag: "wx" });
   renameSync(tmp, path);
 }
-export function appendEvent(dir: string, data: unknown): void {
+export const EVENT_LOG_MAX_BYTES = 20 * 1024 * 1024;
+export const EVENT_LOG_KEEP = 5;
+export const TURN_LOG_KEEP = 2;
+interface EventLogOptions { maxBytes?: number; keep?: number; now?: () => number }
+function logSize(path: string): number {
+  try { return statSync(path).size; }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return 0;
+    throw error;
+  }
+}
+function sameLock(a: Stats, b: Stats): boolean {
+  return a.dev === b.dev && a.ino === b.ino && a.mtimeMs === b.mtimeMs;
+}
+function makeLogLock(lock: string): boolean {
+  try { mkdirSync(lock, { mode: 0o700 }); return true; }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+    throw error;
+  }
+}
+function takeLogLock(lock: string, now: () => number): Stats | undefined {
+  if (!makeLogLock(lock)) {
+    const stale = statSync(lock);
+    if (now() - stale.mtimeMs <= 10000) return undefined;
+    // Another stale-lock breaker may already have replaced it. Recheck identity
+    // and mtime immediately before removal, leaving a changed lock alone.
+    if (!sameLock(stale, statSync(lock))) return undefined;
+    rmdirSync(lock);
+    if (!makeLogLock(lock)) return undefined;
+  }
+  return statSync(lock);
+}
+function logArchive(dir: string, base: string, now: () => number): string {
+  const stamp = new Date(now()).toISOString().replace(/[-:.]/g, "");
+  let path = join(dir, `${base}-${stamp}.jsonl`), collision = 0;
+  while (existsSync(path)) {
+    const suffix = collision++ ? `-${collision}` : "";
+    path = join(dir, `${base}-${stamp}-${process.pid}${suffix}.jsonl`);
+  }
+  return path;
+}
+function pruneLog(dir: string, base: string, keep: number): void {
+  const archives = readdirSync(dir).filter(name => name.startsWith(`${base}-`) && name.endsWith(".jsonl")).sort();
+  for (const name of archives.slice(0, Math.max(0, archives.length - keep))) {
+    try { rmSync(join(dir, name)); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  }
+}
+function rotateLog(dir: string, base: string, opts: Required<EventLogOptions>): void {
+  const lock = join(dir, `${base}.lock`), owner = takeLogLock(lock, opts.now);
+  if (!owner) return;
+  try {
+    const file = join(dir, `${base}.jsonl`);
+    if (logSize(file) < opts.maxBytes) return;
+    renameSync(file, logArchive(dir, base, opts.now));
+    pruneLog(dir, base, opts.keep);
+  } finally {
+    if (sameLock(owner, statSync(lock))) rmdirSync(lock);
+  }
+}
+export function appendEvent(dir: string, data: unknown, opts: EventLogOptions = {}): void {
   mkdirSync(dir, { recursive: true, mode: 0o700 });
-  appendFileSync(join(dir, "events.jsonl"), JSON.stringify(data) + "\n", { mode: 0o600 });
+  const base = data !== null && typeof data === "object" && "event" in data && data.event === "turn" ? "turns" : "events";
+  const file = join(dir, `${base}.jsonl`), maxBytes = opts.maxBytes ?? EVENT_LOG_MAX_BYTES;
+  try {
+    if (logSize(file) >= maxBytes) rotateLog(dir, base, { maxBytes, keep: opts.keep ?? (base === "turns" ? TURN_LOG_KEEP : EVENT_LOG_KEEP), now: opts.now ?? Date.now });
+  } catch { /* Rotation is best-effort: telemetry must still append if it fails. */ }
+  appendFileSync(file, JSON.stringify(data) + "\n", { mode: 0o600 });
 }
 export function writeHandoff(h: Handoff, auto: AutoState, input?: HandoffInput): void {
   mkdirSync(dirname(h.path), { recursive: true, mode: 0o700 });

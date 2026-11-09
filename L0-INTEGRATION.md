@@ -35,7 +35,7 @@ Watch the existing session JSONL (append entries), not `session_compact` notific
 {"type":"compaction","details":{"kind":"handoff","path":"/absolute/repo/.ai-work/handoffs/<sessionId>-<n>.md","n":1}}
 ```
 
-Pi serializes the null retain-none id as the compaction entry's own id. `events.jsonl` records `handoff_committed` and the matching path/n; `handoff_written` alone may be idle-only or later invalidated. The commit event is emitted immediately before returning the draft; the actual session entry remains the authority if a boundary later fails.
+Pi serializes the null retain-none id as the compaction entry's own id. `events*.jsonl` (live log and rotated archives) records `handoff_committed` and the matching path/n; `handoff_written` alone may be idle-only or later invalidated. The commit event is emitted immediately before returning the draft; the actual session entry remains the authority if a boundary later fails.
 
 `main-session.py` can keep tracking the same file across in-process handoffs. On a wrapper relaunch a new sessionId/file appears; associate it by cwd plus its startup status, not the previous file's size. No periodic lane-context shell command or model nudge is needed for tokens.
 
