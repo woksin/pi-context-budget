@@ -16,6 +16,7 @@ export interface Config {
   keepRecentTokens: number;
   maxHandoffsPerSession: number;
   loop: { maxHandoffsWithoutProgress: number; withinTurns: number };
+  handoffGrace: { enabled: boolean; calls: number; fraction: number };
 }
 const MAIN: Thresholds = { soft: 300000, handoff: 400000, hard: 600000, minProgress: 50000 };
 const SUB: Thresholds = { soft: 150000, handoff: 200000, hard: 300000, minProgress: 25000 };
@@ -65,8 +66,12 @@ export function parseConfig(raw: unknown): Config {
     resumeChecks[name] = command;
   }
   const loop = v.loop === undefined ? {} : object(v.loop, "loop");
+  const grace = v.handoffGrace === undefined ? {} : object(v.handoffGrace, "handoffGrace");
+  const fraction = positive(grace.fraction, 0.5, "handoffGrace.fraction");
+  if (fraction > 1) throw new Error("handoffGrace.fraction must be <= 1");
   return {
     mode: mode as Mode, overflowRecovery: boolean(v.overflowRecovery, true, "overflowRecovery"), resumeChecks, enforceCwds: allow as string[] | undefined, main, subagent, models,
+    handoffGrace: { enabled: boolean(grace.enabled, true, "handoffGrace.enabled"), calls: integer(grace.calls, 4, "handoffGrace.calls"), fraction },
     idleMinutes: positive(v.idleMinutes, 50, "idleMinutes"),
     idleMinTokens: positive(v.idleMinTokens, 300000, "idleMinTokens"),
     keepRecentTokens: positive(v.keepRecentTokens, 20000, "keepRecentTokens"),
@@ -125,6 +130,7 @@ export const MAX_COMPACTION_RETRIES = 2;
 export interface MachineState {
   phase: Phase; mode: Mode; tokens: number | null; floor: number | null;
   turn: number; count: number; handoffTurns: number[]; softNotified: boolean;
+  softModelNoticed: boolean; graceUsed: number; graceCalls: string[];
   settleRequest: "none" | "budget" | "idle";
   /** The in-turn "handoff required" notice was already delivered since the last reset. */
   requiredNoticed: boolean;
@@ -142,7 +148,7 @@ export interface MachineState {
 export interface Frame { mode: Mode; tokens: number | null; thresholds: Thresholds; config: Config; wrapped: boolean }
 export type MachineEvent =
   | { type: "turn_end"; usage?: number; failure?: MachineState["providerFailure"]; continues?: boolean }
-  | { type: "tool_call"; tool: string; id: string }
+  | { type: "tool_call"; tool: string; id: string; graceEligible?: boolean }
   | { type: "tool_end"; tool: string; id: string; error: boolean }
   | { type: "handoff_prepare" }
   | { type: "handoff_written"; handoff: Handoff }
@@ -159,7 +165,8 @@ export type MachineEvent =
 export type Effect =
   | { type: "log"; event: string; data?: Record<string, unknown> }
   | { type: "notify" }
-  | { type: "notice_required" }
+  | { type: "notice_soft" }
+  | { type: "notice_required"; content: string }
   | { type: "notify_degraded"; reason: "loop" }
   | { type: "notify_cap_advisory"; count: number; cap: number }
   | { type: "write_handoff"; idleOnly: boolean }
@@ -174,7 +181,7 @@ export type Effect =
 type LogEffect = Extract<Effect, { type: "log" }>;
 export function initialState(mode: Mode = "observe"): MachineState {
   return { phase: "idle", mode, tokens: null, floor: null, turn: 0, count: 0, handoffTurns: [], softNotified: false,
-    settleRequest: "none", requiredNoticed: false, failures: 0, compactionFallback: false, attempt: 0, blockedCalls: [], lastSettled: 0,
+    settleRequest: "none", requiredNoticed: false, softModelNoticed: false, graceUsed: 0, graceCalls: [], failures: 0, compactionFallback: false, attempt: 0, blockedCalls: [], lastSettled: 0,
     observedIdle: false, providerFailure: "none", relaunchSent: false, lastAction: "none" };
 }
 export function classifyFailure(e: { aborted?: boolean; errorMessage?: string }): FailureClass {
@@ -229,15 +236,28 @@ function committed(s: MachineState, source: CommitSource): void {
   if (source !== "idle") { s.count++; s.handoffTurns.push(s.turn); }
   s.tokens = s.floor = null;
   s.stored = s.pending ?? s.stored; s.pending = undefined; s.pendingSource = undefined;
-  s.softNotified = false; s.settleRequest = "none"; s.requiredNoticed = false;
+  s.softNotified = s.softModelNoticed = false; s.graceUsed = 0;
+  s.settleRequest = "none"; s.requiredNoticed = false;
   s.compaction = undefined; s.failures = 0; s.compactionFallback = s.relaunchSent = false;
 }
 function resetEnforcement(s: MachineState): void {
-  s.pending = s.stored = undefined; s.pendingSource = undefined; s.compaction = undefined; s.blockedCalls = [];
+  s.pending = s.stored = undefined; s.pendingSource = undefined; s.compaction = undefined; s.blockedCalls = []; s.graceCalls = [];
   s.settleRequest = "none"; s.failures = 0; s.compactionFallback = s.relaunchSent = false;
   s.lastAction = "none"; s.requiredNoticed = false;
+  s.softModelNoticed = false; s.graceUsed = 0;
 }
+export const SOFT_NOTICE = "Context budget: soft threshold reached. Finish the current atomic step, bring .ai-work/<task>/STATE.md up to date (and any task notes), and prepare your handoff; call context_handoff at the next safe point. The handoff becomes mandatory at the handoff threshold, after which only a few state-recording calls are allowed.";
 export const REQUIRED = "Call context_handoff now with goal, next_step and verified facts; preserve user_constraints verbatim and hypotheses separately. Then end the turn without further tools. Only the user may disable enforcement via config or the optional /guards off context.";
+function graceRemaining(s: MachineState, f: Frame): number {
+  const { enabled, calls, fraction } = f.config.handoffGrace;
+  const handoff = effectiveThresholds(s.floor, f.thresholds).handoff;
+  const ceiling = handoff + fraction * (f.thresholds.hard - handoff);
+  if (!enabled || !handoffRequired(s, f) || s.pending || s.stored || fallbackFor(s, f) || s.tokens === null || s.tokens >= ceiling) return 0;
+  return Math.max(0, calls - s.graceUsed);
+}
+function graceHint(remaining: number): string {
+  return remaining > 0 ? ` You may still make ${remaining} edit/write calls to .ai-work/**/*.md or safe read-only git calls (diff requires --no-ext-diff --no-textconv; log requires --oneline --no-show-signature) to record state, then call context_handoff.` : "";
+}
 function phase(s: MachineState, f: Frame): Phase {
   if (s.mode === "off") return "idle";
   if (s.mode === "observe" && s.observation) s = s.observation;
@@ -279,6 +299,7 @@ function wouldLog(effect: Effect, s: MachineState, f: Frame): LogEffect {
     }
     case "notify": event = "would_soft_notice"; break;
     case "notice_required": event = "would_required_notice"; break;
+    case "notice_soft": event = "would_soft_model_notice"; break;
     case "notify_degraded": event = `would_${effect.reason}_degraded`; break;
     case "notify_cap_advisory": event = "would_cap_advisory"; break;
     case "write_handoff": event = effect.idleOnly ? "would_idle_handoff_write" : "would_handoff_write"; break;
@@ -338,17 +359,24 @@ function decide(s: MachineState, e: MachineEvent, f: Frame): Effect[] {
   }
   switch (e.type) {
     case "tool_call":
+      if (!handoffRequired(s, f)) s.graceUsed = 0;
+      if (e.tool !== "context_handoff" && e.graceEligible && graceRemaining(s, f) > 0) {
+        s.graceUsed++; s.graceCalls.push(e.id);
+        return [{ type: "log", event: "grace_allowed", data: { used: s.graceUsed, calls: f.config.handoffGrace.calls } }];
+      }
       if (e.tool !== "context_handoff" && (s.pending || fallback || handoffRequired(s, f))) {
         s.blockedCalls.push(e.id);
-        return [{ type: "block", reason: s.pending || (fallback && s.stored) ? "Handoff stored. End this turn; do not call more tools." : `Every tool except context_handoff is blocked. ${REQUIRED}` }];
+        return [{ type: "block", reason: s.pending || (fallback && s.stored) ? "Handoff stored. End this turn; do not call more tools." : `Every tool except context_handoff is blocked. ${REQUIRED}${graceHint(graceRemaining(s, f))}` }];
       }
       if (e.tool !== "context_handoff") s.stored = undefined;
       return [];
     case "tool_end": {
       if (s.blockedCalls.includes(e.id)) { s.blockedCalls = s.blockedCalls.filter(id => id !== e.id); return []; }
+      const grace = s.graceCalls.includes(e.id);
+      s.graceCalls = s.graceCalls.filter(id => id !== e.id);
       if (e.tool !== "context_handoff") {
         s.pending = s.stored = undefined; s.pendingSource = undefined;
-        if (!e.error) s.handoffTurns = [];
+        if (!e.error && !grace) s.handoffTurns = [];
       }
       return [];
     }
@@ -367,14 +395,18 @@ function decide(s: MachineState, e: MachineEvent, f: Frame): Effect[] {
         committed(s, source); return [{ type: "commit", handoff: usable, source }];
       }
       const required = handoffRequired(s, f);
-      if (!required) s.requiredNoticed = false;
+      if (!required) { s.requiredNoticed = false; s.graceUsed = 0; }
       if (e.continues && required && !s.pending && !s.stored && !s.requiredNoticed && !fallback) {
-        s.requiredNoticed = true; return [{ type: "notice_required" }];
+        s.requiredNoticed = true; return [{ type: "notice_required", content: REQUIRED + graceHint(graceRemaining(s, f)) }];
       }
       const soft = effectiveThresholds(s.floor, f.thresholds).soft;
-      if (s.tokens === null || s.tokens < soft) s.softNotified = false;
-      if (!s.softNotified && (s.tokens ?? 0) >= soft) { s.softNotified = true; return [{ type: "notify" }]; }
-      return [];
+      if (s.tokens === null || s.tokens < soft) s.softNotified = s.softModelNoticed = false;
+      const effects: Effect[] = [];
+      if (!s.softNotified && (s.tokens ?? 0) >= soft) { s.softNotified = true; effects.push({ type: "notify" }); }
+      if (e.continues && s.softNotified && !s.softModelNoticed && !required && !fallback) {
+        s.softModelNoticed = true; effects.push({ type: "notice_soft" });
+      }
+      return effects;
     }
     case "agent_before_settle":
       if (s.providerFailure !== "none" || s.settleRequest !== "none" || s.pending || (fallback && s.stored)) return [];
@@ -409,7 +441,7 @@ function decide(s: MachineState, e: MachineEvent, f: Frame): Effect[] {
 /** Pure, immutable policy boundary. Inactive modes can emit ONLY telemetry, never action effects. */
 export function transition(previous: MachineState, event: MachineEvent, frame: Frame): { state: MachineState; effects: Effect[] } {
   if (frame.mode === "observe") return observe(previous, event, frame);
-  const s: MachineState = { ...previous, observation: undefined, handoffTurns: [...previous.handoffTurns], blockedCalls: [...previous.blockedCalls], tokens: frame.tokens };
+  const s: MachineState = { ...previous, observation: undefined, handoffTurns: [...previous.handoffTurns], blockedCalls: [...previous.blockedCalls], graceCalls: [...previous.graceCalls], tokens: frame.tokens };
   if (s.mode !== frame.mode) { resetEnforcement(s); s.mode = frame.mode; }
   if ((event.type === "session_compact" || event.type === "session_compact_failed") && event.attempt !== undefined && s.compaction?.id !== event.attempt) {
     s.phase = phase(s, frame);

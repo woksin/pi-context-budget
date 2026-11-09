@@ -4,9 +4,10 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
-import { effectiveMode, modelThresholds, parseConfig, renderHandoff, validateHandoff, ownsWrapper, effectiveThresholds, launchPromptKind, shorten, RETRY, normalizeFilesToRead, REQUIRED, initialState, transition, policyStatus,
+import { effectiveMode, modelThresholds, parseConfig, renderHandoff, validateHandoff, ownsWrapper, effectiveThresholds, launchPromptKind, shorten, RETRY, normalizeFilesToRead, SOFT_NOTICE, initialState, transition, policyStatus,
   restoreHistory, handoffBackoff, forced, degradedFor, type Effect, type Frame, type MachineEvent, type Handoff, type HandoffInput, type HistoryItem } from "./core.ts";
 import { OverflowRecovery } from "./overflow-recovery.ts";
+import { graceEligible } from "./grace.ts";
 import { resumeCommand, runResumeCheck } from "./resume-check.ts";
 import { appendEvent, atomicJson, gitDetail, gitState, issueClaims, runningState, writeHandoff, writeLaunchPrompt, writeMarker, processSessionHosts, pendingQuestions, watchCheck, type SessionHosts } from "./storage.ts";
 
@@ -147,7 +148,10 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
         switch (effect.type) {
           case "notify":
             log(ctx, "soft_crossing");
-            ctx.ui.notify("Context is large: finish the current step first; hand off at the next natural boundary. No handoff is required at the soft threshold.", "info"); break;
+            ctx.ui.notify("Context is large (soft threshold): the agent is asked to update its state file and prepare a handoff; none is forced yet.", "info"); break;
+          case "notice_soft":
+            log(ctx, "soft_model_notice");
+            result = { entries: [{ type: "custom_message", customType: "context-budget", display: true, content: SOFT_NOTICE }] }; break;
           case "notify_degraded":
             log(ctx, `${effect.reason}_degraded`);
             ctx.ui.notify("Context-budget handoff loop limit reached and no relaunch wrapper is available. Tools stay available and handoff enforcement is paused until a tool call makes progress; start a fresh session soon (/new, or relaunch under the wrapper).", "warning"); break;
@@ -155,7 +159,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
             ctx.ui.notify(`Context-budget: ${effect.count} handoffs this session (cap ${effect.cap}). In-place handoffs keep working, but a fresh session is recommended (/new from the latest handoff, or run under pi-session).`, "warning"); break;
           case "notice_required":
             log(ctx, "required_notice");
-            result = { entries: [{ type: "custom_message", customType: "context-budget", display: true, content: REQUIRED }] }; break;
+            result = { entries: [{ type: "custom_message", customType: "context-budget", display: true, content: effect.content }] }; break;
           case "block":
             log(ctx, "blocked", { reason: effect.reason }); result = { block: true, reason: effect.reason }; break;
           case "reject_handoff": throw new Error(effect.reason);
@@ -284,7 +288,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
         return { content: [{ type: "text", text: intent.idleOnly ? "Handoff stored. End this turn without further tools; the context resets at the end of this turn." : "Handoff stored. End this turn without further tools; recovery continues automatically." }], details: { handoff } };
       },
     });
-    pi.on("tool_call", safe((e, ctx) => run({ type: "tool_call", tool: e.toolName, id: e.toolCallId }, ctx)));
+    pi.on("tool_call", safe((e, ctx) => run({ type: "tool_call", tool: e.toolName, id: e.toolCallId, graceEligible: graceEligible(e.toolName, e.input, ctx.cwd) }, ctx)));
     pi.on("tool_execution_end", safe(async (e, ctx) => {
       // Reading ids is metadata collection, not policy; never walk arbitrary/cyclic result trees.
       const collect = (value: unknown, depth = 0): void => {
