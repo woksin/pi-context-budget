@@ -33,7 +33,7 @@ function expected(effect: Effect): { event: string; source: string } {
   if (effect.type === "steer") return { event: effect.idleOnly ? "would_idle_handoff" : "would_handoff", source: effect.type };
   if (effect.type === "write_handoff") return { event: effect.idleOnly ? "would_idle_handoff_write" : "would_handoff_write", source: effect.type };
   if (effect.type === "notify_degraded") return { event: `would_${effect.reason}_degraded`, source: effect.type };
-  const names = { notify: "would_soft_notice", notice_required: "would_required_notice", reject_handoff: "would_handoff_rejected", block: "would_block", commit: "would_handoff_commit",
+  const names = { notify: "would_soft_notice", notice_soft: "would_soft_model_notice", notice_required: "would_required_notice", reject_handoff: "would_handoff_rejected", block: "would_block", commit: "would_handoff_commit",
     compact: "would_idle_compact", backstop: "would_backstop", relaunch: "would_relaunch", cancel_compaction: "would_cancel_compaction", notify_cap_advisory: "would_cap_advisory" };
   return { event: names[effect.type], source: effect.type };
 }

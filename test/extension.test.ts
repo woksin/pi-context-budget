@@ -620,3 +620,37 @@ test("the required notice rides a continuing turn without continue; status shows
   assert.deepEqual(h.status().effectiveThresholds, { soft: 150, handoff: 250 });
   assert.equal(await h.emit("turn_end", event(300, [{}])), undefined);
 });
+test("soft model notice rides the next continuing turn without an extra request", async () => {
+  const h = await harness();
+  assert.equal(await h.turn(100), undefined);
+  assert.equal(h.notifications.length, 1);
+  assert.ok(!h.notifications[0].includes("No handoff is required"));
+  const event = { message: { role: "assistant", usage: { input: 100, output: 0, cacheRead: 0, cacheWrite: 0 } }, toolResults: [{}] };
+  const result = await h.emit("turn_end", event);
+  assert.equal(result.continue, undefined);
+  assert.equal(result.entries[0].customType, "context-budget");
+  assert.match(result.entries[0].content, /STATE\.md/);
+  assert.match(result.entries[0].content, /prepare your handoff/);
+  assert.equal(await h.emit("turn_end", event), undefined);
+  assert.ok(h.events().some(e => e.event === "soft_model_notice"));
+  const crossing = await harness();
+  const first = await crossing.emit("turn_end", event);
+  assert.equal(first.continue, undefined);
+  assert.equal(first.entries[0].customType, "context-budget");
+  assert.equal(crossing.notifications.length, 1);
+});
+test("adapter grants four state calls, blocks other tools and retains settle behavior", async () => {
+  const h = await harness();
+  await h.turn(100); await h.turn(300);
+  const call = (toolName: string, input: unknown, toolCallId = "state") => h.emit("tool_call", { toolName, input, toolCallId });
+  assert.equal((await call("edit", { path: "src/x.ts" }, "bad")).block, true);
+  for (const [tool, input] of [["edit", { path: ".ai-work/t/STATE.md" }], ["write", { file_path: ".ai-work/t/notes.md" }], ["bash", { command: "git status" }], ["read", { path: ".ai-work/t" }]] as const) {
+    assert.equal(await call(tool, input), undefined);
+    await h.emit("tool_execution_end", { toolName: tool, toolCallId: "state", isError: false });
+  }
+  assert.equal((await call("edit", { path: ".ai-work/t/STATE.md" })).block, true);
+  assert.equal(h.events().filter(e => e.event === "grace_allowed").length, 4);
+  assert.equal((await h.emit("agent_before_settle")).continue, true);
+  assert.equal(await h.emit("agent_before_settle"), undefined);
+  assert.ok(h.events().some(e => e.event === "settle_handoff_requested"));
+});
