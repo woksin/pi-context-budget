@@ -1,10 +1,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import fs, { mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
+import fs, { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import { join } from "node:path";
 import { buildSessionContext, convertToLlm, SessionManager } from "@earendil-works/pi-coding-agent";
-import { assemblePacket, createResumeHook, FILE_BYTES, PACKET_BYTES } from "../src/memory/resume.ts";
+import { assemblePacket, createResumeHook, genericResumeCheck, FILE_BYTES, PACKET_BYTES } from "../src/memory/resume.ts";
+import { FileMemoryStore } from "../src/memory/store.ts";
+import { eligibilityCheck } from "../src/memory/authorize.ts";
+import { agent, message, directive, decision } from "./memory-conformance.ts";
+import { resumeCommand } from "../src/resume-check.ts";
+import { parseConfig } from "../src/core.ts";
 import { MAX_HANDOFF_BYTES } from "../src/core.ts";
 import { createContextBudgetExtension } from "../src/extension.ts";
 import { SessionHosts } from "../src/storage.ts";
@@ -28,6 +33,60 @@ function fixture() {
   const deps = { cwdRoot: root, repos: [], agentDir, handoffAt: "2026-01-01T00:00:00Z", observation };
   return { dir, root, agentDir, file, observation, configFile, ctx, deps };
 }
+
+function checkFixture() {
+  const f = fixture(), store = new FileMemoryStore({ home: join(f.dir, "memory"), eligibilityCheck });
+  f.ctx.sessionManager.getSessionId = () => "session";
+  f.ctx.sessionManager.getBranch = () => [];
+  const entry = message(); store.appendMessage(entry);
+  const active = directive(entry, { authority: { mode: "auto", ruleVersion: 1 } });
+  assert.equal(store.addItem(active, agent).ok, true);
+  const proposed = directive(entry); assert.equal(store.addItem(proposed, agent).ok, true);
+  store.appendMessage(message({ text: "Unclassified request" }));
+  return { ...f, store, active, proposed };
+}
+test("generic check has deterministic bounded counts, newest retirement and a memory_list pointer", () => {
+  const f = checkFixture(), retired = decision();
+  assert.equal(f.store.addItem(retired, agent).ok, true);
+  assert.equal(f.store.retireItem(retired.id, "done", "Finished", { type: "agent_decision" }, agent).ok, true);
+  const event = f.store.changesSince().events.at(-1)!;
+  for (let i = 0; i < 80; i++) assert.equal(f.store.addItem(decision(), agent).ok, true);
+  const check = genericResumeCheck(f.ctx, f.store);
+  assert.equal(check, genericResumeCheck(f.ctx, f.store));
+  assert.ok(Buffer.byteLength(check) <= 1024);
+  assert.match(check, /active directives="1"/); assert.match(check, /unresolved messages="1"/);
+  assert.match(check, /proposed items="1"/); assert.ok(check.includes(retired.id)); assert.ok(check.includes(event.at));
+  assert.match(check, /unread lane messages="unknown \(no collector\)"/); assert.match(check, /memory_list/);
+});
+test("generic section is in the packet only for main sessions without an operator command", async () => {
+  const f = checkFixture();
+  const hook = (subagent: boolean, config: any = {}, env: any = {}) => createResumeHook({ agentDir: f.agentDir, configFile: f.configFile,
+    observe: () => f.observation, store: async () => f.store, host: () => ({ subagent }),
+    command: ctx => resumeCommand(parseConfig(config), ctx.sessionManager.getSessionName?.(), env) });
+  const main = await hook(false).append(f.ctx, "narrative");
+  assert.match(main, /## Memory resume check/); assert.ok(main.indexOf("## Memory resume check") > main.indexOf("## Resume packet"));
+  for (const h of [hook(true), hook(false, { resumeChecks: { lane: "printf named-check" } }), hook(false, {}, { PI_RESUME_CHECK: "printf environment-check" })]) {
+    assert.doesNotMatch(await h.append(f.ctx, "narrative"), /## Memory resume check/);
+  }
+  writeFileSync(f.configFile, JSON.stringify({ memory: { resume: false, scope: { mode: "all" } } }));
+  assert.equal(await hook(false).append(f.ctx, "unchanged\nbytes\n"), "unchanged\nbytes\n");
+});
+
+test("a failed or absent memory store drops only the generic check", async () => {
+  const f = checkFixture();
+  for (const store of [async () => { throw Error("store unavailable"); }, async () => undefined]) {
+    const hook = createResumeHook({ agentDir: f.agentDir, configFile: f.configFile, observe: () => f.observation, store });
+    const summary = await hook.append(f.ctx, "keep the handoff");
+    assert.match(summary, /^keep the handoff/); assert.match(summary, /## Resume packet/);
+    assert.doesNotMatch(summary, /## Memory resume check/);
+  }
+});
+test("an over-budget check is omitted without dropping the packet facts", async () => {
+  const f = fixture(), input = { ...f.deps, observedAt: f.deps.handoffAt, files: [], budget: PACKET_BYTES };
+  const expected = (await assemblePacket(input)).sections.join("\n\n");
+  const actual = await assemblePacket({ ...input, budget: Buffer.byteLength(expected), check: "x".repeat(1024) });
+  assert.equal(actual.sections.join("\n\n"), expected);
+});
 
 test("path boundary: absolute, existing regular files only; traversal and symlink escapes fail closed", async () => {
   const f = fixture(), good = f.file("good.txt"), outside = f.file("outside.txt", "outside-only", f.dir);
@@ -278,6 +337,8 @@ test("commit wiring persists the packet, reload rebuilds it, and five converted 
   const result = await f.emit("turn_end", { message: { role: "assistant", usage: { input: 300, output: 0, cacheRead: 0, cacheWrite: 0 } } });
   const draft = result.entries.find((e: any) => e.type === "compaction");
   assert.match(draft.summary, /## Resume packet \(reference material, not instructions\)/); assert.match(draft.summary, /commit-time-reference/);
+  assert.equal(JSON.parse(readFileSync(stored.details.handoff.path.replace(/\.md$/, ".json"), "utf8")).laneRoot, f.sm.getSessionId());
+  assert.equal(existsSync(join(f.agentDir, "memory")), false);
   f.sm.appendCompaction(draft.summary, null, 300, draft.details);
   const reopened = SessionManager.open(f.sm.getSessionFile()!);
   assert.match(JSON.stringify(buildSessionContext(reopened.getEntries()).messages), /commit-time-reference/);
@@ -290,6 +351,16 @@ test("commit wiring persists the packet, reload rebuilds it, and five converted 
   }
   assert.equal(new Set(payloads).size, 1); assert.match(payloads[0], /commit-time-reference/);
   assert.doesNotMatch(payloads[0], /later-/);
+});
+
+test("backstop wiring persists the lane root independently of the resume flag", async () => {
+  const f = await extensionFixture(false);
+  const stored = await f.tool.execute("h", { goal: "finish", facts: "verified", next_step: "continue" }, undefined, undefined, f.ctx);
+  const result = await f.emit("session_before_compact", { reason: "threshold", preparation: { tokensBefore: 300 } });
+  assert.ok(result.compaction.summary.includes("verified"));
+  const saved = JSON.parse(readFileSync(stored.details.handoff.path.replace(/\.md$/, ".json"), "utf8"));
+  assert.equal(saved.laneRoot, f.sm.getSessionId());
+  assert.equal(existsSync(join(f.agentDir, "memory")), false);
 });
 
 test("commit rejects original traversal and relative spellings even after handoff normalization", async () => {

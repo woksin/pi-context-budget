@@ -18,7 +18,8 @@ export interface MemoryStoreCore {
   confirm(itemId: string, actor: Actor): WriteResult;
   retireItem(itemId: string, status: RetireEvent["status"], reason: string, source: Source, actor: Actor): WriteResult;
   classify(classification: Classification, actor: Actor): WriteResult;
-  list(query: ItemQuery): Page<FoldedItem>;
+  /** Optional visibility is applied before paging; cursors index the filtered result. */
+  list(query: ItemQuery, visible?: (item: FoldedItem) => boolean): Page<FoldedItem>;
   changesSince(cursor?: string): { events: MemoryEvent[]; cursor: string };
   health(): Health;
   readFolded(): FoldedState;
@@ -212,10 +213,10 @@ export class FileMemoryStore implements MemoryStoreCore {
   classify(classification: Classification, actor: Actor): WriteResult {
     return this.write({ ...classification, ...this.base(actor), type: "classify" });
   }
-  list(query: ItemQuery): Page<FoldedItem> {
+  list(query: ItemQuery, visible?: (item: FoldedItem) => boolean): Page<FoldedItem> {
     const items = Object.values(this.readFolded().items).filter(item => matchesScope(item, query.scopes) &&
       (!query.kind || item.kind === query.kind) && (!query.status || item.status === query.status));
-    return page(items, query);
+    return page(visible ? items.filter(visible) : items, query);
   }
   changesSince(cursor = "0"): { events: MemoryEvent[]; cursor: string } {
     const offset = Number(cursor);

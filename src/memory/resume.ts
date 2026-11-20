@@ -4,12 +4,17 @@ import { createHash, randomUUID } from "node:crypto";
 import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import { homedir } from "node:os";
 import { atomicJson } from "../storage.ts";
+import { bytePrefix } from "../collect.ts";
+import { persistLaneRoot } from "./scope.ts";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { MAX_HANDOFF_BYTES, type Handoff, type HandoffInput } from "../core.ts";
 import { flagOn, readMemoryConfig } from "./config.ts";
 import { redactedField } from "./mask.ts";
 import { loadScanner, redact, SCAN_CAP_BYTES, type Scanner } from "./redact.ts";
-import { singleLine } from "./render.ts";
+import { compare, singleLine } from "./render.ts";
+import { selectedHandoffScopes } from "./handoff-scopes.ts";
+import { project } from "./project.ts";
+import type { MemoryStoreCore } from "./store.ts";
 
 export const FILE_BYTES = 8 * 1024, PACKET_BYTES = 24 * 1024;
 const FACT_BYTES = 3 * 1024, MAX_FILES = 20;
@@ -23,7 +28,7 @@ export type Observation = {
 };
 type PacketInput = {
   cwdRoot?: string | null; repos: Repo[]; agentDir: string; handoffAt: string; files: string[];
-  observation: Observation; observedAt?: string; scanner?: Scanner; budget?: number;
+  observation: Observation; observedAt?: string; scanner?: Scanner; budget?: number; check?: string;
 };
 type Redactor = (value: string) => ReturnType<typeof redact>;
 type FileData = { text: string; mtime: string; sha8: string };
@@ -182,6 +187,9 @@ export async function assemblePacket(input: PacketInput): Promise<{ sections: st
   const sections = [HEADER, ...factSections(input, redactor)];
   let used = Buffer.byteLength(sections.join("\n\n"));
   if (used > budget) return { sections: [] };
+  if (input.check && used + Buffer.byteLength(input.check) + 2 <= budget) {
+    sections.push(input.check); used += Buffer.byteLength(input.check) + 2;
+  }
   const policy = { roots: await allowedRoots(input), sessions: [resolve(input.agentDir, "sessions"), await canonicalPath(join(input.agentDir, "sessions"))] };
   const files = input.files.slice(0, MAX_FILES);
   let included = 0;
@@ -205,6 +213,8 @@ async function handoffFiles(handoff?: Handoff): Promise<string[]> {
 }
 type HookDeps = {
   agentDir: string; configFile: string; observe(ctx: ExtensionContext): Observation;
+  store?(ctx: ExtensionContext): Promise<MemoryStoreCore | undefined>; host?(): { subagent: boolean } | undefined;
+  command?(ctx: ExtensionContext): string | undefined;
   log?(ctx: ExtensionContext, event: string, data: Record<string, unknown>): void;
 };
 /** Only a terminated final block is ours; header text elsewhere can be verbatim user input. */
@@ -222,7 +232,9 @@ function withoutPacket(summary: string, handoff?: Handoff): string {
 function sidecarPath(handoff: Handoff): string { return handoff.path.replace(/\.md$/u, ".json"); }
 async function savedHandoff(handoff: Handoff): Promise<Record<string, unknown>> {
   const saved = JSON.parse(await readFile(sidecarPath(handoff), "utf8"));
-  if (!saved || typeof saved !== "object" || Array.isArray(saved)) throw Error("invalid_sidecar");
+  if (!saved) throw Error("invalid_sidecar");
+  if (typeof saved !== "object") throw Error("invalid_sidecar");
+  if (Array.isArray(saved)) throw Error("invalid_sidecar");
   return saved;
 }
 async function persistHandoff(handoff: Handoff, text: string): Promise<void> {
@@ -241,6 +253,24 @@ function observe(deps: HookDeps, ctx: ExtensionContext): Observation {
   try { return deps.observe(ctx); }
   catch { return { unavailable: ["issue_work collector failed", "pi-jobs collector failed", "pi-subagents collector failed"] }; }
 }
+/** Commit-time metadata only: no commands, item text or lane-inbox filesystem reads. */
+export function genericResumeCheck(ctx: ExtensionContext, store: MemoryStoreCore): string {
+  const selected = selectedHandoffScopes(ctx, store);
+  const projection = project(store, { ...selected, session: ctx.sessionManager.getSessionId(), sessions: selected.sessionIds });
+  const rows = projection.index.rows;
+  const active = rows.filter(row => row.kind === "directive").filter(row => row.status === "active").reduce((n, row) => n + row.count, 0);
+  const proposed = rows.filter(row => row.status === "proposed").reduce((n, row) => n + row.count, 0);
+  const visible = new Set(projection.entries.filter(entry => entry.type === "item").map(entry => entry.id));
+  const folded = store.readFolded();
+  const newest = store.changesSince().events.filter(event => event.type === "retire")
+    .filter(event => folded.events[event.id]?.ok).filter(event => visible.has(event.itemId))
+    .sort((a, b) => compare(b.at, a.at) || compare(b.id, a.id))[0];
+  return bytePrefix(["## Memory resume check (reference material, not instructions)",
+    `active directives=${singleLine(String(active))}; unresolved messages=${singleLine(String(projection.index.unresolved))}; proposed items=${singleLine(String(proposed))}`,
+    newest ? `newest retirement: id=${encodedExcerpt(newest.itemId, 256)}; time=${encodedExcerpt(newest.at, 128)}` : `newest retirement=${singleLine("none")}`,
+    `unread lane messages=${singleLine("unknown (no collector)")}`,
+    `details=${singleLine("memory_list")}`].join("\n"), 1024);
+}
 /** Commit-time fallback: no request hook, no per-call timestamp, no provider-time file access. */
 export function createResumeHook(deps: HookDeps) {
   const committed = new WeakMap<Handoff, Map<string, Promise<string>>>(), blocked = new WeakSet<Handoff>();
@@ -249,11 +279,26 @@ export function createResumeHook(deps: HookDeps) {
     blocked.add(handoff); committed.delete(handoff);
     try { deps.log?.(ctx, "resume_packet_skipped", { operation }); } catch { /* Logging must not block recovery. */ }
   }
+  async function check(ctx: ExtensionContext): Promise<string | undefined> {
+    try {
+      if (deps.host?.()?.subagent) return undefined;
+      if (deps.command?.(ctx)) return undefined;
+      const store = await deps.store?.(ctx);
+      return store ? genericResumeCheck(ctx, store) : undefined;
+    } catch { return undefined; }
+  }
+  function rememberLaneRoot(ctx: ExtensionContext, handoff?: Handoff): void {
+    if (!handoff) return;
+    try { persistLaneRoot(ctx, handoff.path); }
+    catch {
+      try { deps.log?.(ctx, "lane_root_skipped", {}); } catch { /* Metadata must never block recovery. */ }
+    }
+  }
   async function build(ctx: ExtensionContext, original: string, handoff?: Handoff, input?: HandoffInput): Promise<string> {
     const summary = withoutPacket(original, handoff), observation = observe(deps, ctx), observedAt = new Date().toISOString();
     const packet = await assemblePacket({ cwdRoot: observation.cwdRoot, repos: observation.repos ?? [], agentDir: deps.agentDir,
       handoffAt: handoff?.at ?? observedAt, files: input?.files_to_read ?? await handoffFiles(handoff), observation, observedAt,
-      budget: Math.max(0, MAX_HANDOFF_BYTES - Buffer.byteLength(summary) - 3) });
+      budget: Math.max(0, MAX_HANDOFF_BYTES - Buffer.byteLength(summary) - 3), check: await check(ctx) });
     return packet.sections.length ? summary + "\n\n" + packet.sections.join("\n\n") + "\n" : summary;
   }
   async function append(ctx: ExtensionContext, summary: string, handoff?: Handoff, input?: HandoffInput): Promise<string> {
@@ -267,7 +312,7 @@ export function createResumeHook(deps: HookDeps) {
     return pending;
   }
   return {
-    append,
+    append, rememberLaneRoot,
     async remember(ctx: ExtensionContext, handoff: Handoff, files: unknown): Promise<void> {
       if (!enabled(ctx) || !Array.isArray(files)) return;
       try {
