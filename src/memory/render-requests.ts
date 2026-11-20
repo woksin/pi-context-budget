@@ -8,7 +8,7 @@ import { REQUEST_TASK } from "../core.ts";
 export { REQUEST_TASK };
 export type DeliveryRequest = { id: string; text: string | null; withheld?: string | null };
 export type DeliveryAnswer = { id: string; text: string | null; withheld?: string | null; sameRunAsAnswer: boolean };
-export type Delivery = { sessionId: string; requests: DeliveryRequest[]; lastAnswer?: DeliveryAnswer; degraded?: string };
+export type Delivery = { sessionId: string; hasUI?: boolean; requests: DeliveryRequest[]; lastAnswer?: DeliveryAnswer; degraded?: string };
 const bytes = (text: string) => Buffer.byteLength(text);
 
 /** Never split a code point, including when the source has astral characters. */
@@ -24,14 +24,16 @@ function prefix(text: string, budget: number): string {
 function tail(text: string, budget: number): string {
   return [...prefix([...text].reverse().join(""), budget)].reverse().join("");
 }
-function excerpt(text: string, budget: number, head: number): string {
+type AnswerExcerpt = { text: string; budget: number; head: number };
+function excerpt({ text, budget, head }: AnswerExcerpt): string {
   if (bytes(text) <= budget) return text;
   const separator = "\n… [bounded; read pointer for full text] …\n";
   const room = Math.max(0, budget - bytes(separator));
   const first = Math.min(head, Math.max(0, room - Math.min(1536, Math.floor(room / 3))));
   return prefix(text, first) + separator + tail(text, room - first);
 }
-function fence(text: string, nonce: string, id: string): string {
+type FencedData = { text: string; nonce: string; id: string };
+function fence({ text, nonce, id }: FencedData): string {
   return `<<<user-data:${nonce}:${id}>>>\n${text}\n<<<end-user-data:${nonce}:${id}>>>`;
 }
 function requestSection(data: Delivery, budget: number, nonce: string): string {
@@ -43,7 +45,7 @@ function requestSection(data: Delivery, budget: number, nonce: string): string {
     const pointer = `[${request.id}] journal/${data.sessionId}.jsonl#${request.id}`;
     const body = request.text ?? `[withheld: ${request.withheld ?? "unavailable"}]`;
     const clipped = bytes(body) > 2048 ? prefix(body, 2000) + "\n[bounded; read pointer]" : body;
-    const full = `${pointer}\n${fence(clipped, nonce, request.id)}\n`;
+    const full = `${pointer}\n${fence({ text: clipped, nonce, id: request.id })}\n`;
     const fits = used + bytes(full) <= budget;
     if (inline && fits) { lines.push(full); used += bytes(full); continue; }
     inline = false;
@@ -58,12 +60,12 @@ function answerSection(data: Delivery, budget: number, nonce: string): string {
   const answer = data.lastAnswer;
   if (!answer) return "";
   const pointer = `answers/${data.sessionId}.jsonl#${answer.id}`;
-  const heading = "## Last answer before this reset (verbatim, bounded; the user's screen may not show it)\n";
-  const recap = answer.sameRunAsAnswer ? `\nYour last answer may not be visible to the user; start your next message with a short recap (${pointer}).` : "";
-  const fixed = `${heading}${fence("", nonce, answer.id)}\n${pointer}${recap}\n`;
+  const heading = data.hasUI === false ? "## Last answer before this reset (verbatim, bounded)\n" : "## Last answer before this reset (verbatim, bounded; the user's screen may not show it)\n";
+  const recap = answer.sameRunAsAnswer && data.hasUI !== false ? `\nYour last answer may not be visible to the user; start your next message with a short recap (${pointer}).` : "";
+  const fixed = `${heading}${fence({ text: "", nonce, id: answer.id })}\n${pointer}${recap}\n`;
   const text = answer.text ?? `[withheld: ${answer.withheld ?? "unavailable"}]`;
-  const bounded = excerpt(text, Math.max(0, budget - bytes(fixed)), 4096);
-  return heading + fence(bounded, nonce, answer.id) + `\n${pointer}${recap}\n`;
+  const bounded = excerpt({ text, budget: Math.max(0, budget - bytes(fixed)), head: 4096 });
+  return heading + fence({ text: bounded, nonce, id: answer.id }) + `\n${pointer}${recap}\n`;
 }
 /** Pure redacted-data renderer. Budgets are independent of handoff narrative; pointers need only plain file reads. */
 export function renderRequests(data: Delivery, emergency = false): string {

@@ -101,6 +101,36 @@ test("flags-off and flags-on preserve tool and prompt structure; only flags-on w
   assert.equal(existsSync(join(on.home, "journal/s1.jsonl")), true);
 });
 
+test("reset delivery omits screen/recap wording only for explicit no-UI sessions, keeping the bounded answer", async () => {
+  const h = await harness();
+  await h.human("work");
+  await h.assistant([text("Answer head " + "x".repeat(16000) + " answer tail")]);
+  await h.fire("session_compact", { reason: "manual", compactionEntry: { id: "ui-boundary" } });
+  for (const hasUI of [false, true, undefined]) {
+    const ctx = { ...h.ctx, hasUI } as ExtensionContext;
+    const hook = createRequestsHook({ agentDir: h.agentDir, configFile: h.configFile, host: () => undefined, log() {} });
+    hook.reload();
+    const carrier = await hook.context({ type: "context", messages: [] }, ctx);
+    assert.ok(carrier?.messages);
+    const outputs = [await hook.render(ctx), await hook.render(ctx, true), (await hook.handoff(ctx)).requests,
+      String((carrier.messages.at(-1) as { content: string }).content)];
+    for (const output of outputs) {
+      assert.match(output, /## Last answer before this reset \(verbatim, bounded/);
+      assert.match(output, /Answer head/);
+      assert.match(output, /answer tail/);
+      assert.match(output, /answers\/s1.jsonl#/);
+      assert.match(output, /bounded; read pointer/);
+      assert.ok(Buffer.byteLength(output) <= 12 * 1024);
+      if (hasUI === false) {
+        assert.doesNotMatch(output, /the user's screen may not show it|Your last answer may not be visible|start your next message with a short recap/);
+      } else {
+        assert.match(output, /the user's screen may not show it/);
+        assert.match(output, /Your last answer may not be visible to the user; start your next message with a short recap/);
+      }
+    }
+  }
+});
+
 test("request opens on human input, a final stop answer closes it, interim answers do not", async () => {
   const h = await harness();
   await h.human("do the thing");

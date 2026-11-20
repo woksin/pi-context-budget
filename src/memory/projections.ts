@@ -1,6 +1,7 @@
 import { closeSync, constants, fstatSync, lstatSync, openSync, opendirSync, readSync, realpathSync } from "node:fs";
 import { basename, join, relative, isAbsolute, sep } from "node:path";
 import { canonicalRemote } from "./handoff-scopes.ts";
+import { singleLine } from "./render.ts";
 import type { FoldedItem, Scope } from "./types.ts";
 
 export const QUESTION_LIMITS = Object.freeze({ files: 128, bytes: 64 * 1024, entries: 4096 });
@@ -8,7 +9,7 @@ type Counts = { read: number; ignored: number; malformed: number; unknown: numbe
 type Repository = { root: string; remote?: string };
 type Options = { agentDir: string; repo?: Repository; env?: Record<string, string | undefined> };
 type Question = { id: string; title: string; body: string; repo: string | null; status: string;
-  updatedAt: string; history: unknown[]; options?: { key: string; text: string }[]; answer?: { text: string; option?: string } };
+  updatedAt: string; history: unknown[]; asker?: { lane?: unknown; sessionId?: unknown }; options?: { key: string; text: string }[]; answer?: { text: string; option?: string } };
 const statuses = ["open", "answered", "decided", "deferred", "withdrawn", "superseded", "closed"];
 
 /** Enumeration is bounded too. Never use a partial revision listing to select stale history. */
@@ -83,21 +84,46 @@ function repoMatches({ recorded, repo, remote }: { recorded: string; repo: Repos
   const name = remote.split("/").filter(Boolean).slice(-2).join("/");
   return [repo.root, name, remote].includes(recorded) || canonicalRemote(recorded) === remote;
 }
-function questionScope({ recorded, repo }: { recorded: string | null; repo?: Repository }): Scope {
-  if (recorded === null) return { kind: "global", key: "*" };
+function originKey(value: unknown): string { return typeof value === "string" ? value.trim() : ""; }
+function questionOriginScope(item: Question): Scope {
+  const lane = originKey(item.asker?.lane);
+  if (lane) return { kind: "lane", key: `orch:${lane}` };
+  const session = originKey(item.asker?.sessionId);
+  if (session) return { kind: "session", key: session };
+  // Unattributed questions remain in user_questions, but match no handoff scope.
+  return { kind: "task", key: `question_item:${item.id}` };
+}
+function questionScope({ item, repo }: { item: Question; repo?: Repository }): Scope {
+  const recorded = item.repo;
+  if (recorded === null) return questionOriginScope(item);
   const remote = canonicalRemote(repo?.remote);
   if (repo && repoMatches({ recorded, repo, remote })) return { kind: "repo", key: remote ?? repo.root };
   return { kind: "repo", key: recorded };
 }
-function answerText(item: Question): string[] {
-  const answer = item.answer!;
-  if (answer.option === undefined) return [answer.text];
-  return [`${answer.option}: ${selectedOption(item)!.text}`, answer.text];
+const encodedBytes = (text: string) => Buffer.byteLength(singleLine(text)) - 2;
+/** Bound encoded fields without splitting Unicode characters or expanding control characters past the budget. */
+function questionExcerpt(text: string, budget: number): string {
+  if (encodedBytes(text) <= budget) return text;
+  let result = "", used = 0;
+  for (const character of text) {
+    used += encodedBytes(character);
+    if (used > budget - 3) break;
+    result += character;
+  }
+  return result + "…";
+}
+function decisionText(item: Question): string {
+  const fields = [item.title, selectedOption(item)?.text ?? "", item.answer!.text];
+  const fixed = `${item.id}  ->  ("")`;
+  // Leave room for the [inline] label and JSON encoding within a 300-byte line.
+  const budget = Math.max(0, Math.floor((288 - Buffer.byteLength(singleLine(fixed))) / fields.length));
+  const [title, choice, answer] = fields.map(text => questionExcerpt(text, budget));
+  return `${item.id} ${title} -> ${[choice, `("${answer}")`].filter(Boolean).join(" ")}`;
 }
 function projected(item: Question, repo?: Repository): FoldedItem {
   const id = `question_item:${item.id}`;
-  return { id, kind: "decision", scope: questionScope({ recorded: item.repo, repo }),
-    text: [item.title, item.body, ...answerText(item)].join("\n"), source: { type: "question_item", ref: item.id },
+  return { id, kind: "decision", scope: questionScope({ item, repo }),
+    text: decisionText(item), source: { type: "question_item", ref: item.id },
     supersedes: [], status: "active", at: item.updatedAt, eventId: id, changedBy: id };
 }
 function readItem({ root, id, options, counts }: { root: string; id: string; options: Options; counts: Counts }): FoldedItem | undefined {

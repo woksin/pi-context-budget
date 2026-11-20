@@ -34,11 +34,14 @@ function sourcePointer(item: FoldedItem): string {
 function itemRecord(item: FoldedItem): RenderRecord {
   const scope = `${singleLine(item.scope.kind)}:${singleLine(item.scope.key)}`, pointer = sourcePointer(item);
   const titles = { directive: "User directives (verbatim, from source)", order: "Coordinator orders", decision: "Agent decisions" };
-  const section = item.status === "proposed" ? "Proposed directives (not binding)" : titles[item.kind];
+  const question = item.kind === "decision" && item.source.type === "question_item";
+  const title = question ? "User decisions (question store)" : titles[item.kind];
+  const section = item.status === "proposed" ? "Proposed directives (not binding)" : title;
   const identity = `[${singleLine(item.id)}] (${scope}, ${pointer}, ${singleLine(item.at)})`;
   const gloss = item.gloss ? `\nagent gloss: ${singleLine(item.gloss)}` : "";
   return { id: item.id, type: "item", scope: item.scope, at: item.at, section,
-    full: `${identity} ${singleLine(item.text)}${gloss}`, pointer: `${identity} ${singleLine(pointerExcerpt(item.text))}`,
+    full: question ? singleLine(item.text) : `${identity} ${singleLine(item.text)}${gloss}`,
+    pointer: question ? pointer : `${identity} ${singleLine(pointerExcerpt(item.text))}`,
     eligible: item.status === "active" || item.status === "proposed", withheld: false };
 }
 function messageRecord(entry: JournalEntry, disposition: Disposition): RenderRecord {
