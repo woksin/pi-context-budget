@@ -9,7 +9,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 const base = resolve(import.meta.dirname, "../.ai-work/hooks");
 mkdirSync(base, { recursive: true });
 const required = { goal: "finish", next_step: "write result", facts: "Read part one" };
-async function harness(mode = "enforce", overrides: Record<string, unknown> = {}, withGuard = false, hosts = new SessionHosts()) {
+async function harness(mode = "enforce", overrides: Record<string, unknown> = {}, withGuard = false, hosts = new SessionHosts(), activeTools = ["read", "context_handoff"]) {
   const dir = mkdtempSync(join(base, "case-"));
   process.env.PI_CODING_AGENT_DIR = join(dir, "agent");
   process.env.PI_CONTEXT_BUDGET_CONFIG = join(dir, "config.json");
@@ -24,7 +24,8 @@ async function harness(mode = "enforce", overrides: Record<string, unknown> = {}
   const handlers = new Map<string, (e: any, ctx: ExtensionContext) => Promise<any>>();
   let tool: any;
   const notifications: string[] = [], footer: (string | undefined)[] = [];
-  const pi = { on: (name: string, handler: any) => { handlers.set(name, handler); }, registerTool: (value: any) => { tool = value; } } as unknown as ExtensionAPI;
+  const pi = { on: (name: string, handler: any) => { handlers.set(name, handler); }, registerTool: (value: any) => { tool = value; },
+    getActiveTools: () => activeTools, getAllTools: () => [{ name: "read" }, { name: "context_handoff" }] } as unknown as ExtensionAPI;
   let usage: number | null = 100, shutdown = 0, compact = 0;
   const branch: any[] = [];
   const sid = `test-${dir.split("/").at(-1)}`;
@@ -756,6 +757,29 @@ test("the required notice rides a continuing turn without continue; status shows
   assert.deepEqual(h.status().effectiveThresholds, { soft: 150, handoff: 250 });
   assert.equal(await h.emit("turn_end", event(300, [{}])), undefined);
 });
+for (const role of ["subagent", "main without handoff tool"] as const) {
+  for (const tokens of [100, 200, 1200]) test(`${role} at ${tokens} tokens asks for a final answer without blocking or steering`, async () => {
+    const hosts = new SessionHosts();
+    if (role === "subagent") hosts.acquire("parent");
+    const h = await harness("enforce", { subagent: { soft: 100, handoff: 200, hard: 1000, minProgress: 50 } }, false, hosts,
+      role === "subagent" ? ["read", "context_handoff"] : ["read"]);
+    await h.turn(100); // Establish a floor; the notice must also reach a later continuing turn.
+    h.setTokens(tokens);
+    const result = await h.emit("turn_end", { message: { role: "assistant", usage: { input: tokens, output: 0, cacheRead: 0, cacheWrite: 0 } }, toolResults: [{}] });
+    assert.equal(result.continue, undefined);
+    assert.match(result.entries[0].content, /finish/i);
+    assert.match(result.entries[0].content, /final answer/i);
+    assert.doesNotMatch(result.entries[0].content, /STATE\.md|context_handoff/);
+    assert.doesNotMatch(h.notifications.join("\n"), /state file|STATE\.md|context_handoff|prepare a handoff/);
+    for (const toolName of ["read", "bash", "edit", "write"]) {
+      assert.equal(await h.emit("tool_call", { toolName, toolCallId: toolName, input: {} }), undefined);
+    }
+    assert.equal(await h.emit("agent_before_settle"), undefined);
+    assert.equal(await h.emit("agent_settled", { aborted: false }), undefined);
+    assert.deepEqual(h.counters(), { shutdown: 0, compact: 0 });
+    assert.equal(h.status().action, "soft");
+  });
+}
 test("soft model notice rides the next continuing turn without an extra request", async () => {
   const h = await harness();
   assert.equal(await h.turn(100), undefined);
@@ -765,6 +789,7 @@ test("soft model notice rides the next continuing turn without an extra request"
   const result = await h.emit("turn_end", event);
   assert.equal(result.continue, undefined);
   assert.equal(result.entries[0].customType, "context-budget");
+  assert.equal(result.entries[0].content, "Context budget: soft threshold reached. Finish the current atomic step, bring .ai-work/<task>/STATE.md up to date (and any task notes), and prepare your handoff; call context_handoff at the next safe point. The handoff becomes mandatory at the handoff threshold, after which only a few state-recording calls are allowed.");
   assert.match(result.entries[0].content, /STATE\.md/);
   assert.match(result.entries[0].content, /prepare your handoff/);
   assert.equal(await h.emit("turn_end", event), undefined);

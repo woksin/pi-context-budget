@@ -108,6 +108,8 @@ Configured/effective mode differences are shown in the footer, for example
 
 ## Handoff policy
 
+Subagents and sessions without an active `context_handoff` tool receive a finish-and-return-final-answer notice instead of handoff instructions; budget thresholds never block their tools or request a handoff continuation.
+
 Thresholds are floor-relative. With a known floor, the effective handoff threshold is `min(hard, max(handoff, floor + minProgress))` and the effective soft threshold is `min(handoff', max(soft, handoff' - (handoff - soft)))`: `soft` and `handoff` are minimums, `minProgress` is the floor-relative knob, and `hard` is always absolute and wins. For prompt-heavy installs (floor around 150k) with soft 150000 / handoff 220000 / hard 400000, set `main.minProgress: 120000`: soft at about 200k, handoff at about 270k, about 120k of progress per reset instead of about 70k. The status file shows `effectiveThresholds`. The live config is the user's to change; this package never edits it.
 
 1. **Soft:** one UI advisory per crossing asks the agent to finish the current atomic step, update `.ai-work/<task>/STATE.md` and task notes, and prepare a handoff. A model-visible message is appended at the next continuing `turn_end` (tool results), without an extra provider call; a non-continuing turn only notifies the user.
