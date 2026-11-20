@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
-import { recallHistory, createRecallHook, RECALL_BANNER, FILE_CAP_BYTES } from "../src/memory/recall.ts";
+import { recallHistory, createRecallHook, RECALL_BANNER, FILE_CAP_BYTES, SCAN_FILE_CAP, TOTAL_READ_CAP_BYTES } from "../src/memory/recall.ts";
 import { redact } from "../src/memory/redact.ts";
 import { createContextBudgetExtension } from "../src/extension.ts";
 import { SessionHosts } from "../src/storage.ts";
@@ -47,6 +47,18 @@ test("old tool results are redacted at return with and without the external scan
   }
 });
 
+test("secret prefixes cannot probe either redaction pass; safe words on the same line still match", async () => {
+  const f = fixture(), secret = canary(), externalSecret = ["external", "-", "hidden-value"].join("");
+  f.transcript(f.sessionFile, "main", [f.entry("secret-line", "toolResult", `needle ${secret} ${externalSecret}`)]);
+  const scanner = (text: string) => ({ text: text.replace(externalSecret, "[REDACTED:external]"), kinds: [], count: 0, skipped: false });
+  for (const prefix of [secret.slice(0, 6), externalSecret.slice(0, 10)]) {
+    assert.equal(await f.search(prefix, {}, { scanner }), RECALL_BANNER + "\n");
+    assert.equal(await f.search(prefix + "wrong", {}, { scanner }), RECALL_BANNER + "\n");
+  }
+  const safe = await f.search("needle", {}, { scanner });
+  assert.match(safe, /secret-line/); assert.match(safe, /REDACTED:github-token/); assert.match(safe, /REDACTED:external/);
+});
+
 test("both scanner passes run, failures withhold only that hit, including its metadata", async () => {
   const f = fixture();
   f.journal("bad", "needle external-value " + canary(), { injectedFrom: canary() }); f.journal("good", "needle safe");
@@ -78,6 +90,58 @@ test("files over 200 MiB are skipped with a note; oversized lines do not hide fo
   assert.match(await f.search(), /skipped.*200 MiB/);
   writeFileSync(f.sessionFile, "x".repeat(5 * 1024 * 1024) + "\n" + JSON.stringify(f.entry("after-line", "toolResult", "needle")) + "\n");
   assert.match(await f.search(), /after-line/);
+});
+
+test("an unrelated session header stops the read before its large body exhausts the shared budget", async () => {
+  const f = fixture(), foreign = join(f.home, "foreign"), permitted = join(f.home, "permitted");
+  mkdirSync(foreign); mkdirSync(permitted);
+  const file = join(foreign, "foreign.jsonl"); f.transcript(file, "unrelated", []);
+  truncateSync(file, TOTAL_READ_CAP_BYTES + 1024);
+  f.transcript(join(permitted, "previous.jsonl"), "previous", [f.entry("permitted-hit", "toolResult", "needle")]);
+  const output = await f.search("needle", { scope: "lane" }, { transcriptRoots: [foreign, permitted, f.transcriptRoot], chainSessionIds: ["main", "previous"] });
+  assert.match(output, /permitted-hit/); assert.doesNotMatch(output, /byte read cap/);
+});
+
+test("file count and total byte budgets stop scans with a note", async () => {
+  const f = fixture();
+  for (let i = 0; i < SCAN_FILE_CAP + 5; i++) f.transcript(join(f.transcriptRoot, `${i}.jsonl`), `other-${i}`, [f.entry(`entry-${i}`, "toolResult", "unmatched")]);
+  let bodies = 0;
+  const output = await f.search("absent", { scope: "all" }, { redactor: (text: string) => { bodies++; return redact(text); } });
+  assert.match(output, /file scan cap/); assert.equal(bodies, SCAN_FILE_CAP - 1);
+  const large = fixture(); truncateSync(large.sessionFile, TOTAL_READ_CAP_BYTES + 1024);
+  const bounded = await large.search(); assert.match(bounded, /total byte read cap/);
+  assert.ok(Buffer.byteLength(bounded) <= 16 * 1024);
+});
+
+test("hydrated blobs also consume the shared byte budget", async () => {
+  const f = fixture(), body = "x".repeat(2 * 1024 * 1024), hash = createHash("sha256").update(body).digest("hex"), bytes = Buffer.byteLength(body);
+  mkdirSync(join(f.memoryHome, "blobs")); writeFileSync(join(f.memoryHome, "blobs", `${hash}.txt`), body);
+  for (let i = 0; i < 20; i++) f.journal(`blob-${i}`, "preview", { blob: { sha256: hash, bytes }, sha256: hash, textBytes: bytes });
+  const output = await f.search("absent", {}, { redactor: (text: string) => ({ text, withheld: null, redactions: [] }) });
+  assert.match(output, /total byte read cap/);
+});
+
+test("abort stops before any reads and between files", async () => {
+  const f = fixture(), controller = new AbortController(); controller.abort();
+  let scanned = 0;
+  const deps = { ...f.deps, redactor: (text: string) => { scanned++; return redact(text); } };
+  const stopped = await recallHistory({ query: "needle", scope: "all", origin: "any" }, deps, controller.signal);
+  assert.match(stopped, /recall aborted/); assert.equal(scanned, 0);
+  f.journal("first", "needle first"); f.transcript(f.sessionFile, "main", [f.entry("later", "toolResult", "needle later")]);
+  const during = new AbortController();
+  const output = await recallHistory({ query: "needle", origin: "any" }, { ...f.deps, redactor: (text: string) => { during.abort(); return redact(text); } }, during.signal);
+  assert.match(output, /recall aborted/); assert.doesNotMatch(output, /needle later/);
+});
+
+test("absolute paths are masked before matching and snippet boundaries preserve surrogate pairs", async () => {
+  const f = fixture(), windows = ["C:", "work", "file.txt"].join("\\");
+  f.transcript(f.sessionFile, "main", [f.entry("paths", "toolResult", `needle local=${f.home}/file.txt root=/opt/private/file.txt home=~/private/file.txt win=${windows} https://example.test/item`)]);
+  const paths = await f.search(); assert.match(paths, /REDACTED:path/); assert.ok(!paths.includes(f.home)); assert.ok(!paths.includes(windows));
+  assert.doesNotMatch(paths, /\/opt\/private|~\/private/); assert.match(paths, /https:\/\/example\.test\/item/);
+  assert.equal(await f.search(f.home), RECALL_BANNER + "\n");
+  f.transcript(f.sessionFile, "main", [f.entry("unicode", "toolResult", "😀" + "x".repeat(255) + "needle")]);
+  const output = await f.search(), encoded = output.match(/text=("(?:\\.|[^"\\])*")/)![1];
+  assert.equal([...JSON.parse(encoded)][0], "😀");
 });
 
 test("session excludes other journals/transcripts; lane is chain identity, all alone includes children", async () => {
@@ -161,6 +225,9 @@ test("extension binds recall to the main host only and rollback stops reads", as
   const call = () => tool.execute("id", { query: "needle", origin: "any" }, undefined, undefined, main.ctx);
   const result = await call(); assert.match(result.content[0].text, /old-result/); assert.ok(!JSON.stringify(result).includes(canary()));
   assert.deepEqual(result.details, {}); assert.equal(existsSync(join(f.memoryHome, "events.jsonl")), false);
+  const stopped = new AbortController(); stopped.abort();
+  const aborted = await tool.execute("id", { query: "needle", origin: "any" }, stopped.signal, undefined, main.ctx);
+  assert.match(aborted.content[0].text, /recall aborted/); assert.doesNotMatch(aborted.content[0].text, /old-result/);
   configure(false); assert.equal((await call()).content[0].text, "memory disabled");
 });
 
