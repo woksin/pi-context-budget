@@ -286,6 +286,16 @@ Records carry CRC32 of their JSON body without `crc`. Each append is one write o
 
 Directive authority is checked again at fold time against journal provenance. Without an injected `EligibilityCheck`, automatic directives remain proposed; a valid human `/directive ` source or human UI confirmation can activate them. Orders require an explicit coordinator allowlist. `readFolded()`, paging and the capability-labelled core conformance suite provide the seam for later projections and alternative backends.
 
+## Intent-memory projection (inert)
+
+`withProjection(core)` in `src/memory/project.ts` adds `project({scopes, session, budgets?})` and `listMessages({unresolvedOnly: true, ...})` to any `MemoryStoreCore`; `session` is the journal session id. It is not wired into the extension or the existing request/answer renderer. Constructing the wrapper does not write or read the store.
+
+Projection returns `text`, byte-bounded `sections`, per-record `entries` labelled `inline`, `pointer` or `index-only`, tier `counts`, and a structured `index`. Defaults are 20 KiB total: 8 KiB items, 8 KiB unresolved human messages in the selected session, 4 KiB index, with a shared 3 KiB pointer sub-budget. Headings and metadata count toward these UTF-8 byte limits. Optional budgets can reduce these caps; the mandatory index needs at least 512 bytes and total must cover it (`invalid_projection_budget` otherwise). Inline selection prefers more-specific scopes, then recency; display order is stable, general-to-specific then id, within the prescribed sections. Proposed directives have a separate, non-binding heading.
+
+Every scoped item (including retired items) and every selected human message is counted; resolved messages and retired items are index-only. Large indexes coarsen to scope totals, then overall totals; complete structured counts remain available, and `memory_list scope=<..> cursor=<..>` / `recall ...` describe the future tool paging seam, not tools registered by this slice. More than 50 active items in a scope produces a hygiene warning. Withheld messages use reason-bearing pointers when space permits, never invented text.
+
+`src/memory/spans.ts` derives dispositions solely from accepted folded events: directive adds cover only their source spans, explicit classifications union coverage, and whitespace needs no classification. Any uncovered remainder repeats on every projection until resolved, independently of boundaries. Explicit `whole: "none"` dispositions retain their reasons in the index. Filtered message paging applies resolution before pagination; callers can still page or search resolved messages through the core.
+
 ## Intent-memory origin gate (inert)
 
 `src/memory/origin.ts` exports the pure `classifyOrigin(input, context)` gate. It is pure and does not write memory; the flag-gated journal hook (below) is its only caller. S3b must check `enabled && journal` before any store or journal access, supply trusted adapter facts, and skip writes when `journal` is false. Input text, tool arguments and model claims must never supply these facts.

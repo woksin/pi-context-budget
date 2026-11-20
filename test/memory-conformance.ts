@@ -20,9 +20,50 @@ export function directive(source: MessageInput, overrides: Partial<Item> = {}): 
     span: { start: 0, end: source.text!.length } }, authority: { mode: "none", ruleVersion: 1 }, ...overrides });
 }
 
-/** Backends register only capabilities they implement; projection is added by S2b. */
-export function memoryConformance(capability: "core", create: () => MemoryStoreCore): void {
-  assert.equal(capability, "core");
+import type { MemoryStore } from "../src/memory/project.ts";
+
+function projectionConformance(create: () => MemoryStore): void {
+  test("projection: bounded, deterministic, counted and unresolved until fully classified", () => {
+    const store = create(), entry = message({ text: "First\nSecond" });
+    store.appendMessage(entry);
+    store.addItem(directive(entry, { text: "First", source: { type: "user_message", ref: entry.id, span: { start: 0, end: 5 } } }), agent);
+    const query = { scopes: [{ kind: "global" as const, key: "*" }], session: entry.session.id };
+    for (let boundary = 0; boundary < 3; boundary++) {
+      const result = store.project(query);
+      assert.deepEqual(store.project(query), result);
+      assert.ok(Buffer.byteLength(result.text) <= 20 * 1024);
+      assert.equal(result.index.unresolved, 1);
+      assert.match(result.text, /Second/);
+      assert.equal(result.counts.inline + result.counts.pointer + result.counts.indexOnly, result.entries.length);
+      store.addItem(decision(), agent);
+    }
+    store.classify({ messageId: entry.id, whole: "none", spans: [], reason: "No further binding intent" }, agent);
+    assert.equal(store.project(query).index.unresolved, 0);
+    assert.equal(store.listMessages({ unresolvedOnly: true, limit: 10 }).items.length, 0);
+  });
+  test("projection: withheld reasons, non-binding proposals, UTF-8 quotas and paging", () => {
+    const store = create(), withheld = message({ text: null, withheld: "too_large" });
+    store.appendMessage(withheld);
+    const entry = message({ text: "漢😀".repeat(1000) });
+    store.appendMessage(entry);
+    store.addItem(directive(entry), agent);
+    const result = store.project({ scopes: [{ kind: "global", key: "*" }], session: "session",
+      budgets: { total: 2048, items: 512, messages: 1024, index: 512 } });
+    assert.ok(Buffer.byteLength(result.text) <= 2048);
+    assert.equal(Buffer.from(result.text).toString("utf8"), result.text);
+    assert.equal(result.entries.find(row => row.id === withheld.id)?.label, "pointer");
+    assert.match(result.text, /withheld: too_large/);
+    assert.match(result.text, /Proposed directives \(not binding\)/);
+    assert.equal(result.index.proposed, 1);
+    assert.equal(store.listMessages({ unresolvedOnly: true, limit: 1 }).items[0].id, withheld.id);
+  });
+}
+
+/** Backends register only capabilities they implement. */
+export function memoryConformance(capability: "core", create: () => MemoryStoreCore): void;
+export function memoryConformance(capability: "projection", create: () => MemoryStore): void;
+export function memoryConformance(capability: "core" | "projection", create: () => MemoryStoreCore): void {
+  if (capability === "projection") { projectionConformance(create as () => MemoryStore); return; }
   test("core: idempotent add by item id and message id", () => {
     const store = create(), entry = message(), item = decision();
     assert.deepEqual(store.appendMessage(entry), store.appendMessage({ ...entry, text: "ignored" }));
