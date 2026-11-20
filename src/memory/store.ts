@@ -1,7 +1,7 @@
 import { mkdirSync, chmodSync, readdirSync, readFileSync, openSync, writeFileSync, fsyncSync, closeSync, renameSync, unlinkSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { appendRecord, scanLog, JOURNAL_LINE_BYTES } from "./log.ts";
 import { foldEvents, rejection } from "./fold.ts";
 import { requireValid, safeName, utf8Head, validateEvent, validateMessage, ValidationError } from "./validate.ts";
@@ -25,6 +25,9 @@ export interface MemoryStoreCore {
   readFolded(): FoldedState;
 }
 export type StoreOptions = FoldOptions & { agentDir?: string; home?: string; redactor?: Redactor };
+/** Where the store keeps its files; resolving it never touches the disk. */
+export const memoryHome = (options: { home?: string; agentDir?: string }): string =>
+  options.home ?? process.env.PI_MEMORY_HOME ?? join(options.agentDir ?? join(homedir(), ".pi", "agent"), "memory");
 const digest = (text: string) => createHash("sha256").update(text).digest("hex");
 function privateDirectory(directory: string): void {
   mkdirSync(directory, { recursive: true, mode: 0o700 });
@@ -138,15 +141,15 @@ export class FileMemoryStore implements MemoryStoreCore {
   private readonly options: StoreOptions;
   constructor(options: StoreOptions = {}) {
     this.options = options;
-    this.home = options.home ?? process.env.PI_MEMORY_HOME ?? join(options.agentDir ?? join(homedir(), ".pi", "agent"), "memory");
+    this.home = memoryHome(options);
     for (const directory of [this.home, ...["journal", "answers", "blobs"].map(name => join(this.home, name))]) privateDirectory(directory);
   }
   private journalFiles(): string[] {
     return readdirSync(join(this.home, "journal")).filter(name => /^[A-Za-z0-9_-]{1,200}\.jsonl$/.test(name)).sort().map(name => join(this.home, "journal", name));
   }
-  private messages(): JournalEntry[] {
+  private messages(hidden?: ReadonlySet<string>): JournalEntry[] {
     const entries = new Map<string, JournalEntry>();
-    for (const file of this.journalFiles()) for (const entry of readJournal(this.home, file)) if (!entries.has(entry.id)) entries.set(entry.id, entry);
+    for (const file of this.journalFiles().filter(path => !hidden?.has(basename(path)))) for (const entry of readJournal(this.home, file)) if (!entries.has(entry.id)) entries.set(entry.id, entry);
     return [...entries.values()];
   }
   appendMessage(input: MessageInput): JournalEntry {
@@ -183,6 +186,10 @@ export class FileMemoryStore implements MemoryStoreCore {
   }
   readFolded(): FoldedState {
     return foldEvents(scanLog(join(this.home, "events.jsonl")).records, this.messages(), this.options);
+  }
+  /** Retention verification: the projection as if the named journal files (basenames) did not exist. Reads only. */
+  readFoldedWithout(hidden: ReadonlySet<string>): FoldedState {
+    return foldEvents(scanLog(join(this.home, "events.jsonl")).records, this.messages(hidden), this.options);
   }
   private appendEvent(event: MemoryEvent): WriteResult {
     try { appendRecord(join(this.home, "events.jsonl"), event); }
