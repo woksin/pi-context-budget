@@ -110,6 +110,11 @@ test("journal stays off when any memory value is invalid; the log holds no confi
   h.setRaw(`{ "memory": "${canary}`);
   await h.input("c");
   assert.ok(!JSON.stringify(h.events()).includes(canary));
+  const excerpt = j("zq", "9xk"); // short enough for the runtime to quote it whole in the parse error
+  h.setRaw(`K=${excerpt}`);
+  await h.input("d");
+  assert.ok(h.events().some(e => e.event === "config_error"));
+  assert.ok(!JSON.stringify(h.events()).includes(excerpt));
 });
 
 test("no-UI sessions are journaled as unattended, never human", async () => {

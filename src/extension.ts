@@ -48,7 +48,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
     function reload(ctx: ExtensionContext): void {
       journal.reload(ctx);
       try { config = parseConfig(existsSync(configFile) ? JSON.parse(readFileSync(configFile, "utf8")) : {}); }
-      catch (error) { config = parseConfig({}); log(ctx, "config_error", { error: String(error), mode: "observe" }); }
+      catch (error) { config = parseConfig({}); log(ctx, "config_error", { error: error instanceof SyntaxError ? "invalid_json" : "unreadable", mode: "observe" }); }
     }
     const ref = (ctx: ExtensionContext) => ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "unknown";
     function modeStatus(ctx: ExtensionContext) {
