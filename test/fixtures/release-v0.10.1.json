@@ -1,0 +1,126 @@
+{
+  "handoff": "# Handoff s-1\n\nTimestamp: fixture-time\nHandoff file: /fixture/.ai-work/handoffs/s-1.md\n\n## Goal\nwork\n\n## Verified facts (agent-reported; verify before relying on them)\nverified\n\n## Next step\ncontinue\n\n## Automatically collected state\nCwd: /fixture\nRepository root: /fixture\nBranch: fixture\nHEAD: unknown\nWorking tree:\nclean\nSync: no upstream\nLaunch prompt: not supplied\nRepositories touched:\n/fixture | fixture | unknown | dirty 0 | no upstream\nRunning jobs / watches:\nnone\nRunning subagents:\nnone\nScheduled agents:\nnone exposed\nFinished jobs — Finished since last handoff (results not yet acted on):\nnone\nIssue claims: []\nUnavailable: pi-subagents registry absent, scheduled agents: not exposed by registry, pi-jobs registry absent, issue_work registry absent/unreadable\n\nResume now from Next step without asking the user. Verify current git HEAD and re-establish external state before trusting prior review/CI/issue facts.\n",
+  "providerContexts": [
+    [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "same task"
+          }
+        ],
+        "timestamp": 0
+      }
+    ],
+    [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "after reset"
+          }
+        ],
+        "timestamp": 1
+      }
+    ]
+  ],
+  "tools": [
+    {
+      "name": "context_handoff",
+      "label": "Context handoff",
+      "description": "Write a concise structured handoff, then END THIS TURN without more tools. Recovery continues automatically; an idle request resets the context at the end of this turn. Separate facts from hypotheses and preserve user constraints verbatim.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "goal": {
+            "type": "string",
+            "minLength": 1,
+            "description": "What the session is trying to achieve."
+          },
+          "next_step": {
+            "type": "string",
+            "minLength": 1,
+            "description": "The single next action to take on resume."
+          },
+          "facts": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Verified facts only; verify before relying on them."
+          },
+          "decisions": {
+            "type": "string",
+            "description": "Decisions made and why."
+          },
+          "user_constraints": {
+            "type": "string",
+            "description": "User constraints, verbatim."
+          },
+          "open_items": {
+            "type": "string",
+            "description": "Unfinished work and open questions."
+          },
+          "hypotheses": {
+            "type": "string",
+            "description": "Unverified theories, kept separate from facts."
+          },
+          "files_to_read": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "description": "ABSOLUTE path (relative paths are resolved against the cwd)."
+            },
+            "description": "Existing files to read first on resume; relative paths resolve against cwd. Keep state files current."
+          },
+          "watch_actions": {
+            "type": "array",
+            "maxItems": 20,
+            "description": "Required for each running watch/job/subagent. Use its exact id (or a unique prefix of at least 8 characters), target and completion follow-up.",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 300
+                },
+                "target": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 300
+                },
+                "on_complete": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 300
+                },
+                "cancel": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 300
+                }
+              },
+              "required": [
+                "id",
+                "target",
+                "on_complete"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "launch_prompt": {
+            "type": "string",
+            "description": "Optional. The prompt to start the relaunched session with: either the prompt text (saved to a file for you) or an ABSOLUTE path to an existing file containing it."
+          }
+        },
+        "required": [
+          "goal",
+          "next_step",
+          "facts"
+        ],
+        "additionalProperties": false
+      }
+    }
+  ]
+}

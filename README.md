@@ -345,14 +345,18 @@ node eval/origin-matrix.mjs "$HOME/.local/share/pi-runtime/lib/node_modules/@ear
 
 ## Intent-memory journal (`memory.journal`, off by default)
 
-With the `memory` block absent, or `journal` not `true`, the extension behaves exactly as before: no memory directory is created, the store module is never loaded, the tool list and prompt are unchanged. The block lives in `context-budget.json`:
+With the `memory` block absent, all memory features are off: no memory directory is created, the store module is never loaded, the tool list and prompt are unchanged. The block lives in `context-budget.json`. **Stage 0** explicitly disables every boolean flag:
 
 ```json
-{ "memory": { "journal": false, "requests": false, "answers": "final", "answerPolicy": "carry", "intent": false,
-  "resume": false, "recall": false, "scope": { "mode": "only", "names": [] }, "coordinators": [], "trustRpc": false } }
+{ "memory": { "journal": false, "requests": false, "intent": false, "resume": false, "recall": false,
+  "scope": { "mode": "only", "names": [] }, "coordinators": [], "trustRpc": false } }
 ```
 
-**Fail closed.** A missing block, a missing flag, an invalid value or a parse error means `false`; the reason is logged once as `memory_config_invalid` in the event log. `scope.mode: "only"` with empty `names` is nobody, names match the session name, and everyone must be spelled `{"mode":"all"}`. `requests` needs `journal`. The file is re-read on every input and at session start, so journal on/off applies without a restart. Tools (none ship in this slice) are registered at load only when a tool-bearing flag (`intent`, `recall`) is true then; each call re-checks flags and answers `memory disabled` when off, so rollback is immediate, while enabling a tool for an already-running session needs a restart (`registerMemoryTool`).
+The shipped defaults for `memory.journal`, `memory.requests`, `memory.intent`, `memory.resume`, `memory.recall` and `memory.trustRpc` are all `false`. `memory.scope` defaults to `{"mode":"only","names":[]}` (nobody), and `memory.coordinators` to `[]` (no trusted coordinators). `memory.answers` and `memory.answerPolicy` also default to `false` when omitted; leave them omitted in stage 0, since explicit `false` is not a valid enum value. When requests are enabled, their effective behaviors are `"final"` and `"carry"`; opt into `"all"` or `"defer"` explicitly.
+
+**Fail closed.** A missing block, a missing flag, an invalid value or a parse error means `false`; the reason is logged once as `memory_config_invalid` in the event log. `scope.mode: "only"` with empty `names` is nobody, names match the session name, and everyone must be spelled `{"mode":"all"}`. `requests` needs `journal`. The file is re-read on every input and at session start, so journal on/off applies without a restart. Tools are registered at load only when a tool-bearing flag (`intent`, `recall`) is true then; each call re-checks flags and answers `memory disabled` when off, so rollback is immediate, while enabling a tool for an already-running session needs a restart (`registerMemoryTool`).
+
+**Rollback (any stage).** Set `requests:false` first: carrier injection and answer/boundary/closure writes stop on the next input, and request-enabled handoff bytes return to baseline. Then disable `intent`, `resume`, `recall`, and finally `journal`. `requests:true` with `journal:false` parses as `requests:false` with a logged reason. Keep the block; an empty `scope.names` list means nobody, never everyone. For code rollback, use the previous tag. Store files remain append-only and inert when disabled.
 
 **Journal.** Each input that the origin gate accepts (human, launch, unattended, injected; child sessions skipped) is appended to `<agentDir>/memory/journal/<sessionId>.jsonl` (dirs 0700, files 0600, `PI_MEMORY_HOME` overrides). Bodies over 64 KiB keep head 2 KiB + tail 1 KiB inline and the whole redacted body in `blobs/`. The hook never throws into pi: failures are logged as `journal_error` (message only, never prompt text) and swallowed. The first input is human only when argv, TTY and launcher indicators verify that no initial/relaunch prompt exists; otherwise it remains `unattended` (`launch-unverified`). Later typed input is `human`.
 
