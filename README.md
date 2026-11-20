@@ -276,6 +276,16 @@ CI runs Node 22/24, installs the tested pi runtime, typechecks, tests, checks Ba
 
 MIT licensed.
 
+## Intent-memory storage core (inert)
+
+`src/memory/store.ts` exports the harness-neutral `MemoryStoreCore` and `FileMemoryStore`. Nothing imports this store into the extension yet: existing flags-off behavior is unchanged. Projection, span resolution, request/answer lifecycle hooks and UI authorisation are separate slices; unsupported raw lifecycle events are rejected until their validators exist.
+
+An explicitly constructed store uses `<agentDir>/memory/` (default `~/.pi/agent/memory/`); `PI_MEMORY_HOME` overrides the directory. It creates private directories (0700) for `journal/<session>.jsonl`, `answers/<session>.jsonl`, `blobs/<sha256>.txt`, and an append-only `events.jsonl` (files 0600). Journal bodies over 64 KiB use verified, atomically renamed blobs. Callers must supply already-redacted journal text. Search requires a caller-provided redactor and withholds results when it is absent or fails.
+
+Records carry CRC32 of their JSON body without `crc`. Each append is one write of `"\n" + json + "\n"`, so a torn tail cannot consume the next record. Readers ignore blank, incomplete, unparsable and CRC-bad lines without rewriting; `health()` reports blank, torn-tail, corrupt and rejected-event counts. Events are folded by byte position, not UUID order. Writes pre-validate, append, re-fold and report `applied`, `rejected`, or `conflict` with the winning event id.
+
+Directive authority is checked again at fold time against journal provenance. Without an injected `EligibilityCheck`, automatic directives remain proposed; a valid human `/directive ` source or human UI confirmation can activate them. Orders require an explicit coordinator allowlist. `readFolded()`, paging and the capability-labelled core conformance suite provide the seam for later projections and alternative backends.
+
 ## Related projects
 
 - [pi-setup](https://github.com/woksin/pi-setup): my full pi agent setup (rules, agents, extensions, installer) that ties these together

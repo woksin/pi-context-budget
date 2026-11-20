@@ -1,0 +1,60 @@
+import { randomBytes } from "node:crypto";
+
+/** UUIDv7 supplies identity only. Log positions, never UUIDs, order events. */
+export function newId(): string {
+  const bytes = randomBytes(16);
+  bytes.writeUIntBE(Date.now(), 0, 6);
+  bytes[6] = (bytes[6] & 0x0f) | 0x70;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = bytes.toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+export type Scope = { kind: "global" | "repo" | "lane" | "session" | "task"; key: string };
+export type Actor = { kind: "human" | "agent" | "coordinator" | "system"; id: string;
+  harness: "pi" | "claude-code" | "copilot-cli" | "direct" | "other" };
+export type Span = { start: number; end: number };
+export type Origin = "human" | "unattended" | "launch" | "injected";
+export type Session = { id: string; role: "main" | "subagent"; file?: string; entryId?: string };
+export type BlobRef = { sha256: string; bytes: number };
+export type JournalEntry = {
+  schema: "memory.journal/2"; id: string; at: string; session: Session; cwd: string; repo?: string; lane?: string;
+  origin: Origin; originEvidence: string[];
+  injectedKind?: "lane_message" | "brief" | "notice" | "reminder" | "relaunch" | "unknown";
+  injectedFrom?: string; text: string | null; withheld: "redactor_failed" | "too_large" | null;
+  textBytes: number; sha256: string; blob?: BlobRef; redactions: { kind: string; count: number }[];
+};
+export type MessageInput = Omit<JournalEntry, "schema" | "textBytes" | "sha256" | "blob">;
+export type Source = { type: "user_message" | "coordinator_order" | "agent_decision" | "question_item"; ref?: string; span?: Span };
+export type Authority = { mode: "auto" | "command" | "none"; ruleVersion: number; commandRef?: string };
+export type Item = { id: string; kind: "directive" | "order" | "decision"; scope: Scope; text: string; gloss?: string;
+  source: Source; rationale?: string; authority?: Authority; supersedes: string[] };
+export type ItemStatus = "active" | "proposed" | "done" | "superseded" | "withdrawn";
+export type FoldedItem = Item & { status: ItemStatus; at: string; eventId: string; changedBy: string; retiredByAgent?: boolean };
+export type EventBase = { schema: "memory.event/2"; id: string; at: string; actor: Actor };
+export type AddEvent = EventBase & { type: "add"; item: Item };
+export type ConfirmEvent = EventBase & { type: "confirm"; itemId: string; via: "ui" };
+export type RetireEvent = EventBase & { type: "retire"; itemId: string; status: "done" | "superseded" | "withdrawn"; reason: string; source: Source };
+export type Classification = { messageId: string; spans: (Span & { result: "directive" | "decision" | "none"; itemIds: string[] })[];
+  whole: "none" | null; reason?: string };
+export type ClassifyEvent = EventBase & Classification & { type: "classify" };
+export type IdSet = { count: number; ids: string[] } | { count: number; sha256: string; blob: string };
+export type BoundaryEvent = EventBase & { type: "boundary"; session: Session; runId: string;
+  kind: "handoff" | "emergency" | "hard" | "idle" | "overflow_native" | "overflow_package" | "manual" | "abort";
+  compactionEntryId?: string; openRequests: IdSet; lastAnswerId?: string; sameRunAsAnswer: boolean; handoffPath?: string };
+export type RequestCloseEvent = EventBase & { type: "request_close"; requestId: string; status: "answered" | "abandoned";
+  answerId?: string; reason?: string; source?: Source };
+export type MemoryEvent = AddEvent | ConfirmEvent | RetireEvent | ClassifyEvent | BoundaryEvent | RequestCloseEvent;
+export type WriteResult = { ok: boolean; status: "applied" | "rejected" | "conflict"; eventId: string; reason?: string; winningEventId?: string };
+export type RejectedEvent = { eventId: string; reason: string; winningEventId?: string };
+export type FoldedState = { items: Record<string, FoldedItem>; events: Record<string, WriteResult>; rejectedEvents: RejectedEvent[];
+  classifications: ClassifyEvent[]; boundaries: BoundaryEvent[]; closures: RequestCloseEvent[]; counts: Record<string, number> };
+export type EligibilityCheck = (text: string, span: Span, ruleVersion: number) => { eligible: boolean; reasons: string[] };
+export type FoldOptions = { eligibilityCheck?: EligibilityCheck; coordinators?: string[] };
+export type LocatedRecord<T = unknown> = { position: number; record: T };
+export type Page<T> = { items: T[]; cursor?: string };
+export type Redactor = (text: string) => string | null;
+export type MessageQuery = { sessionId?: string; since?: string; origin?: Origin; limit: number; cursor?: string };
+export type ItemQuery = { scopes?: Scope[]; status?: ItemStatus; kind?: Item["kind"]; limit: number; cursor?: string };
+export type SearchQuery = { query: string; sessionIds?: string[]; scopes?: Scope[]; limit: number; since?: string; redactor?: Redactor };
+export type SearchHit = { id: string; at: string; origin: Origin; snippet: string; span: Span };
+export type Health = { tornTail: number; corrupt: number; blank: number; rejectedEvents: number; activePerScope: Record<string, number> };
