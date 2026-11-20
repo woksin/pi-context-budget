@@ -22,7 +22,7 @@ export type RunAnswer = { id: string; kind: AnswerKind; textBytes: number; stopR
 export type CompactionHint = { kind: BoundaryKind; handoffPath?: string };
 export type Carried = { open: string[]; lastAnswer?: RunAnswer & { sameRunAsAnswer: boolean }; degraded?: string };
 
-const brief = (error: unknown) => String(error instanceof Error ? error.message : error).slice(0, 200);
+const stopReason = (value: string | undefined) => ["stop", "toolUse", "aborted", "error", "length"].includes(value ?? "") ? value! : "unknown";
 const blocks = (message: AssistantMessage): { type?: string; text?: string }[] => Array.isArray(message.content) ? message.content : [];
 const textOf = (message: AssistantMessage): string => typeof message.content === "string" ? message.content :
   blocks(message).filter(block => block.type === "text" && typeof block.text === "string").map(block => block.text).join("\n");
@@ -33,7 +33,7 @@ export function createRequestsHook(deps: RequestsHookDeps) {
   let memory: MemoryConfig = memoryOff(), store: Promise<FileMemoryStore> | undefined, scanner: Promise<Scanner | undefined> | undefined;
   let loadedFor: string | undefined, open = new Set<string>(), compactions = new Set<string>();
   let answers: RunAnswer[] = [], capture: string[] | undefined, expected: CompactionHint | undefined;
-  let runId = newId(), turn = 0, humanSeq = 0, degraded: string | undefined;
+  let runId = newId(), turn = 0, humanSeq = 0, degraded: string | undefined, interimsDropped = 0;
   const reported = new Set<string>();
   const home = async () => (await (store ??= import("./store.ts").then(({ FileMemoryStore }) => new FileMemoryStore({ agentDir: deps.agentDir })))).home;
   const scanners = () => scanner ??= loadScanner(deps.agentDir);
@@ -41,11 +41,11 @@ export function createRequestsHook(deps: RequestsHookDeps) {
   const session = (ctx: HookContext) => ({ id: ctx.sessionManager.getSessionId(), role: "main" as const, file: ctx.sessionManager.getSessionFile?.() });
 
   /** Loud but non-blocking (contract 10.6): the event log gets one record per failure kind, the next render one line. */
-  function degrade(ctx: HookContext, what: string, error: unknown): void {
+  function degrade(ctx: HookContext, what: string, _error: unknown): void {
     degraded = what;
     if (reported.has(what)) return;
     reported.add(what);
-    try { deps.log(ctx as ExtensionContext, "memory_degraded", { what, error: brief(error) }); } catch { /* Logging must not escape. */ }
+    try { deps.log(ctx as ExtensionContext, "memory_degraded", { what, error: "write_failed" }); } catch { /* Logging must not escape. */ }
   }
   /** Files are the source of truth; a restarted process rebuilds its open set from them. */
   async function load(ctx: HookContext): Promise<void> {
@@ -58,16 +58,21 @@ export function createRequestsHook(deps: RequestsHookDeps) {
   }
   async function persist(ctx: HookContext, answer: RunAnswer): Promise<boolean> {
     if (answer.written) return true;
+    if (answer.dropped) return false;
     try {
       const dir = await home();
+      if (answer.kind === "interim" && answersBytes(dir, answer.parts.session.id) >= (deps.capBytes ?? SESSION_CAP_BYTES)) {
+        answer.dropped = true; interimsDropped++; return false;
+      }
       appendAnswer(dir, answer.id, { ...answer.parts, requests: makeIdSet(dir, answer.ids, deps.blobWriter) }, answer.body, deps.blobWriter);
       answer.written = true;
     } catch (error) { degrade(ctx, "answer_write", error); }
     return answer.written;
   }
+  const isClosingAnswer = (answer: RunAnswer): boolean => answer.kind === "final" && answer.stopReason === "stop" && answer.written;
   /** Closure strictly follows a durable final answer with stopReason stop; a failure leaves the request open. */
   async function closeAnswered(ctx: HookContext, answer: RunAnswer): Promise<void> {
-    if (answer.kind !== "final" || answer.stopReason !== "stop" || !answer.written) return;
+    if (!isClosingAnswer(answer)) return;
     for (const id of answer.ids.filter(id => open.has(id))) {
       try { appendEvent(await home(), closeEvent(id, answer.id)); open.delete(id); }
       catch (error) { degrade(ctx, "request_close_write", error); return; }
@@ -83,13 +88,14 @@ export function createRequestsHook(deps: RequestsHookDeps) {
     const text = textOf(message), ids = capture ?? [];
     capture = undefined; turn++;
     if (!text.trim()) return;
-    const body = redactAnswer(text, await scanners()), kind: AnswerKind = hasToolCall(message) ? "interim" : "final";
-    const answer: RunAnswer = { id: newAnswerId(), kind, textBytes: Buffer.byteLength(body.text ?? ""), stopReason: message.stopReason ?? "unknown", ids, body,
-      parts: { session: session(ctx), runId, kind, model: message.model, stopReason: message.stopReason ?? "unknown", turn }, humanSeq, written: false, dropped: false };
+    const scanner = await scanners(), body = redactAnswer(text, scanner), kind: AnswerKind = hasToolCall(message) ? "interim" : "final";
+    const model = typeof message.model === "string" ? redactAnswer(message.model, scanner).text ?? undefined : undefined;
+    const reason = stopReason(message.stopReason);
+    const answer: RunAnswer = { id: newAnswerId(), kind, textBytes: Buffer.byteLength(body.text ?? ""), stopReason: reason, ids, body,
+      parts: { session: session(ctx), runId, kind, model, stopReason: reason, turn }, humanSeq, written: false, dropped: false };
     answers.push(answer);
     if (kind === "interim" && memory.answers !== "all") { keep(); return; }
-    if (kind === "interim" && answersBytes(await home(), answer.parts.session.id) > (deps.capBytes ?? SESSION_CAP_BYTES)) answer.dropped = true;
-    else if (await persist(ctx, answer)) await closeAnswered(ctx, answer);
+    if (await persist(ctx, answer)) await closeAnswered(ctx, answer);
     keep();
   }
   async function boundary(ctx: HookContext, kind: BoundaryKind, extra: { compactionEntryId?: string; handoffPath?: string } = {}): Promise<void> {
@@ -97,11 +103,14 @@ export function createRequestsHook(deps: RequestsHookDeps) {
     await load(ctx);
     if (extra.compactionEntryId && compactions.has(extra.compactionEntryId)) return;
     for (const answer of answers.filter(a => !a.written && !a.dropped)) await persist(ctx, answer);
-    const last = pickLastAnswer(answers), durable = last?.written ? last : undefined, dir = await home();
+    await persistBoundary(ctx, kind, extra);
+    if (extra.compactionEntryId) compactions.add(extra.compactionEntryId);
+  }
+  async function persistBoundary(ctx: HookContext, kind: BoundaryKind, extra: { compactionEntryId?: string; handoffPath?: string }): Promise<void> {
+    const last = pickLastAnswer(answers.filter(a => !a.dropped)), durable = last?.written ? last : undefined, dir = await home();
     // A record is never written for an answer that is not on disk; the in-memory copy still serves the handoff.
     appendEvent(dir, buildBoundary(dir, { session: session(ctx), runId, kind, open: [...open], lastAnswerId: durable?.id,
       sameRunAsAnswer: !!durable && durable.humanSeq === humanSeq, ...extra }, deps.blobWriter));
-    if (extra.compactionEntryId) compactions.add(extra.compactionEntryId);
   }
   const guarded = async (ctx: HookContext, what: string, action: () => Promise<void>): Promise<void> => {
     try { if (enabled(ctx)) await action(); } catch (error) { degrade(ctx, what, error); }
@@ -112,7 +121,7 @@ export function createRequestsHook(deps: RequestsHookDeps) {
   };
   return {
     reload(): void { memory = readMemoryConfig(deps.configFile).config; },
-    reset(): void { loadedFor = undefined; open = new Set(); compactions = new Set(); answers = []; capture = undefined; expected = undefined; humanSeq = 0; degraded = undefined; reported.clear(); },
+    reset(): void { loadedFor = undefined; open = new Set(); compactions = new Set(); answers = []; capture = undefined; expected = undefined; humanSeq = 0; degraded = undefined; interimsDropped = 0; reported.clear(); },
     onJournaled: (entry: JournalEntry, ctx: HookContext) => guarded(ctx, "request_open", async () => {
       if (!isRequest(entry)) return;
       await load(ctx);
@@ -137,9 +146,10 @@ export function createRequestsHook(deps: RequestsHookDeps) {
       await boundary(ctx, hint?.kind ?? compactionKind(event.reason, packageInFlight), { compactionEntryId: event.compactionEntry?.id, handoffPath: hint?.handoffPath });
     }),
     settled: (aborted: boolean, ctx: HookContext) => guarded(ctx, "boundary_write", async () => { if (aborted && open.size) await boundary(ctx, "abort"); }),
+    health(): { interimsDropped: number } { return { interimsDropped }; },
     /** What a handoff must still carry, from process memory (valid even when the files could not be written). */
     carried(): Carried {
-      const last = pickLastAnswer(answers);
+      const last = pickLastAnswer(answers.filter(a => !a.dropped));
       return { open: [...open], degraded, ...(last ? { lastAnswer: { ...last, sameRunAsAnswer: last.humanSeq === humanSeq } } : {}) };
     },
   };

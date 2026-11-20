@@ -14,25 +14,47 @@ export type RequestStatus = "open" | "answered" | "abandoned";
 export type RequestInfo = { id: string; at: string; origin: JournalEntry["origin"]; text: string | null; withheld: JournalEntry["withheld"];
   status: RequestStatus; answerIds: string[]; interruptions: number; aborted: boolean };
 export type SessionState = { requests: RequestInfo[]; open: RequestInfo[]; answers: AnswerRecord[]; boundaries: ResolvedBoundary[];
-  possiblyUnseen: Set<string> };
+  possiblyUnseen: Set<string>; agentAbandonments: RequestCloseEvent[] };
 
 export function closeEvent(requestId: string, answerId: string): RequestCloseEvent {
   return { schema: "memory.event/2", id: newId(), at: new Date().toISOString(), actor: SYSTEM_ACTOR, type: "request_close", requestId, status: "answered", answerId };
 }
 
+/** An agent may abandon only by citing a later human journal entry, never a launch or model decision. */
+function authorisedAbandonment(event: RequestCloseEvent, request: JournalEntry, messages: Map<string, JournalEntry>): boolean {
+  if (event.status !== "abandoned") return false;
+  if (event.actor.kind === "human") return true;
+  if (event.actor.kind !== "agent" || event.source?.type !== "user_message") return false;
+  return laterHuman(messages.get(event.source.ref ?? ""), request, event);
+}
+function laterHuman(source: JournalEntry | undefined, request: JournalEntry, event: RequestCloseEvent): boolean {
+  if (source?.origin !== "human") return false;
+  return Date.parse(source.at) > Date.parse(request.at) && Date.parse(source.at) <= Date.parse(event.at);
+}
+function validateBoundary(event: BoundaryEvent): void {
+  requireValid(BOUNDARY_KINDS.includes(event.kind), "invalid_event");
+  requireValid(typeof event.sameRunAsAnswer === "boolean", "invalid_event");
+  requireValid(typeof event.runId === "string", "invalid_event");
+  requireValid(typeof event.openRequests?.count === "number", "invalid_event");
+  requireValid(typeof event.session?.id === "string", "invalid_event");
+}
+function isHarnessAnswer(event: RequestCloseEvent): boolean {
+  return event.status === "answered" && event.actor.kind === "system" && safeName(event.answerId ?? "");
+}
+
 /** Fold-time validation (shared by `foldEvents` and the reader): a closure needs a real request, and only the harness answers. */
 export function validateRequestEvent(event: BoundaryEvent | RequestCloseEvent, messages: Map<string, JournalEntry>): void {
-  requireValid(event.schema === "memory.event/2" && safeName(event.id) && Number.isFinite(Date.parse(event.at)), "invalid_event");
+  requireValid(event.schema === "memory.event/2", "invalid_event");
+  requireValid(safeName(event.id), "invalid_event");
+  requireValid(Number.isFinite(Date.parse(event.at)), "invalid_event");
   requireValid(["human", "agent", "coordinator", "system"].includes(event.actor?.kind), "invalid_actor");
   if (event.type === "boundary") {
-    requireValid(BOUNDARY_KINDS.includes(event.kind) && typeof event.sameRunAsAnswer === "boolean" && typeof event.runId === "string", "invalid_event");
-    requireValid(typeof event.openRequests?.count === "number" && typeof event.session?.id === "string", "invalid_event");
+    validateBoundary(event);
     return;
   }
   const request = messages.get(event.requestId);
   requireValid(request && isRequest(request), "no_source");
-  const harnessAnswer = event.status === "answered" && event.actor.kind === "system" && safeName(event.answerId ?? "");
-  requireValid(harnessAnswer || (event.status === "abandoned" && event.actor.kind === "human"), "not_authorised");
+  requireValid(isHarnessAnswer(event) || authorisedAbandonment(event, request, messages), "not_authorised");
 }
 
 function readJournal(home: string, sessionId: string): JournalEntry[] {
@@ -44,16 +66,22 @@ function readJournal(home: string, sessionId: string): JournalEntry[] {
   }
   return entries;
 }
-function readEvents(home: string, sessionId: string, messages: Map<string, JournalEntry>) {
-  const boundaries: BoundaryEvent[] = [], closed = new Map<string, RequestCloseEvent>(), seen = new Set<string>();
-  const file = eventsFile(home);
-  for (const { record } of existsSync(file) ? scanLog(file).records : []) {
+function validEvents(home: string, messages: Map<string, JournalEntry>): Array<BoundaryEvent | RequestCloseEvent> {
+  const events: Array<BoundaryEvent | RequestCloseEvent> = [], seen = new Set<string>();
+  for (const { record } of scanLog(eventsFile(home)).records) {
     const event = record as BoundaryEvent | RequestCloseEvent;
-    if ((event.type !== "boundary" && event.type !== "request_close") || seen.has(event.id)) continue;
+    if (!["boundary", "request_close"].includes(event.type) || seen.has(event.id)) continue;
     try { validateRequestEvent(event, messages); } catch { continue; }
-    seen.add(event.id);
-    if (event.type === "boundary" && event.session.id === sessionId) boundaries.push(event);
-    else if (event.type === "request_close" && !closed.has(event.requestId)) closed.set(event.requestId, event);
+    seen.add(event.id); events.push(event);
+  }
+  return events;
+}
+function readEvents(home: string, sessionId: string, messages: Map<string, JournalEntry>) {
+  const events = validEvents(home, messages);
+  const boundaries = events.filter((event): event is BoundaryEvent => event.type === "boundary").filter(event => event.session.id === sessionId);
+  const closed = new Map<string, RequestCloseEvent>();
+  for (const event of events.filter((event): event is RequestCloseEvent => event.type === "request_close")) {
+    if (!closed.has(event.requestId)) closed.set(event.requestId, event);
   }
   return { boundaries, closed };
 }
@@ -77,8 +105,22 @@ export function readSessionState(home: string, sessionId: string): SessionState 
       status: closed.get(entry.id)?.status ?? "open", answerIds: answerIds.get(entry.id) ?? [], interruptions: interruptions.length,
       aborted: interruptions.some(b => b.event.kind === "abort") };
   });
-  return { requests, open: requests.filter(r => r.status === "open"), answers, boundaries: resolved, possiblyUnseen: possiblyUnseen(boundaries) };
+  const agentAbandonments = [...closed.values()].filter(event => event.status === "abandoned" && event.actor.kind === "agent");
+  return { requests, open: requests.filter(r => r.status === "open"), answers, boundaries: resolved, possiblyUnseen: possiblyUnseen(boundaries), agentAbandonments };
 }
-export const answersBytes = (home: string, sessionId: string): number => {
-  try { return statSync(join(home, "answers", `${sessionId}.jsonl`)).size; } catch { return 0; }
-};
+/** Session volume includes every distinct referenced body/id-set blob, not just the small JSONL previews. */
+export function answersBytes(home: string, sessionId: string): number {
+  const file = join(home, "answers", `${sessionId}.jsonl`);
+  if (!existsSync(file)) return 0;
+  const blobs = new Set<string>();
+  for (const { record } of scanLog(file).records) {
+    const answer = record as AnswerRecord;
+    if (answer.blob) blobs.add(`${answer.blob.sha256}.txt`);
+    if (answer.requests && "blob" in answer.requests) blobs.add(answer.requests.blob);
+  }
+  let bytes = statSync(file).size;
+  for (const blob of blobs) {
+    if (/^[a-f0-9]{64}\.txt$/.test(blob)) bytes += statSync(join(home, "blobs", blob)).size;
+  }
+  return bytes;
+}

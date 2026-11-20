@@ -35,6 +35,7 @@ export function createJournalHook(deps: JournalHookDeps): JournalHook {
   let memory: MemoryConfig = memoryOff(), reasons = "";
   let firstInput = true, scanner: Promise<Scanner | undefined> | undefined, store: Promise<FileMemoryStore> | undefined;
   const scanners = () => scanner ??= loadScanner(deps.agentDir);
+  const onJournaled = deps.onJournaled ?? (async () => {});
   const stores = () => store ??= import("./store.ts").then(({ FileMemoryStore }) => new FileMemoryStore({ agentDir: deps.agentDir }));
 
   function originContext(ctx: HookContext, position: boolean): OriginContext {
@@ -57,7 +58,7 @@ export function createJournalHook(deps: JournalHookDeps): JournalHook {
       ...injectedFrom(decision.injectedFrom, scanner), ...body,
     };
     const stored = (await stores()).appendMessage(entry);
-    await deps.onJournaled?.(stored, ctx);
+    await onJournaled(stored, ctx);
   }
   /** Fixed reason codes only; config excerpts and exception text never reach the log. */
   function reload(ctx: HookContext): void {

@@ -1,13 +1,14 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { appendRecord, JOURNAL_LINE_BYTES, scanLog } from "./log.ts";
+import { appendRecord, EVENT_LINE_BYTES, scanLog } from "./log.ts";
 import { resolveIdSet, writeBlobFile, type BlobWriter, type ResolvedIdSet } from "./idset.ts";
 import { redact, type Scanner } from "./redact.ts";
 import { newId, type BlobRef, type IdSet, type Session } from "./types.ts";
 import { safeName, utf8Head } from "./validate.ts";
 
-export const ANSWER_INLINE_BYTES = 64 * 1024;
+export const ANSWER_INLINE_BYTES = EVENT_LINE_BYTES - 1;
+const recordBytes = (record: AnswerRecord) => Buffer.byteLength(JSON.stringify({ ...record, crc: "00000000" }));
 /** Contract 10.2: the last answer prefers a final of at least this many bytes. */
 export const SUBSTANTIVE_BYTES = 256;
 export type AnswerKind = "final" | "interim";
@@ -24,17 +25,25 @@ export const answerFile = (home: string, sessionId: string) => join(home, "answe
 export const redactAnswer = (text: string, scanner?: Scanner): AnswerBody => redact(text, scanner);
 const tail = (text: string, bytes: number) => [...utf8Head([...text].reverse().join(""), bytes)].reverse().join("");
 
+const fitsInline = (record: AnswerRecord) => recordBytes(record) <= ANSWER_INLINE_BYTES;
+function fitPreview(record: AnswerRecord): void {
+  const text = record.text ?? "";
+  record.blob = { sha256: record.sha256, bytes: record.textBytes };
+  record.text = `${utf8Head(text, 2048)}\n…\n${tail(text, 1024)}`;
+  // Escaped preview bytes count too; metadata alone that cannot fit fails without a referencing record.
+  if (!fitsInline(record)) record.text = "";
+  if (!fitsInline(record)) throw Error("too_large");
+}
 export type AnswerParts = { session: Session; runId: string; requests: IdSet; kind: AnswerKind; model?: string; stopReason: string; turn: number };
 /** Large bodies keep head and tail inline; the whole redacted body goes to a blob written before the record. */
 export function appendAnswer(home: string, id: string, parts: AnswerParts, body: AnswerBody, writer: BlobWriter = writeBlobFile): AnswerRecord {
   const text = body.text ?? "", textBytes = Buffer.byteLength(text);
   const record: AnswerRecord = { schema: "memory.answer/2", id, at: new Date().toISOString(), ...parts, ...body, textBytes, sha256: digest(text) };
-  if (textBytes > ANSWER_INLINE_BYTES) {
+  if (!fitsInline(record)) {
+    fitPreview(record);
     writer(home, `${record.sha256}.txt`, text);
-    record.blob = { sha256: record.sha256, bytes: textBytes };
-    record.text = `${utf8Head(text, 2048)}\n…\n${tail(text, 1024)}`;
   }
-  appendRecord(answerFile(home, parts.session.id), record, JOURNAL_LINE_BYTES);
+  appendRecord(answerFile(home, parts.session.id), record, ANSWER_INLINE_BYTES);
   return record;
 }
 export const newAnswerId = newId;
@@ -53,7 +62,7 @@ const wellFormed = (record: AnswerRecord): boolean => record.schema === "memory.
 export function readAnswers(home: string, sessionId: string): AnswerRecord[] {
   if (!safeName(sessionId)) return [];
   const seen = new Set<string>(), answers: AnswerRecord[] = [];
-  for (const { record } of scanLog(answerFile(home, sessionId), JOURNAL_LINE_BYTES).records) {
+  for (const { record } of scanLog(answerFile(home, sessionId), ANSWER_INLINE_BYTES).records) {
     const answer = record as AnswerRecord;
     if (!wellFormed(answer) || seen.has(answer.id)) continue;
     seen.add(answer.id);

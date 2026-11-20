@@ -25,14 +25,15 @@ function promptFree(args: readonly string[]): boolean {
 
 /**
  * Verified launch facts, fail closed. `null` means "verified: none"; `undefined` means unknown (the origin gate then
- * journals the first input as unattended). Relaunch (`bin/pi-session`) always passes `@promptfile`/`continue from <handoff>`
- * positionally, so a prompt-free argv also proves this process is not a relaunch. The environment alone proves nothing.
+ * journals the first input as unattended). The authoritative `bin/pi-session` uses positional/@file prompts AND
+ * PI_SESSION_ and PI_RELAUNCH_ environment markers. Their presence (even empty, including future markers) is unverified.
  */
-export function deriveLaunchFacts(args: readonly string[], stdinIsTTY: boolean | undefined): LaunchFacts {
+export function deriveLaunchFacts(args: readonly string[], stdinIsTTY: boolean | undefined, env: NodeJS.ProcessEnv = process.env): LaunchFacts {
   const verified = stdinIsTTY === true && promptFree(args);
-  return { initialPrompt: verified ? null : undefined, relaunchPrompt: verified ? null : undefined };
+  const relaunchIndicator = Object.keys(env).some(key => /^PI_(?:SESSION|RELAUNCH)(?:_|$)/.test(key));
+  return { initialPrompt: verified ? null : undefined, relaunchPrompt: verified && !relaunchIndicator ? null : undefined };
 }
 /** `process.argv` is `[runtime, script, ...args]`; any other shape is unknown. */
-export function processLaunchFacts(argv: readonly string[] = process.argv, stdinIsTTY: boolean | undefined = process.stdin.isTTY): LaunchFacts {
-  return argv.length >= 2 ? deriveLaunchFacts(argv.slice(2), stdinIsTTY) : deriveLaunchFacts(["unknown"], stdinIsTTY);
+export function processLaunchFacts(argv: readonly string[] = process.argv, stdinIsTTY: boolean | undefined = process.stdin.isTTY, env: NodeJS.ProcessEnv = process.env): LaunchFacts {
+  return deriveLaunchFacts(argv.length >= 2 ? argv.slice(2) : ["unknown"], stdinIsTTY, env);
 }

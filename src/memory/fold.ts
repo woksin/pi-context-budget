@@ -67,6 +67,8 @@ function foldOne(event: MemoryEvent, position: number, ctx: FoldContext): void {
   } catch (error) { recordRejection(ctx, id, error); }
 }
 function countItems(state: FoldedState): void {
+  const agentAbandonments = state.closures.filter(event => event.status === "abandoned" && event.actor.kind === "agent");
+  if (agentAbandonments.length) state.counts["requests:abandoned:agent"] = agentAbandonments.length;
   for (const item of Object.values(state.items)) {
     const key = `${item.kind}:${item.scope.kind}:${item.scope.key}:${item.status}`;
     state.counts[key] = (state.counts[key] ?? 0) + 1;

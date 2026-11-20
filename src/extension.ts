@@ -369,9 +369,12 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
       await requests.compacted(e, ctx, overflow.packageCompacting);
     }));
     pi.on("session_compact_failed", safe(async (e, ctx) => { requests.compactionFailed(); overflow.nativeCompaction(ctx, e.reason); await run(e, ctx); }));
-    pi.on("session_shutdown", safe((_e, ctx) => {
+    function discardUncommittedHandoff(ctx: ExtensionContext): void {
       const held = state.pending ?? state.stored;
       if (mode(ctx) === "enforce" && held && held.path !== state.committedPath) log(ctx, "handoff_discarded", { path: held.path, reason: "session shutdown before commit" });
+    }
+    pi.on("session_shutdown", safe((_e, ctx) => {
+      discardUncommittedHandoff(ctx);
       overflow.shutdown(); status(ctx, "ended"); host?.release(); host = undefined; log(ctx, "session_shutdown"); }));
   };
 }
