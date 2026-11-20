@@ -16,6 +16,7 @@ import { appendEvent, atomicJson, collectRepos, handoffHead, issueClaims, runnin
 import { bindRequests, createRequestsHook, wire } from "./memory/requests-hook.ts";
 import { processLaunchFacts, type LaunchFacts } from "./memory/launch.ts";
 import { createIntentHook } from "./memory/tools.ts";
+import { createRecallHook } from "./memory/recall.ts";
 import { bytePrefix, chainIdentity, emergencyHandoff, emergencySummary, previousHandoff, primaryHead } from "./collect.ts";
 
 type ActionResult = BoundaryResult & ToolCallEventResult & SessionBeforeCompactResult;
@@ -55,7 +56,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
       catch (error) { console.error(`context-budget: event log unavailable: ${String(error)}`); }
     }
     const memoryDeps = { agentDir, configFile, log, host: () => host };
-    const intent = createIntentHook(pi, memoryDeps);
+    const intent = createIntentHook(pi, memoryDeps), recall = createRecallHook(pi, memoryDeps);
     const requests = createRequestsHook({ ...memoryDeps, hasTools: () => hasActiveTools(pi) });
     const journal = wire(requests, { ...memoryDeps, launchFacts });
     function reload(ctx: ExtensionContext): void {
@@ -244,7 +245,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
       try { return await handler(event, ctx); } catch (error) { log(ctx, "hook_error", { error: String(error) }); }
     };
     function reset(ctx: ExtensionContext): void {
-      host?.release(); host = hosts.acquire(ctx.sessionManager.getSessionId()); intent.start(ctx);
+      host?.release(); host = hosts.acquire(ctx.sessionManager.getSessionId()); intent.start(ctx); recall.start(ctx);
       reload(ctx); journal.reset(); requests.reset(); overflow.reset(ctx); knownIds.clear(); handoffRejections = 0; resumeBoundary = resumeMessage = mismatchLogged = undefined;
       const history: HistoryItem[] = ctx.sessionManager.getBranch().flatMap((e): HistoryItem[] => {
         if (e.type === "compaction") {
