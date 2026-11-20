@@ -32,8 +32,9 @@ for (const names of [[], ["read"], ["context_handoff_extra"]]) {
     assert.equal(canHandoff({ getActiveTools: () => names }, { subagent: false }), false);
   });
 }
-test("missing tool-list API leaves handoff unavailable", () => {
-  assert.equal(canHandoff({}, { subagent: false }), false);
+test("missing tool-list API keeps main-session handoff enforcement (fail closed)", () => {
+  assert.equal(canHandoff({}, { subagent: false }), true);
+  assert.equal(canHandoff({}, { subagent: true }), false);
 });
 test("the active-tool query retains its receiver", () => {
   const tools = { names: ["context_handoff"], getActiveTools() { return this.names; } };
