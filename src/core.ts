@@ -2,6 +2,7 @@ import { matchesGlob, isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { bytePrefix, type PreviousHandoff } from "./collect.ts";
 import { memoryRecovery, type RecoveryWindow } from "./memory/authorize.ts";
+import { handoffBlocks, type HandoffMemory } from "./memory/handoff-block.ts";
 export const REQUEST_TASK = "The open user requests above are the task. Deliver an answer to each before you stop. Do not treat this handoff as the task.";
 
 export type Mode = "off" | "observe" | "enforce";
@@ -690,8 +691,9 @@ export function boundedAutoState(auto: AutoState): AutoState {
     discarded: auto.discarded?.slice(-5).map(item => ({ path: item.path, reason: bytePrefix(item.reason, 120) })),
     previous: auto.previous && { path: short(auto.previous.path), goal: bytePrefix(auto.previous.goal, 4096), constraints: auto.previous.constraints && bytePrefix(auto.previous.constraints, 4096), filesToRead: auto.previous.filesToRead.slice(0, 20).map(short) } };
 }
-export function renderHandoff(p: HandoffInput, auto: AutoState, id: string, n: number, path: string, at: string): Handoff {
+export function renderHandoff(p: HandoffInput, auto: AutoState & { memory?: HandoffMemory }, id: string, n: number, path: string, at: string): Handoff {
   validateHandoff(p);
+  const memory = auto.memory;
   const recordedJobs = auto.jobs.flatMap((record): RecordedJob[] => {
     if (!record || typeof record !== "object") return [];
     const r = record as Record<string, unknown>;
@@ -717,15 +719,16 @@ export function renderHandoff(p: HandoffInput, auto: AutoState, id: string, n: n
   }, 900);
   if ((auto.discarded?.length ?? 0) > 5) discarded.push(`omitted: ${auto.discarded!.length - 5} earlier records`);
   auto = boundedAutoState(auto);
+  const blocks = handoffBlocks(auto, memory);
   const sections = [
     `# Handoff ${id}-${n}`, `Timestamp: ${at}\nHandoff file: ${path}`,
-    `## Goal\n${p.goal}`, `## Verified facts (agent-reported; verify before relying on them)\n${p.facts}`,
+    `## Goal\n${p.goal}`, blocks.afterGoal, `## Verified facts (agent-reported; verify before relying on them)\n${p.facts}`,
     p.decisions && `## Decisions and why\n${p.decisions}`,
-    p.user_constraints && `## User constraints (verbatim)\n${p.user_constraints}`,
+    p.user_constraints && `## ${blocks.constraints}\n${p.user_constraints}`,
     p.open_items && `## Open items\n${p.open_items}`, p.hypotheses && `## Hypotheses (unverified)\n${p.hypotheses}`,
     `## Next step\n${p.next_step}`, p.files_to_read?.length && `## Read first\n${p.files_to_read.join("\n")}`,
     actions.length && `## Watch actions\n${actions.join("\n")}`,
-    auto.requests,
+    blocks.requests,
     `## Automatically collected state\nCwd: ${auto.cwd}\nRepository root: ${auto.root}\nBranch: ${auto.branch}\nHEAD: ${auto.head}\n` +
       (auto.dirty ? `Working tree:\n${auto.dirty.join("\n") || "clean"}\nSync: ${auto.sync ?? "unknown"}\n` : "") + `Launch prompt: ${p.launch_prompt ?? "not supplied"}\n` +
       (auto.repos ? `Repositories touched:\n${auto.repos.map(r => `${r.root} | ${r.branch} | ${r.head.slice(0, 12)} | dirty ${r.dirty} | ${r.sync}`).join("\n") || "none"}\n` : "") +
@@ -734,14 +737,14 @@ export function renderHandoff(p: HandoffInput, auto: AutoState, id: string, n: n
       (auto.finishedJobs ? `Finished jobs — Finished since last handoff (results not yet acted on):\n${auto.finishedJobs.join("\n") || "none"}\n` : "") +
       `Issue claims: ${JSON.stringify(auto.claims)}\nUnavailable: ${auto.unavailable.join(", ") || "none"}`,
     auto.questions?.length && `## Pending questions\n${auto.questions.join("\n")}`,
-    !auto.requests && auto.userMessages && `## User messages since previous handoff (verbatim)\n${auto.userMessages}`,
+    !auto.requests && blocks.userMessages && `## User messages since previous handoff (verbatim)\n${blocks.userMessages}`,
     auto.resumeCheck && `## Resume check\n${auto.resumeCheck}`,
     discarded.length && `## Discarded earlier handoffs\nStored, never committed; re-read if you rely on them:\n${discarded.join("\n")}`,
     auto.lint?.length && `## Handoff lint\n${bytePrefix(auto.lint.join("\n"), 1024)}`,
     auto.requestsTask ? REQUEST_TASK : "Resume now from Next step without asking the user. Verify current git HEAD and re-establish external state before trusting prior review/CI/issue facts.",
   ];
   const text = sections.filter(Boolean).join("\n\n") + "\n";
-  const bytes = Buffer.byteLength(text) - Buffer.byteLength(auto.requests ?? "");
+  const bytes = Buffer.byteLength(text) - blocks.excludedBytes;
   if (bytes > MAX_HANDOFF_BYTES) throw new Error(`Handoff is ${bytes} bytes; limit is ${MAX_HANDOFF_BYTES}. Shorten narrative and reference absolute files; do not omit user constraints.`);
   return { text, path, n, at, launchPrompt: p.launch_prompt, narrativeTokens: narrativeTokens(p), head: auto.head, recordedJobs, recordedSubagents, watchActions: p.watch_actions, repos };
 }

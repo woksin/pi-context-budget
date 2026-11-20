@@ -6,6 +6,7 @@ import { registerIntentCommands } from "./commands.ts";
 import { loadScanner, redact } from "./redact.ts";
 import { requireValid, ValidationError } from "./validate.ts";
 import { newId } from "./types.ts";
+import { normaliseRepoScope, selectedHandoffScopes } from "./handoff-scopes.ts";
 import type { Actor, ClassifyEvent, Item, ItemQuery, RetireEvent, Source, Span } from "./types.ts";
 import type { MemoryStoreCore } from "./store.ts";
 
@@ -31,7 +32,8 @@ const schemas = {
 type AddInput = Pick<Item, "kind" | "scope" | "text" | "gloss" | "supersedes"> & { source?: { ref?: string; span?: Span } };
 async function add(runtime: IntentServices, store: MemoryStoreCore, ctx: ExtensionContext, input: AddInput) {
   const source = itemSource(input), actor = runtime.actor(ctx);
-  const item: Item = { id: newId(), kind: input.kind, scope: input.scope, text: input.text, source,
+  const selected = selectedHandoffScopes(ctx, store);
+  const item: Item = { id: newId(), kind: input.kind, scope: normaliseRepoScope(input.scope, selected.repo), text: input.text, source,
     supersedes: input.supersedes ?? [] };
   if (input.gloss !== undefined) item.gloss = await safeText(runtime, input.gloss);
   if (input.kind === "directive") item.authority = { mode: "auto", ruleVersion: 1 };
@@ -39,8 +41,9 @@ async function add(runtime: IntentServices, store: MemoryStoreCore, ctx: Extensi
   const result = store.addItem(item, actor);
   if (!result.ok) return reply(result, result.reason);
   const folded = store.readFolded().items[item.id]!;
-  return reply({ ...result, item: folded }, folded.status === "proposed"
-    ? `proposed: user must confirm with /memory confirm ${item.id}` : JSON.stringify(folded));
+  const selectedScopes = selectedHandoffScopes(ctx, store).scopes;
+  const status = folded.status === "proposed" ? `proposed: user must confirm with /memory confirm ${item.id}` : JSON.stringify(folded);
+  return reply({ ...result, item: folded, selectedScopes }, `${status}\nHandoff-selected scope keys: ${JSON.stringify(selectedScopes)}`);
 }
 function itemSource(input: AddInput): Source {
   if (input.kind === "decision") return { type: "agent_decision" };

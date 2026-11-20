@@ -119,8 +119,10 @@ test("runtime memory imports are limited to gated extension hooks and the pure c
     // The extension wires pure configuration/launch helpers and flag-gated journal, requests and intent hooks.
     // Only core's type-import-only authorization helper is exempt; no other runtime file may import memory.
     const wired: Record<string, string[]> = {
-      "src/extension.ts": ["./memory/config.ts", "./memory/journal-hook.ts", "./memory/requests-hook.ts", "./memory/launch.ts", "./memory/tools.ts"],
-      "src/core.ts": ["./memory/authorize.ts"],
+      "src/extension.ts": ["./memory/config.ts", "./memory/journal-hook.ts", "./memory/requests-hook.ts", "./memory/launch.ts", "./memory/tools.ts", "./memory/handoff-hook.ts"],
+      "src/core.ts": ["./memory/authorize.ts", "./memory/handoff-block.ts"],
+      "src/collect.ts": ["./memory/handoff-block.ts"],
+      "src/validate.ts": ["./memory/handoff-block.ts"],
     };
     const specifiers = [...readFileSync(join(root, file), "utf8").matchAll(/(?:from\s*|import\s*\(|require\s*\()\s*["']([^"']*memory\/[^"']*)["']/g)].map(match => match[1]);
     const allowed = wired[file] ?? [];

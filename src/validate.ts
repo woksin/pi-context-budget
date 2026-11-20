@@ -1,6 +1,7 @@
 /** Handoff checks use injected observations only; uncertain state is always warn-only. */
 import { basename, isAbsolute, normalize } from "node:path";
 import { RETRY, type AutoState, type HandoffInput } from "./core.ts";
+import { constraintLint } from "./memory/handoff-block.ts";
 
 interface CheckContext {
   running: Pick<AutoState, "jobs" | "subagents" | "scheduled" | "finishedJobs" | "unavailable">;
@@ -9,6 +10,7 @@ interface CheckContext {
   mtimeMs(path: string): number | undefined;
   branch: readonly unknown[];
   enforce: boolean;
+  memoryIntent?: boolean;
 }
 const record = (value: unknown): Record<string, unknown> => value && typeof value === "object" ? value as Record<string, unknown> : {};
 export function recordId(value: unknown): string | undefined {
@@ -83,6 +85,6 @@ export function checkHandoff(input: HandoffInput, ctx: CheckContext): { errors: 
     const available = !ctx.running.unavailable.some(message => /^pi-(?:jobs|subagents)/.test(message));
     problem(`Unknown watch_actions ids: ${unknown.map(action => action.id).join(", ")}. Use an exact known id or a unique prefix of at least 8 characters${available ? "." : "; registry unavailable, verify on resume."}`, ctx.enforce && available);
   }
-  lint.push(...files.stale);
+  lint.push(...constraintLint(input, ctx.memoryIntent), ...files.stale);
   return { errors, lint: lint.slice(0, 8).map(line => Array.from(line).slice(0, 300).join("")) };
 }
