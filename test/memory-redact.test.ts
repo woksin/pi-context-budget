@@ -144,7 +144,11 @@ test("Bearer values of any length are redacted", () => {
 });
 
 test("a scanner module that never finishes loading withholds instead of falling back to built-in only", async () => {
-  const scanner = await loadScanner(agentDir("await new Promise(() => {}); export const scan = (t: string) => ({ text: t, kinds: [], count: 0, skipped: false });"), 100);
+  // The load timer is unref'd so it never keeps pi alive; hold the loop open here as the live runtime does.
+  const keepAlive = setInterval(() => {}, 1000);
+  let scanner;
+  try { scanner = await loadScanner(agentDir("await new Promise(() => {}); export const scan = (t: string) => ({ text: t, kinds: [], count: 0, skipped: false });"), 100); }
+  finally { clearInterval(keepAlive); }
   assert.ok(scanner, "a timed-out load must not look like an absent scanner");
   assert.deepEqual(redact(CANARIES.github.text, scanner), { text: null, withheld: "redactor_failed", redactions: [] });
 });
