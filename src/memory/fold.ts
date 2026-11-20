@@ -1,5 +1,6 @@
-import type { AddEvent, ConfirmEvent, FoldedState, FoldOptions, ItemStatus, JournalEntry, LocatedRecord, MemoryEvent, RetireEvent, WriteResult } from "./types.ts";
+import type { AddEvent, BoundaryEvent, ConfirmEvent, RequestCloseEvent, FoldedState, FoldOptions, ItemStatus, JournalEntry, LocatedRecord, MemoryEvent, RetireEvent, WriteResult } from "./types.ts";
 import { validateEvent, ValidationError } from "./validate.ts";
+import { validateRequestEvent } from "./requests.ts";
 
 type FoldContext = { state: FoldedState; messages: Map<string, JournalEntry>; options: FoldOptions };
 
@@ -45,9 +46,18 @@ function recordRejection(ctx: FoldContext, id: string, error: unknown): void {
   ctx.state.events[id] = result;
   ctx.state.rejectedEvents.push({ eventId: id, reason: result.reason!, ...(result.winningEventId ? { winningEventId: result.winningEventId } : {}) });
 }
+/** Request closures and boundaries are fold-validated like every event but never change intent state. */
+function foldRequestEvent(event: BoundaryEvent | RequestCloseEvent, id: string, ctx: FoldContext): void {
+  try {
+    validateRequestEvent(event, ctx.messages);
+    if (event.type === "boundary") ctx.state.boundaries.push(event); else ctx.state.closures.push(event);
+    ctx.state.events[id] = { ok: true, status: "applied", eventId: id };
+  } catch (error) { recordRejection(ctx, id, error); }
+}
 function foldOne(event: MemoryEvent, position: number, ctx: FoldContext): void {
   const id = typeof event.id === "string" ? event.id : `invalid:${position}`;
   if (Object.hasOwn(ctx.state.events, id)) return;
+  if (event.type === "boundary" || event.type === "request_close") return foldRequestEvent(event, id, ctx);
   const existing = existingAdd(event, ctx.state);
   if (existing) { ctx.state.events[id] = existing; return; }
   try {

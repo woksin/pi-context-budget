@@ -116,8 +116,8 @@ test("flags-off inertness: runtime entry points cannot reach any memory module",
   const root = join(import.meta.dirname, "..");
   const runtime = ["context-budget.ts", ...readdirSync(join(root, "src")).filter(f => f.endsWith(".ts")).map(f => `src/${f}`)];
   for (const file of runtime) {
-    // S3b wires only the pure flag parser and the flag-gated journal hook (which loads the store lazily).
-    const wired = ["./memory/config.ts", "./memory/journal-hook.ts"];
+    // Wired: the pure flag parser, the flag-gated journal and requests hooks, and the pure launch-fact derivation.
+    const wired = ["./memory/config.ts", "./memory/journal-hook.ts", "./memory/requests-hook.ts", "./memory/launch.ts"];
     const specifiers = [...readFileSync(join(root, file), "utf8").matchAll(/(?:from\s*|import\s*\(|require\s*\()\s*["']([^"']*memory\/[^"']*)["']/g)].map(match => match[1]);
     assert.deepEqual(specifiers.filter(specifier => !wired.includes(specifier)), [], file);
     if (file !== "src/extension.ts") assert.deepEqual(specifiers, [], file);
