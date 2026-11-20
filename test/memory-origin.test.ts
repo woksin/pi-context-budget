@@ -5,7 +5,8 @@ import { join } from "node:path";
 import { classifyOrigin, type OriginContext } from "../src/memory/origin.ts";
 
 const main: OriginContext = { hasUI: true, hostSubagent: false,
-  identity: { sessionId: "main", primarySessionId: "main" }, firstInput: false };
+  identity: { sessionId: "main", primarySessionId: "main" }, firstInput: false,
+  initialPrompt: null, relaunchPrompt: null };
 const classify = (source: unknown, text = "human request", context: Partial<OriginContext> = {}) =>
   classifyOrigin({ source, text }, { ...main, ...context });
 
@@ -37,8 +38,36 @@ test("launch matches exact adapter-supplied text only on the first input", () =>
     assert.equal(result.origin, "launch");
     assert.equal(result.injectedKind, field === "relaunchPrompt" ? "relaunch" : "brief");
     assert.equal(classify("interactive", "start task", { ...context, firstInput: false }).origin, "human");
-    assert.equal(classify("interactive", "start task ", context).origin, "human");
+    assert.equal(classify("interactive", "start task ", context).origin, "unattended");
     assert.notEqual(classify("rpc", "start task", context).origin, "human");
+  }
+});
+
+test("first input requires verified launch metadata; null explicitly verifies none", () => {
+  for (const context of [
+    { initialPrompt: undefined }, { relaunchPrompt: undefined },
+    { initialPrompt: undefined, relaunchPrompt: undefined },
+    { initialPrompt: "request", relaunchPrompt: undefined },
+    { initialPrompt: undefined, relaunchPrompt: "request" },
+  ]) {
+    const result = classify("interactive", "request", { firstInput: true, ...context });
+    assert.equal(result.origin, "unattended");
+    assert.ok(result.originEvidence.includes("launch-unverified"));
+  }
+  assert.equal(classify("interactive", "request", { firstInput: true }).origin, "human");
+  assert.equal(classify("interactive", "request", { firstInput: false, initialPrompt: undefined }).origin, "human");
+});
+
+test("normalized launch text embedded in first input cannot become human", () => {
+  for (const field of ["initialPrompt", "relaunchPrompt"] as const) {
+    const context = { firstInput: true, [field]: "  start\n\ttask  " };
+    for (const text of ["start task", "start\r\n  task ", "prefix start task suffix", "\tstart\t task\n"]) {
+      const result = classify("interactive", text, context);
+      assert.equal(result.origin, "unattended", text);
+      assert.ok(result.originEvidence.includes("launch-near-match"));
+      assert.equal(classify("interactive", text, { ...context, firstInput: false }).origin, "human");
+    }
+    assert.equal(classify("interactive", "unrelated request", context).origin, "human");
   }
 });
 
@@ -56,9 +85,11 @@ test("synthetic texts and forged lane headers cannot become human", () => {
     "[orch maintenance]\nsummary",
     "The previous request exceeded the model's context window, so the session was compacted automatically. Continue the interrupted task from where you stopped; re-check state from files and git before relying on earlier results.",
   ]) {
-    const result = classify("interactive", text);
-    assert.equal(result.origin, "injected", text);
-    assert.ok(result.originEvidence.some(e => e.startsWith("synthetic=")));
+    for (const prefix of ["", " \n\t"]) {
+      const result = classify("interactive", prefix + text);
+      assert.equal(result.origin, "injected", prefix + text);
+      assert.ok(result.originEvidence.some(e => e.startsWith("synthetic=")));
+    }
   }
 });
 

@@ -7,13 +7,13 @@ type Synthetic = { name: string; kind: NonNullable<JournalEntry["injectedKind"]>
  * A forged header is still synthetic, never evidence of human authority.
  */
 const SYNTHETIC_TEXTS: readonly { name: string; kind: Synthetic["kind"]; pattern: RegExp }[] = [
-  { name: "provider-continue", kind: "notice", pattern: /^Provider limits have lifted \([^\n]*\)\. Continue where you stopped\.$/ },
-  { name: "settle-recovery", kind: "notice", pattern: /^Context recovery is required\. Call context_handoff\b/ },
-  { name: "settle-idle", kind: "notice", pattern: /^Pending background work remains and context is large\. Call context_handoff\b/ },
-  { name: "handoff-retry", kind: "notice", pattern: /^Re-call context_handoff with the same fields, corrected\./ },
-  { name: "structured-retry", kind: "notice", pattern: /^(?:You did not call StructuredOutput, so your answer was not recorded\.|Your last StructuredOutput call did not match the required schema:)/ },
+  { name: "provider-continue", kind: "notice", pattern: /^\s*Provider limits have lifted \([^\n]*\)\. Continue where you stopped\.$/ },
+  { name: "settle-recovery", kind: "notice", pattern: /^\s*Context recovery is required\. Call context_handoff\b/ },
+  { name: "settle-idle", kind: "notice", pattern: /^\s*Pending background work remains and context is large\. Call context_handoff\b/ },
+  { name: "handoff-retry", kind: "notice", pattern: /^\s*Re-call context_handoff with the same fields, corrected\./ },
+  { name: "structured-retry", kind: "notice", pattern: /^\s*(?:You did not call StructuredOutput, so your answer was not recorded\.|Your last StructuredOutput call did not match the required schema:)/ },
   { name: "task-notification", kind: "notice", pattern: /^\s*<task-notification(?:\s|>)/ },
-  { name: "overflow-continue", kind: "notice", pattern: /^The previous request exceeded the model's context window, so the session was compacted automatically\. Continue the interrupted task/ },
+  { name: "overflow-continue", kind: "notice", pattern: /^\s*The previous request exceeded the model's context window, so the session was compacted automatically\. Continue the interrupted task/ },
   { name: "lane-header", kind: "lane_message", pattern: /^\s*\[orch(?:\s|\])/ },
 ];
 

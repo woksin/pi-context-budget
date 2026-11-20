@@ -1,7 +1,7 @@
 /** Offline real-runtime input routing. UI is stubbed; no provider is ever called. */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { findRuntime } from "./runtime.ts";
@@ -18,7 +18,8 @@ async function setup(t: { after(fn: () => void): void }, facts: Partial<OriginCo
   mkdirSync(agentDir);
   const records: OriginDecision[] = [], inputs: any[] = [], journalCalls: OriginDecision[] = [];
   let firstInput = true;
-  const context: OriginContext = { hostSubagent: false, identity: { sessionId: "main", primarySessionId: "main" }, ...facts };
+  const context: OriginContext = { hostSubagent: false, identity: { sessionId: "main", primarySessionId: "main" },
+    initialPrompt: null, relaunchPrompt: null, ...facts };
   const settingsManager = pc.SettingsManager.inMemory({ compaction: { enabled: false } });
   const loader = new pc.DefaultResourceLoader({ cwd: dir, agentDir, settingsManager,
     noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true, noExtensions: true,
@@ -34,7 +35,10 @@ async function setup(t: { after(fn: () => void): void }, facts: Partial<OriginCo
   const { session } = await pc.createAgentSession({ cwd: dir, agentDir, modelRuntime, resourceLoader: loader,
     noTools: "builtin", sessionManager: pc.SessionManager.inMemory(dir), settingsManager });
   await session.bindExtensions({ mode: facts.hasUI === false ? "print" : "interactive", ...(facts.hasUI === false ? {} : { uiContext: {} }) });
-  t.after(() => { session._isAgentRunActive = false; session.dispose(); });
+  t.after(() => {
+    try { session._isAgentRunActive = false; session.dispose(); }
+    finally { rmSync(dir, { recursive: true, force: true }); }
+  });
   return { session, dir, records, inputs, journalCalls, context, loader };
 }
 

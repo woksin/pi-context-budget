@@ -292,9 +292,23 @@ Directive authority is checked again at fold time against journal provenance. Wi
 
 The adapter supplies `hasUI`, the host's subagent bit, `{ sessionId, primarySessionId }`, and `firstInput` (count every input, including injected inputs). Either child signal skips journaling, regardless of source/UI. Missing identity, host bit or input position cannot grant human provenance. `originEvidence` records decisions without copying prompt bodies.
 
-For the first input, supply `initialPrompt`/`relaunchPrompt` as the **exact assembled input**, not merely an argv token or the contents of `launchPrompt`. pi combines `@file` text (including its file wrapper) and the positional continuation; `bin/pi-session` supplies both. Compare before skill/template expansion. These optional strings represent known launch inputs, not an instruction to read arbitrary paths. Later identical text is not automatically launch traffic.
+For the first input, supply `initialPrompt`/`relaunchPrompt` as the **exact assembled input**, not merely an argv token or the contents of `launchPrompt`. pi combines `@file` text (including its file wrapper) and the positional continuation; `bin/pi-session` supplies both. Each value is `string | null`: `null` explicitly verifies that no such launch prompt exists; `undefined` leaves it unverified. Either unverified value makes the first input unattended (`launch-unverified`), even if the other value matches. Exact matches are launch traffic; non-exact input containing a known launch text after trimming and collapsing whitespace is unattended (`launch-near-match`). These values are not instructions to read arbitrary paths. Later identical text is not automatically launch traffic.
 
-Decision precedence: child skip → extension injection → known synthetic text → non-interactive/no-UI unattended → first-input launch match → verified main human. Unknown sources always default to unattended. `source="interactive"` alone is insufficient: installed subagent `runAgent`/`resumeAgent` and structured retries call `session.prompt(text)` with no source option. `source="rpc"` is unattended even when the host exposes a UI bridge. Extension source wins over launch matches. Sender labels are descriptive only, never coordinator authority; forged orchestration headers are injected rather than human.
+S3b must run the gate **before every other input transform**, using untransformed input for launch and synthetic comparisons, not just before skill/template expansion. pi's input runner lets earlier extensions replace text while leaving `source="interactive"` unchanged; inspecting already-transformed text cannot establish its original provenance.
+
+Child exclusion runs first. The ordered `RULES` table then chooses its first match:
+
+| Rule | Decision |
+| --- | --- |
+| Extension | injected; takes precedence over launch matches |
+| Synthetic | injected for known synthetic text |
+| Unattended | non-interactive, unknown source or no UI |
+| Launch | first-input metadata verification, exact match or normalized near-match |
+| Position | unattended when input position is unverified |
+| Main | unattended unless main-session identity is verified |
+| Human | verified main input after every exclusion |
+
+Unknown sources always default to unattended. `source="interactive"` alone is insufficient: installed subagent `runAgent`/`resumeAgent` and structured retries call `session.prompt(text)` with no source option. `source="rpc"` is unattended even when the host exposes a UI bridge. Sender labels are descriptive only, never coordinator authority; forged orchestration headers are injected rather than human. **Residual risk:** unknown in-process senders calling `session.prompt()` without a source default to interactive and can classify as human when the other main/UI/launch checks pass. This gate cannot distinguish them from terminal input; adapters must label or exclude those senders.
 
 `src/memory/synthetic.ts` centralizes anchored provider-continue, settle/idle recovery, handoff/structured retry, overflow-continue, task-notification and orchestration-header recognition. Add new user-role synthetic senders here with hostile cases. Custom job/question/subagent completion messages bypass `input`; future journal code must not reinterpret those as human input.
 
