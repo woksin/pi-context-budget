@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 
 /** Every flag defaults to false: a missing block, missing flag, invalid value or parse error is off. */
 export type MemoryConfig = {
-  journal: boolean; requests: boolean; answers: "final" | "all" | false; answerPolicy: "carry" | false;
+  journal: boolean; requests: boolean; answers: "final" | "all" | false; answerPolicy: "carry" | "defer" | false;
   intent: boolean; resume: boolean; recall: boolean;
   scope: { mode: "only" | "all"; names: string[] }; coordinators: string[]; trustRpc: boolean;
 };
@@ -51,7 +51,7 @@ export function parseMemoryConfig(root: unknown): ParsedMemoryConfig {
   config.requests = flag(raw, "requests", reasons);
   if (config.requests && !config.journal) { config.requests = false; reasons.push("memory.requests requires memory.journal"); }
   config.answers = literal(raw, "answers", ["final", "all"], reasons);
-  config.answerPolicy = literal(raw, "answerPolicy", ["carry"], reasons);
+  config.answerPolicy = literal(raw, "answerPolicy", ["carry", "defer"], reasons);
   for (const key of ["intent", "resume", "recall"] as const) config[key] = flag(raw, key, reasons);
   config.scope = scope(raw.scope, reasons);
   if (raw.coordinators !== undefined) {

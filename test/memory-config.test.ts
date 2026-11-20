@@ -32,6 +32,11 @@ test("a complete block parses as written", () => {
   assert.deepEqual(parseMemoryConfig({ memory: ALL }), { config: { ...ALL, scope: { mode: "all", names: [] } }, reasons: [] });
 });
 
+test("answerPolicy accepts carry/defer but invalid values still fail the entire block closed", () => {
+  for (const policy of ["carry", "defer"]) assert.equal(parseMemoryConfig({ memory: { ...ALL, answerPolicy: policy } }).config.answerPolicy, policy);
+  assert.deepEqual(parseMemoryConfig({ memory: { ...ALL, answerPolicy: "later" } }).config, memoryOff());
+});
+
 test("requests requires journal", () => {
   const { config, reasons } = parseMemoryConfig({ memory: { requests: true } });
   assert.equal(config.requests, false);

@@ -29,6 +29,9 @@ done
 # The first invocation is exactly the original argument vector, except -- is a wrapper separator.
 # Session-selection flags are deliberately retained initially, but never on relaunch.
 initial=("${original[@]}")
+# Trusted narrow fact: only the first prompt-free TTY invocation. Never inherit it on a successor.
+export PI_SESSION_PROMPT_FREE=0
+if [[ -t 0 ]] && ((${#msgs[@]} == 0)); then PI_SESSION_PROMPT_FREE=1; fi
 relaunch_times=()
 child=0 interrupted=0
 forward() {
@@ -80,6 +83,7 @@ while :; do
   # Consumed only after validation. Never replay the old initial prompt or --resume flags.
   rm -- "$marker" || exit 4
   relaunch_times+=("$now")
+  PI_SESSION_PROMPT_FREE=0
   initial=("${opts[@]}")
   [[ -z ${fields[1]} ]] || initial+=("@${fields[1]}")
   initial+=("continue from ${fields[2]}")

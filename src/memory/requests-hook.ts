@@ -1,3 +1,5 @@
+import { renderRequests, selectDelivery } from "./render-requests.ts";
+import { createCarrier } from "./carrier.ts";
 import { flagOn, memoryOff, readMemoryConfig, type MemoryConfig } from "./config.ts";
 import { appendAnswer, newAnswerId, pickLastAnswer, redactAnswer, type AnswerBody, type AnswerKind, type AnswerParts, type AnswerRecord } from "./answers.ts";
 import { appendEvent, buildBoundary, type BoundaryKind } from "./boundary.ts";
@@ -6,7 +8,7 @@ import { loadScanner, type Scanner } from "./redact.ts";
 import { answersBytes, closeEvent, isRequest, readSessionState } from "./requests.ts";
 import { newId, type JournalEntry } from "./types.ts";
 import { createJournalHook, type HostFacts, type JournalHookDeps } from "./journal-hook.ts";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { BoundaryResult, ContextEvent, ContextEventResult, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { MachineEvent } from "../core.ts";
 import type { OverflowRecovery } from "../overflow-recovery.ts";
 import type { FileMemoryStore } from "./store.ts";
@@ -16,7 +18,7 @@ export const SESSION_CAP_BYTES = 50 * 1024 * 1024;
 const HELD_LIMIT = 100;
 type HookContext = { cwd: string; sessionManager: { getSessionId(): string; getSessionFile?(): string | undefined; getSessionName?(): string | undefined } };
 type AssistantMessage = { role?: string; content?: unknown; stopReason?: string; model?: string };
-export type RequestsHookDeps = { agentDir: string; configFile: string; host: () => HostFacts | undefined; blobWriter?: BlobWriter; capBytes?: number;
+export type RequestsHookDeps = { agentDir: string; configFile: string; host: () => HostFacts | undefined; hasTools?: () => boolean; blobWriter?: BlobWriter; capBytes?: number;
   log: (ctx: ExtensionContext, event: string, data?: Record<string, unknown>) => void };
 /** One assistant message as kept in process memory: it survives a failed write so a handoff can still carry it. */
 export type RunAnswer = { id: string; kind: AnswerKind; textBytes: number; stopReason: string; parts: Omit<AnswerParts, "requests">;
@@ -35,11 +37,12 @@ export function createRequestsHook(deps: RequestsHookDeps) {
   let memory: MemoryConfig = memoryOff(), store: Promise<FileMemoryStore> | undefined, scanner: Promise<Scanner | undefined> | undefined;
   let loadedFor: string | undefined, open = new Set<string>(), compactions = new Set<string>();
   let answers: RunAnswer[] = [], capture: string[] | undefined, expected: CompactionHint | undefined;
-  let runId = newId(), turn = 0, humanSeq = 0, degraded: string | undefined, interimsDropped = 0;
+  let runId = newId(), turn = 0, humanSeq = 0, captureSeq = 0, humanTurn = false, degraded: string | undefined, interimsDropped = 0;
   const reported = new Set<string>();
   const home = async () => (await (store ??= import("./store.ts").then(({ FileMemoryStore }) => new FileMemoryStore({ agentDir: deps.agentDir })))).home;
   const scanners = () => scanner ??= loadScanner(deps.agentDir);
-  const enabled = (ctx: HookContext) => !deps.host()?.subagent && flagOn(memory, ctx.sessionManager.getSessionName?.(), "requests");
+  const enabled = (ctx: HookContext) => [!deps.host()?.subagent, deps.hasTools?.() ?? true,
+    flagOn(memory, ctx.sessionManager.getSessionName?.(), "requests")].every(Boolean);
   const session = (ctx: HookContext) => ({ id: ctx.sessionManager.getSessionId(), role: "main" as const, file: ctx.sessionManager.getSessionFile?.() });
 
   /** Loud but non-blocking (contract 10.6): the event log gets one record per failure kind, the next render one line. */
@@ -94,7 +97,7 @@ export function createRequestsHook(deps: RequestsHookDeps) {
     const model = typeof message.model === "string" ? redactAnswer(message.model, scanner).text ?? undefined : undefined;
     const reason = stopReason(message.stopReason);
     const answer: RunAnswer = { id: newAnswerId(), kind, textBytes: Buffer.byteLength(body.text ?? ""), stopReason: reason, ids, body,
-      parts: { session: session(ctx), runId, kind, model, stopReason: reason, turn }, humanSeq, written: false, dropped: false };
+      parts: { session: session(ctx), runId, kind, model, stopReason: reason, turn }, humanSeq: captureSeq, written: false, dropped: false };
     answers.push(answer);
     if (kind === "interim" && memory.answers !== "all") { keep(); return; }
     if (await persist(ctx, answer)) await closeAnswered(ctx, answer);
@@ -117,27 +120,55 @@ export function createRequestsHook(deps: RequestsHookDeps) {
   const guarded = async (ctx: HookContext, what: string, action: () => Promise<void>): Promise<void> => {
     try { if (enabled(ctx)) await action(); } catch (error) { degrade(ctx, what, error); }
   };
+  async function selection(ctx: HookContext, held = answers) {
+    if (!enabled(ctx)) return;
+    try {
+      await load(ctx);
+      const state = readSessionState(await home(), session(ctx).id);
+      const boundary = state.boundaries.filter(b => b.event.kind !== "abort").at(-1);
+      return { boundary, data: selectDelivery({ ...state, sessionId: session(ctx).id, degraded }, held, humanSeq) };
+    } catch (error) {
+      degrade(ctx, "render", error);
+      return { boundary: undefined, data: { sessionId: session(ctx).id, requests: [], degraded } };
+    }
+  }
+  async function render(ctx: HookContext, emergency = false): Promise<string> {
+    const selected = await selection(ctx);
+    return selected ? renderRequests(selected.data, emergency) : "";
+  }
+  const carrier = createCarrier({ read: ctx => selection(ctx, []) });
   const compactionKind = (reason: string | undefined, packageInFlight: boolean): BoundaryKind => {
     if (reason === "overflow") return packageInFlight ? "overflow_package" : "overflow_native";
     return reason === "manual" ? (packageInFlight ? "overflow_package" : "manual") : "emergency";
   };
   return {
+    render,
+    context: carrier.context,
+    async handoff(ctx: HookContext) {
+      const selected = await selection(ctx);
+      return { requests: selected ? renderRequests(selected.data) : "", requestsTask: (selected?.data.requests.length ?? 0) > 0 };
+    },
+    takeHumanTurn(): boolean { const human = humanTurn; humanTurn = false; return human; },
+    deferAnswered: (ctx: HookContext): boolean => enabled(ctx) && memory.answerPolicy === "defer" && answers.some(isClosingAnswer),
     reload(): void { memory = readMemoryConfig(deps.configFile).config; },
-    reset(): void { loadedFor = undefined; open = new Set(); compactions = new Set(); answers = []; capture = undefined; expected = undefined; humanSeq = 0; degraded = undefined; interimsDropped = 0; reported.clear(); },
+    reset(): void { carrier.reset(); loadedFor = undefined; open = new Set(); compactions = new Set(); answers = []; capture = undefined; expected = undefined; humanSeq = 0; humanTurn = false; degraded = undefined; interimsDropped = 0; reported.clear(); },
     onJournaled: (entry: JournalEntry, ctx: HookContext) => guarded(ctx, "request_open", async () => {
       if (!isRequest(entry)) return;
       await load(ctx);
       open.add(entry.id); humanSeq++;
+      if (entry.origin === "human") humanTurn = true;
     }),
     agentStart(): void { runId = newId(); turn = 0; answers = []; capture = undefined; expected = undefined; },
     messageStart: (message: AssistantMessage, ctx: HookContext) => guarded(ctx, "answer_capture", async () => {
       if (message?.role !== "assistant") return;
       await load(ctx);
-      capture = [...open];
+      capture = [...open]; captureSeq = humanSeq;
     }),
     /** Awaited by the runtime before the message is persisted and before turn_end, so no boundary effect can run first. */
     messageEnd: (message: AssistantMessage, ctx: HookContext) => guarded(ctx, "answer_capture", async () => {
-      if (message?.role === "assistant") await captureAnswer(message, ctx);
+      if (message?.role !== "assistant") return;
+      carrier.completed(message.stopReason);
+      await captureAnswer(message, ctx);
     }),
     commit: (ctx: HookContext, handoffPath: string | undefined, idle: boolean) =>
       guarded(ctx, "boundary_write", () => boundary(ctx, idle ? "idle" : "handoff", { handoffPath })),
@@ -170,10 +201,20 @@ type BindDeps = {
   pendingWork: (ctx: ExtensionContext) => boolean;
   compactionOwned: () => boolean;
   status: (ctx: ExtensionContext) => void;
+  context: (event: ContextEvent, ctx: ExtensionContext) => Promise<ContextEventResult | undefined>;
 };
+function startMessage(result: BoundaryResult | undefined) {
+  const entry = result?.entries?.[0];
+  if (entry?.type === "custom_message") return { message: { customType: entry.customType, content: entry.content, display: false } };
+}
 /** Keep answer durability and request-boundary ordering together with the adapter's existing policy effects. */
 export function bindRequests(pi: ExtensionAPI, requests: RequestsHook, deps: BindDeps): void {
   const { safe, run, overflow, pendingWork, compactionOwned, status } = deps;
+  pi.on("context", safe(async (event, ctx) => {
+    const prior = await deps.context(event, ctx);
+    return await requests.context({ ...event, messages: prior?.messages ?? event.messages }, ctx) ?? prior;
+  }));
+  pi.on("before_agent_start", safe(async (_event, ctx) => startMessage(await run({ type: "before_agent_start" }, ctx) as BoundaryResult | undefined)));
   pi.on("agent_start", safe(async (_e, ctx) => { requests.agentStart(); await run({ type: "agent_start" }, ctx); }));
   pi.on("message_start", safe(async (e, ctx) => { await requests.messageStart(e.message, ctx); }));
   // Pi awaits message_end before turn_end, so an answer is durable before any commit effect.

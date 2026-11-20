@@ -253,12 +253,12 @@ export function emergencyHandoff(branch: readonly unknown[], sessionFile?: strin
     next_step: "Re-establish state from files and git, re-read user constraints in the session file, then continue. Do not assume any prior check passed." });
 }
 /** Mechanical backstops have no auto-state dependency, but must retain bounded emergency constraints/files. */
-export function emergencySummary(input: HandoffInput): string {
+export function emergencySummary(input: HandoffInput, requests = ""): string {
   input = boundedEmergency(input);
   return ["# Emergency handoff", input.goal, input.facts,
     input.user_constraints && `\n## User constraints (verbatim)\n${input.user_constraints}`,
     input.files_to_read?.length && `\n## Read first\n${input.files_to_read.join("\n")}`,
-    input.next_step].filter(Boolean).join("\n");
+    requests, input.next_step].filter(Boolean).join("\n");
 }
 export interface InventoryRecord { id?: string; agentId?: string; status?: string; label?: string; description?: string; exitCode?: number | null; logPath?: string; finishedAt?: number | string; endedAt?: number | string }
 export interface JobManager { list: () => InventoryRecord[] }

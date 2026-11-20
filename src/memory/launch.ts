@@ -26,11 +26,16 @@ function promptFree(args: readonly string[]): boolean {
 /**
  * Verified launch facts, fail closed. `null` means "verified: none"; `undefined` means unknown (the origin gate then
  * journals the first input as unattended). The authoritative `bin/pi-session` uses positional/@file prompts AND
- * PI_SESSION_ and PI_RELAUNCH_ environment markers. Their presence (even empty, including future markers) is unverified.
+ * PI_SESSION_ and PI_RELAUNCH_ markers. Only the wrapper's first prompt-free TTY fact is trusted;
+ * inherited/unknown markers, positional prompts and non-TTY stdin remain unverified.
  */
 export function deriveLaunchFacts(args: readonly string[], stdinIsTTY: boolean | undefined, env: NodeJS.ProcessEnv = process.env): LaunchFacts {
   const verified = stdinIsTTY === true && promptFree(args);
-  const relaunchIndicator = Object.keys(env).some(key => /^PI_(?:SESSION|RELAUNCH)(?:_|$)/.test(key));
+  const wrapperKeys = new Set(["PI_SESSION_WRAPPER", "PI_SESSION_PROMPT_FREE", "PI_SESSION_WRAPPER_PID", "PI_SESSION_LAUNCH_ID",
+    "PI_SESSION_MARKER_DIR", "PI_SESSION_MAX_RELAUNCHES_PER_HOUR", "PI_SESSION_PI", "PI_RELAUNCH_MARKER"]);
+  const markerKeys = Object.keys(env).filter(key => /^PI_(?:SESSION|RELAUNCH)(?:_|$)/.test(key));
+  const freshWrapper = env.PI_SESSION_WRAPPER === "1" && env.PI_SESSION_PROMPT_FREE === "1" && markerKeys.every(key => wrapperKeys.has(key));
+  const relaunchIndicator = markerKeys.length > 0 && !freshWrapper;
   return { initialPrompt: verified ? null : undefined, relaunchPrompt: verified && !relaunchIndicator ? null : undefined };
 }
 /** `process.argv` is `[runtime, script, ...args]`; any other shape is unknown. */

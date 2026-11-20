@@ -27,9 +27,10 @@ export async function overflowHarness(options: { mode?: string; config?: Record<
     sendUserMessage: (text: string, opts: unknown) => { sent.push({ text, opts }); } } as unknown as ExtensionAPI;
   let outcome = options.outcome ?? "ok", lastCompactResult: any, compact = 0, usage = 100;
   let during: (() => Promise<unknown>) | undefined;
+  const branch: any[] = [];
   const sid = `overflow-${dir.split("/").at(-1)}`;
   const ctx = { cwd: dir, hasUI: false, model: { provider: "test", id: "test" }, isIdle: () => true,
-    sessionManager: { getSessionId: () => sid, getSessionFile: () => join(dir, "session.jsonl"), getHeader: () => ({}), getBranch: () => [] },
+    sessionManager: { getSessionId: () => sid, getSessionFile: () => join(dir, "session.jsonl"), getHeader: () => ({}), getBranch: () => branch },
     getContextUsage: () => ({ tokens: usage }), shutdown: () => {}, ui: { notify: (text: string) => notifications.push(text), setStatus: () => {} },
     compact: (opts: any) => { compact++; void performCompact(opts); },
   } as unknown as ExtensionContext;
@@ -38,7 +39,9 @@ export async function overflowHarness(options: { mode?: string; config?: Record<
     await during?.();
     if (outcome === "ok") {
       lastCompactResult = await emit("session_before_compact", { reason: "manual", preparation: { firstKeptEntryId: "k1", tokensBefore: 999 } });
-      await emit("session_compact", { reason: "manual", fromExtension: !!lastCompactResult?.compaction });
+      const compactionEntry = { type: "compaction", id: `compact-${compact}`, ...lastCompactResult?.compaction };
+      branch.push(compactionEntry);
+      await emit("session_compact", { reason: "manual", compactionEntry, fromExtension: !!lastCompactResult?.compaction });
       opts.onComplete({});
       return;
     }

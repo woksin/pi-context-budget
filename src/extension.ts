@@ -1,5 +1,5 @@
 /** Pi adapter: collect observations, translate events, execute pure-machine outputs. */
-import type { ExtensionAPI, ExtensionContext, BoundaryResult, ToolCallEventResult, SessionBeforeCompactResult } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ContextEvent, BoundaryResult, ToolCallEventResult, SessionBeforeCompactResult } from "@earendil-works/pi-coding-agent";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -30,6 +30,8 @@ export default async function (pi: ExtensionAPI) {
   const { getAgentDir } = await import("@earendil-works/pi-coding-agent");
   return createContextBudgetExtension({ agentDir: getAgentDir() })(pi);
 }
+const hasActiveTools = (pi: ExtensionAPI) => (pi.getActiveTools?.().length ?? 1) > 0;
+
 export function createContextBudgetExtension({ agentDir, hosts = processSessionHosts(), launchFacts = processLaunchFacts }: { agentDir: string; hosts?: SessionHosts; launchFacts?: () => LaunchFacts }) {
   return async function contextBudgetExtension(pi: ExtensionAPI) {
     const stateDir = resolve(process.env.PI_CONTEXT_BUDGET_STATE_DIR || join(agentDir, "context-budget"));
@@ -51,7 +53,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
       catch (error) { console.error(`context-budget: event log unavailable: ${String(error)}`); }
     }
     const memoryDeps = { agentDir, configFile, log, host: () => host };
-    const requests = createRequestsHook(memoryDeps);
+    const requests = createRequestsHook({ ...memoryDeps, hasTools: () => hasActiveTools(pi) });
     const journal = wire(requests, { ...memoryDeps, launchFacts });
     function reload(ctx: ExtensionContext): void {
       journal.reload(ctx); requests.reload();
@@ -70,7 +72,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
     function frame(ctx: ExtensionContext, observedTokens?: number | null): Frame {
       return { mode: mode(ctx), tokens: observedTokens === undefined ? ctx.getContextUsage()?.tokens ?? null : observedTokens,
         thresholds: modelThresholds(config, ref(ctx), host?.subagent ?? false), config,
-        handoffAvailable: canHandoff(pi, host),
+        handoffAvailable: canHandoff(pi, host), deferAnswered: requests.deferAnswered(ctx),
         wrapped: !!host && ownsWrapper(process.pid, process.env, host.subagent) };
     }
     function step(event: MachineEvent, ctx: ExtensionContext, observed = frame(ctx)): Effect[] {
@@ -143,7 +145,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
         writeLaunchPrompt(promptPath, input.launch_prompt);
         input = { ...input, launch_prompt: promptPath };
       }
-      const h = renderHandoff(input, auto, id, sequence, path, new Date().toISOString());
+      const h = renderHandoff(input, { ...auto, ...await requests.handoff(ctx) }, id, sequence, path, new Date().toISOString());
       writeHandoff(h, auto, input);
       handoffRejections = 0;
       log(ctx, "handoff_written", { path, n: h.n, bytes: Buffer.byteLength(h.text) });
@@ -207,7 +209,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
             // Mechanical recovery must fit and work even if handoff storage/metadata is unavailable.
             const h = effect.handoff, emergency = h ? undefined : emergencyInput(ctx);
             const lint = emergency ? validateObserved(ctx, emergency, runningState([...knownIds], { cwd: ctx.cwd, sessionId: ctx.sessionManager.getSessionId() }), false).lint : [];
-            const summary = `${h?.text ?? emergencySummary(emergency!)}${lint.length ? `\n## Handoff lint\n${bytePrefix(lint.join("\n"), 1024)}` : ""}\nCompaction instance: ${randomUUID()}\n`;
+            const summary = `${h?.text ?? emergencySummary(emergency!, await requests.render(ctx, true))}${lint.length ? `\n## Handoff lint\n${bytePrefix(lint.join("\n"), 1024)}` : ""}\nCompaction instance: ${randomUUID()}\n`;
             log(ctx, "backstop", { path: h?.path, reason: "machine-authorized" });
             requests.expectBackstop({ kind: backstopKind(effect.source, !!h, ctx), handoffPath: h?.path });
             result = { compaction: { summary, firstKeptEntryId: null as unknown as string, tokensBefore: effect.tokensBefore,
@@ -261,7 +263,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
     pi.on("session_tree", safe((_e, ctx) => reset(ctx)));
     // Context runs after Pi has installed the boundary and before the resumed
     // provider call, including retain-none commits returned from turn_end.
-    pi.on("context", safe(async (event, ctx) => {
+    async function requestContext(event: ContextEvent, ctx: ExtensionContext) {
       if (mode(ctx) !== "enforce") return;
       const boundary = [...ctx.sessionManager.getBranch()].reverse().find(e => e.type === "compaction");
       if (!boundary || (boundary.details as { kind?: string } | undefined)?.kind !== "handoff") return;
@@ -281,10 +283,9 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
       }
       const message = [resumeMessage, watchMessage].filter(Boolean).join("\n\n");
       if (message) return { messages: [...event.messages, { role: "custom" as const, customType: "context-budget-resume-check", content: message, display: false, timestamp: Date.now() }] };
-    }));
+    }
     const pendingWork = (ctx: ExtensionContext) => { const r = runningState([...knownIds], { cwd: ctx.cwd, sessionId: ctx.sessionManager.getSessionId() }); return !!(r.jobs.length || r.subagents.length); };
-    bindRequests(pi, requests, { safe, run, overflow, pendingWork, status, compactionOwned: () => !!state.compaction });
-    pi.on("before_agent_start", safe(async (_e, ctx) => { await run({ type: "before_agent_start" }, ctx); }));
+    bindRequests(pi, requests, { safe, run, overflow, pendingWork, status, compactionOwned: () => !!state.compaction, context: requestContext });
     pi.registerTool({
       name: "context_handoff", label: "Context handoff",
       description: "Write a concise structured handoff, then END THIS TURN without more tools. Recovery continues automatically; an idle request resets the context at the end of this turn. Separate facts from hypotheses and preserve user constraints verbatim.",
@@ -352,7 +353,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
     pi.on("agent_before_settle", safe((_e, ctx) => run({ type: "agent_before_settle", pendingWork: pendingWork(ctx) }, ctx)));
     pi.on("input", safe(async (e, ctx) => {
       reload(ctx); await journal.onInput(e, ctx); overflow.input(e.source);
-      await run({ type: "input", now: Date.now(), streaming: !!e.streamingBehavior, alreadyCompacted: ctx.sessionManager.getBranch().at(-1)?.type === "compaction" }, ctx);
+      await run({ type: "input", now: Date.now(), streaming: !!e.streamingBehavior, alreadyCompacted: ctx.sessionManager.getBranch().at(-1)?.type === "compaction", human: requests.takeHumanTurn() }, ctx);
       return { action: "continue" as const };
     }));
     pi.on("session_before_compact", (e, ctx) => overflow.beforeCompact(e, ctx, async () => {
