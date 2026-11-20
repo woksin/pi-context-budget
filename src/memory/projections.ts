@@ -8,7 +8,7 @@ type Counts = { read: number; ignored: number; malformed: number; unknown: numbe
 type Repository = { root: string; remote?: string };
 type Options = { agentDir: string; repo?: Repository; env?: Record<string, string | undefined> };
 type Question = { id: string; title: string; body: string; repo: string | null; status: string;
-  updatedAt: string; history: unknown[]; answer?: { text: string } };
+  updatedAt: string; history: unknown[]; options?: { key: string; text: string }[]; answer?: { text: string; option?: string } };
 const statuses = ["open", "answered", "decided", "deferred", "withdrawn", "superseded", "closed"];
 
 /** Enumeration is bounded too. Never use a partial revision listing to select stale history. */
@@ -61,11 +61,20 @@ function questionMetadata(item: Question): boolean {
   const dated = typeof item.updatedAt === "string" && Number.isFinite(Date.parse(item.updatedAt));
   return repoKnown && dated && Array.isArray(item.history) && statuses.includes(item.status);
 }
+function selectedOption(item: Question) {
+  if (!Array.isArray(item.options)) return undefined;
+  return item.options.find(option => option?.key === item.answer?.option && typeof option.text === "string");
+}
+function questionAnswer(item: Question): boolean {
+  if (item.status !== "decided") return true;
+  if (typeof item.answer?.text !== "string") return false;
+  if (item.answer.option === undefined) return true;
+  return typeof item.answer.option === "string" && !!selectedOption(item);
+}
 function question(value: unknown, id: string): value is Question {
   if (!value || typeof value !== "object") return false;
   const item = value as Question;
-  const answered = item.status !== "decided" || typeof item.answer?.text === "string";
-  return item.id === id && questionText(item) && questionMetadata(item) && answered;
+  return item.id === id && questionText(item) && questionMetadata(item) && questionAnswer(item);
 }
 function repoMatches(recorded: string, repo: Repository, remote?: string): boolean {
   // pi-questions stores the last two origin path components, or the root basename without an origin.
@@ -79,10 +88,15 @@ function questionScope(recorded: string | null, repo?: Repository): Scope {
   if (repo && repoMatches(recorded, repo, remote)) return { kind: "repo", key: remote ?? repo.root };
   return { kind: "repo", key: recorded };
 }
+function answerText(item: Question): string[] {
+  const answer = item.answer!;
+  if (answer.option === undefined) return [answer.text];
+  return [`${answer.option}: ${selectedOption(item)!.text}`, answer.text];
+}
 function projected(item: Question, repo?: Repository): FoldedItem {
   const id = `question_item:${item.id}`;
   return { id, kind: "decision", scope: questionScope(item.repo, repo),
-    text: [item.title, item.body, item.answer!.text].join("\n"), source: { type: "question_item", ref: item.id },
+    text: [item.title, item.body, ...answerText(item)].join("\n"), source: { type: "question_item", ref: item.id },
     supersedes: [], status: "active", at: item.updatedAt, eventId: id, changedBy: id };
 }
 function readItem(root: string, id: string, options: Options, counts: Counts): FoldedItem | undefined {
@@ -98,11 +112,17 @@ function readItem(root: string, id: string, options: Options, counts: Counts): F
   } catch { counts.malformed++; return undefined; }
 }
 
+function itemEntries(root: string, counts: Counts) {
+  return entries(root, counts).filter(entry => {
+    const valid = entry.isDirectory() && /^Q-\d+$/.test(entry.name);
+    if (!valid) counts.ignored++;
+    return valid;
+  }).sort((a, b) => Number(BigInt(b.name.slice(2)) - BigInt(a.name.slice(2))));
+}
 function collectItems(root: string, options: Options, counts: Counts): FoldedItem[] {
   const items: FoldedItem[] = [];
-  for (const entry of entries(root, counts)) {
+  for (const entry of itemEntries(root, counts)) {
     if (counts.read >= QUESTION_LIMITS.files) { counts.limited++; break; }
-    if (!entry.isDirectory() || !/^Q-\d+$/.test(entry.name)) { counts.ignored++; continue; }
     const item = readItem(root, entry.name, options, counts);
     if (item) items.push(item);
   }

@@ -79,10 +79,13 @@ function hygieneScopes(items: FoldedItem[]): string[] {
   return [...counts].filter(([, count]) => count > 50).map(([scope]) => scope).sort(compare);
 }
 
+function sourceKey(item: FoldedItem): string | undefined {
+  return item.source.ref ? JSON.stringify([item.source.type, item.source.ref]) : undefined;
+}
 function mergedItems(stored: FoldedItem[], projected: readonly FoldedItem[] = []): FoldedItem[] {
-  const refs = new Set(stored.map(item => item.source.ref).filter(Boolean));
+  const refs = new Set(stored.map(sourceKey).filter(Boolean));
   const additions = projected.filter(item => {
-    const ref = item.source.ref;
+    const ref = sourceKey(item);
     if (ref && refs.has(ref)) return false;
     if (ref) refs.add(ref);
     return true;
