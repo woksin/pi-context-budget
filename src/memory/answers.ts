@@ -23,50 +23,56 @@ export type AnswerBody = Pick<AnswerRecord, "text" | "withheld" | "redactions">;
 const digest = (text: string) => createHash("sha256").update(text).digest("hex");
 export const answerFile = (home: string, sessionId: string) => join(home, "answers", `${sessionId}.jsonl`);
 export const redactAnswer = (text: string, scanner?: Scanner): AnswerBody => redact(text, scanner);
-const tail = (text: string, bytes: number) => [...utf8Head([...text].reverse().join(""), bytes)].reverse().join("");
+const previewTail = (record: AnswerRecord) => [...utf8Head([...(record.text ?? "")].reverse().join(""), 1024)].reverse().join("");
 
 const fitsInline = (record: AnswerRecord) => recordBytes(record) <= ANSWER_INLINE_BYTES;
 function fitPreview(record: AnswerRecord): void {
   const text = record.text ?? "";
   record.blob = { sha256: record.sha256, bytes: record.textBytes };
-  record.text = `${utf8Head(text, 2048)}\n…\n${tail(text, 1024)}`;
+  record.text = `${utf8Head(text, 2048)}\n…\n${previewTail(record)}`;
   // Escaped preview bytes count too; metadata alone that cannot fit fails without a referencing record.
   if (!fitsInline(record)) record.text = "";
   if (!fitsInline(record)) throw Error("too_large");
+}
+function inlineOrBlob(record: AnswerRecord, text: string, writer: (record: AnswerRecord, text: string) => void): void {
+  if (record.text === null || fitsInline(record)) return;
+  fitPreview(record);
+  writer(record, text);
 }
 export type AnswerParts = { session: Session; runId: string; requests: IdSet; kind: AnswerKind; model?: string; stopReason: string; turn: number };
 /** Large bodies keep head and tail inline; the whole redacted body goes to a blob written before the record. */
 export function appendAnswer(home: string, id: string, parts: AnswerParts, body: AnswerBody, writer: BlobWriter = writeBlobFile): AnswerRecord {
   const text = body.text ?? "", textBytes = Buffer.byteLength(text);
   const record: AnswerRecord = { schema: "memory.answer/2", id, at: new Date().toISOString(), ...parts, ...body, textBytes, sha256: digest(text) };
-  if (!fitsInline(record)) {
-    fitPreview(record);
-    writer(home, `${record.sha256}.txt`, text);
-  }
+  inlineOrBlob(record, text, (answer, body) => writer(home, `${answer.sha256}.txt`, body));
   appendRecord(answerFile(home, parts.session.id), record, ANSWER_INLINE_BYTES);
   return record;
 }
 export const newAnswerId = newId;
 
-function hydrate(home: string, record: AnswerRecord): AnswerRecord {
+function hydrate(record: AnswerRecord, readBlob: (blob: BlobRef) => string): AnswerRecord {
   if (!record.blob) return record;
   try {
-    const text = readFileSync(join(home, "blobs", `${record.blob.sha256}.txt`), "utf8");
+    const text = readBlob(record.blob);
     return digest(text) === record.blob.sha256 ? { ...record, text } : { ...record, text: null, withheld: "too_large" };
   } catch { return { ...record, text: null, withheld: "too_large" }; }
 }
-const wellFormed = (record: AnswerRecord): boolean => record.schema === "memory.answer/2" && safeName(record.id) &&
-  (record.kind === "final" || record.kind === "interim") && typeof record.stopReason === "string" && typeof record.runId === "string";
+const hasAnswerIdentity = (record: AnswerRecord): boolean => record.schema === "memory.answer/2" && safeName(record.id);
+const hasAnswerKind = (record: AnswerRecord): boolean => record.kind === "final" || record.kind === "interim";
+const hasRunId = (record: AnswerRecord): boolean => typeof record.runId === "string";
+const hasStopReason = (record: AnswerRecord): boolean => typeof record.stopReason === "string";
+const wellFormed = (record: AnswerRecord): boolean => hasAnswerIdentity(record) && hasAnswerKind(record) && hasRunId(record) && hasStopReason(record);
 
 /** Reader contract: skip unparsable/crc-bad lines, dedup by id, never write. A missing session file is an empty log. */
 export function readAnswers(home: string, sessionId: string): AnswerRecord[] {
   if (!safeName(sessionId)) return [];
   const seen = new Set<string>(), answers: AnswerRecord[] = [];
+  const readBlob = (blob: BlobRef) => readFileSync(join(home, "blobs", `${blob.sha256}.txt`), "utf8");
   for (const { record } of scanLog(answerFile(home, sessionId), ANSWER_INLINE_BYTES).records) {
     const answer = record as AnswerRecord;
     if (!wellFormed(answer) || seen.has(answer.id)) continue;
     seen.add(answer.id);
-    answers.push(hydrate(home, answer));
+    answers.push(hydrate(answer, readBlob));
   }
   return answers;
 }

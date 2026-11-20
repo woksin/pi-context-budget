@@ -5,8 +5,10 @@ import { makeIdSet, type BlobWriter } from "./idset.ts";
 import { loadScanner, type Scanner } from "./redact.ts";
 import { answersBytes, closeEvent, isRequest, readSessionState } from "./requests.ts";
 import { newId, type JournalEntry } from "./types.ts";
-import type { HostFacts } from "./journal-hook.ts";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { createJournalHook, type HostFacts, type JournalHookDeps } from "./journal-hook.ts";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { MachineEvent } from "../core.ts";
+import type { OverflowRecovery } from "../overflow-recovery.ts";
 import type { FileMemoryStore } from "./store.ts";
 
 /** Contract 10.7: past this many bytes in one session file new interim answers are dropped; finals are always kept. */
@@ -156,3 +158,33 @@ export function createRequestsHook(deps: RequestsHookDeps) {
 }
 export type RequestsHook = ReturnType<typeof createRequestsHook>;
 export type { AnswerRecord };
+
+/** Link only durable journal entries to the request hook, without changing the journal's standalone API. */
+export function wire(requests: RequestsHook, deps: Omit<JournalHookDeps, "onJournaled">) {
+  return createJournalHook({ ...deps, onJournaled: requests.onJournaled });
+}
+type BindDeps = {
+  safe: <E, R>(handler: (event: E, ctx: ExtensionContext) => R | Promise<R>) => (event: E, ctx: ExtensionContext) => Promise<R | undefined>;
+  run: (event: MachineEvent, ctx: ExtensionContext) => Promise<unknown>;
+  overflow: Pick<OverflowRecovery, "settled" | "nativeCompaction" | "packageCompacting">;
+  pendingWork: (ctx: ExtensionContext) => boolean;
+  compactionOwned: () => boolean;
+  status: (ctx: ExtensionContext) => void;
+};
+/** Keep answer durability and request-boundary ordering together with the adapter's existing policy effects. */
+export function bindRequests(pi: ExtensionAPI, requests: RequestsHook, deps: BindDeps): void {
+  const { safe, run, overflow, pendingWork, compactionOwned, status } = deps;
+  pi.on("agent_start", safe(async (_e, ctx) => { requests.agentStart(); await run({ type: "agent_start" }, ctx); }));
+  pi.on("message_start", safe(async (e, ctx) => { await requests.messageStart(e.message, ctx); }));
+  // Pi awaits message_end before turn_end, so an answer is durable before any commit effect.
+  pi.on("message_end", safe(async (e, ctx) => { await requests.messageEnd(e.message, ctx); }));
+  pi.on("agent_settled", safe(async (e, ctx) => {
+    await run({ type: "agent_settled", now: Date.now(), aborted: e.aborted, pendingWork: pendingWork(ctx) }, ctx);
+    await requests.settled(e.aborted, ctx); await overflow.settled(ctx, e.aborted);
+  }));
+  pi.on("session_compact", safe(async (e, ctx) => {
+    overflow.nativeCompaction(ctx, e.reason); await run({ type: "session_compact", owned: compactionOwned() && e.fromExtension }, ctx); status(ctx);
+    await requests.compacted(e, ctx, overflow.packageCompacting);
+  }));
+  pi.on("session_compact_failed", safe(async (e, ctx) => { requests.compactionFailed(); overflow.nativeCompaction(ctx, e.reason); await run(e, ctx); }));
+}

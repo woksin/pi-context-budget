@@ -7,6 +7,7 @@ import { createContextBudgetExtension } from "../src/extension.ts";
 import { SessionHosts } from "../src/storage.ts";
 import { INLINE_IDS, makeIdSet, resolveIdSet } from "../src/memory/idset.ts";
 import { appendAnswer, pickLastAnswer, readAnswers } from "../src/memory/answers.ts";
+import { createRequestsHook } from "../src/memory/requests-hook.ts";
 import { readSessionState } from "../src/memory/requests.ts";
 import { processLaunchFacts, deriveLaunchFacts } from "../src/memory/launch.ts";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -23,7 +24,10 @@ async function harness(memory: unknown = ON, launchFacts = () => ({ initialPromp
   process.env.PI_CONTEXT_BUDGET_CONFIG = configFile; process.env.PI_CONTEXT_BUDGET_STATE_DIR = join(dir, "state"); delete process.env.PI_MEMORY_HOME;
   writeFileSync(configFile, JSON.stringify({ mode: "observe", ...(memory === "absent" ? {} : { memory }) }));
   const handlers = new Map<string, (e: any, ctx: ExtensionContext) => Promise<any>>();
-  const pi = { on: (name: string, handler: any) => { handlers.set(name, handler); }, registerTool() {}, getActiveTools: () => ["read"], getAllTools: () => [{ name: "read" }] } as unknown as ExtensionAPI;
+  const tools: unknown[] = [];
+  const pi = { on: (name: string, handler: any) => { handlers.set(name, handler); },
+    registerTool(tool: any) { tools.push({ name: tool.name, label: tool.label, description: tool.description, parameters: tool.parameters }); },
+    getActiveTools: () => ["read"], getAllTools: () => [{ name: "read" }] } as unknown as ExtensionAPI;
   const ctx = { cwd: dir, hasUI: true, model: { provider: "t", id: "t" },
     sessionManager: { getSessionId: () => "s1", getSessionFile: () => join(dir, "session.jsonl"), getSessionName: () => undefined, getHeader: () => ({}), getBranch: () => [] },
     getContextUsage: () => ({ tokens: 10 }), shutdown() {}, ui: { notify() {}, setStatus() {} } } as unknown as ExtensionContext;
@@ -37,7 +41,7 @@ async function harness(memory: unknown = ON, launchFacts = () => ({ initialPromp
     await fire("message_end", { message: { role: "assistant", content, stopReason, model: "m" } });
   };
   const state = () => readSessionState(home, "s1");
-  return { dir, home, fire, human, assistant, state, agentDir, trace: () => [...handlers.keys()] };
+  return { dir, home, fire, human, assistant, state, agentDir, configFile, ctx, trace: () => ({ tools, activeTools: pi.getActiveTools() }) };
 }
 const text = (value: string) => ({ type: "text", text: value });
 
@@ -83,15 +87,18 @@ test("flags off or requests off: no answers, no events, no files", async () => {
   }
 });
 
-test("memory absent and empty are structurally identical through the same lifecycle", async () => {
-  const absent = await harness("absent"), empty = await harness({});
-  assert.deepEqual(absent.trace(), empty.trace());
-  for (const h of [absent, empty]) {
-    await h.human("same task"); await h.fire("agent_start"); await h.assistant([text("same answer")]);
-    await h.fire("turn_end", {}); await h.fire("session_compact", { compactionEntry: { id: "boundary" } }); await h.fire("agent_settled", { aborted: false });
-    assert.equal(existsSync(h.home), false);
+test("flags-off and flags-on preserve tool and prompt structure; only flags-on writes memory", async () => {
+  const absent = await harness("absent"), empty = await harness({}), on = await harness();
+  const structures: unknown[] = [];
+  for (const h of [absent, empty, on]) {
+    const input = await h.human("same task");
+    const prompt = await h.fire("before_agent_start", { systemPrompt: "same system prompt", prompt: "same task" });
+    const context = await h.fire("context", { messages: [{ role: "user", content: [text("same task")], timestamp: 0 }] });
+    structures.push({ ...h.trace(), input, prompt, context });
   }
-  assert.deepEqual(absent.state(), empty.state());
+  assert.deepEqual(structures[0], structures[2]); assert.deepEqual(structures[1], structures[2]);
+  assert.equal(existsSync(absent.home), false); assert.equal(existsSync(empty.home), false);
+  assert.equal(existsSync(join(on.home, "journal/s1.jsonl")), true);
 });
 
 test("request opens on human input, a final stop answer closes it, interim answers do not", async () => {
@@ -119,14 +126,20 @@ test("answers=all keeps interim answers; stopReason other than stop leaves the r
   assert.equal(s.open.length, 1);
 });
 
-test("open set survives a restart: a new extension instance rebuilds it from the files", async () => {
+test("open set survives a restart: a second hook loads requests and compaction ids from the files", async () => {
   const h = await harness();
   await h.human("first");
-  await h.fire("session_compact", { reason: "manual", compactionEntry: { id: "restart-boundary" } });
-  const again = readSessionState(h.home, "s1");
-  assert.deepEqual(again.open.map(r => r.id), h.state().open.map(r => r.id));
-  assert.equal(again.open.length, 1);
-  assert.equal(again.open[0].interruptions, 1);
+  const compaction = { reason: "manual", compactionEntry: { id: "restart-boundary" } };
+  await h.fire("session_compact", compaction);
+  const ids = h.state().open.map(r => r.id);
+  const second = createRequestsHook({ agentDir: h.agentDir, configFile: h.configFile, host: () => undefined, log() {} });
+  second.reload(); await second.messageStart({ role: "assistant" }, h.ctx);
+  assert.deepEqual(second.carried().open, ids); assert.equal(ids.length, 1);
+  await second.compacted(compaction, h.ctx, false);
+  assert.equal(h.state().open[0].interruptions, 1, "load restores deduplication as well as open membership");
+  await second.messageEnd({ role: "assistant", content: [text("answered after restart")], stopReason: "stop" }, h.ctx);
+  assert.equal(h.state().open.length, 0);
+  assert.deepEqual(resolveIdSet(h.home, h.state().answers[0].requests), { count: 1, ids });
 });
 
 test("abort with open requests writes an abort boundary; compaction writes one boundary per entry", async () => {

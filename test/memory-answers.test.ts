@@ -58,6 +58,18 @@ test("the exact serialized 8191/8192-byte boundary includes CRC and metadata", (
   assert.ok(Buffer.byteLength(JSON.stringify({ ...at, crc: "00000000" })) < 8192);
 });
 
+test("withheld answers never gain text or a blob, even when metadata is oversized", () => {
+  const dir = home(), body = { text: null, withheld: "redactor_failed" as const, redactions: [] };
+  let writes = 0;
+  const writer = () => { writes++; };
+  const record = appendAnswer(dir, "withheld", parts, body, writer);
+  assert.equal(record.text, null); assert.equal(record.blob, undefined);
+  assert.throws(() => appendAnswer(dir, "oversized", { ...parts, model: "m".repeat(9000) }, body, writer), /too_large/);
+  assert.equal(writes, 0);
+  assert.deepEqual(readAnswers(dir, "s1").map(a => ({ text: a.text, blob: a.blob, withheld: a.withheld })),
+    [{ text: null, blob: undefined, withheld: "redactor_failed" }]);
+});
+
 test("volume accounting includes answer bodies and request-set blobs without double counting", () => {
   const dir = home(), value = "body ".repeat(4000);
   appendAnswer(dir, "a1", parts, { text: value, withheld: null, redactions: [] });

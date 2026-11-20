@@ -76,11 +76,13 @@ function validEvents(home: string, messages: Map<string, JournalEntry>): Array<B
   }
   return events;
 }
+function isBoundary(event: BoundaryEvent | RequestCloseEvent): event is BoundaryEvent { return event.type === "boundary"; }
+function isClosure(event: BoundaryEvent | RequestCloseEvent): event is RequestCloseEvent { return event.type === "request_close"; }
 function readEvents(home: string, sessionId: string, messages: Map<string, JournalEntry>) {
   const events = validEvents(home, messages);
-  const boundaries = events.filter((event): event is BoundaryEvent => event.type === "boundary").filter(event => event.session.id === sessionId);
+  const boundaries = events.filter(isBoundary).filter(event => event.session.id === sessionId);
   const closed = new Map<string, RequestCloseEvent>();
-  for (const event of events.filter((event): event is RequestCloseEvent => event.type === "request_close")) {
+  for (const event of events.filter(isClosure)) {
     if (!closed.has(event.requestId)) closed.set(event.requestId, event);
   }
   return { boundaries, closed };
@@ -108,18 +110,21 @@ export function readSessionState(home: string, sessionId: string): SessionState 
   const agentAbandonments = [...closed.values()].filter(event => event.status === "abandoned" && event.actor.kind === "agent");
   return { requests, open: requests.filter(r => r.status === "open"), answers, boundaries: resolved, possiblyUnseen: possiblyUnseen(boundaries), agentAbandonments };
 }
-/** Session volume includes every distinct referenced body/id-set blob, not just the small JSONL previews. */
-export function answersBytes(home: string, sessionId: string): number {
-  const file = join(home, "answers", `${sessionId}.jsonl`);
-  if (!existsSync(file)) return 0;
+function blobPaths(records: ReturnType<typeof scanLog>["records"]): Set<string> {
   const blobs = new Set<string>();
-  for (const { record } of scanLog(file).records) {
+  for (const { record } of records) {
     const answer = record as AnswerRecord;
     if (answer.blob) blobs.add(`${answer.blob.sha256}.txt`);
     if (answer.requests && "blob" in answer.requests) blobs.add(answer.requests.blob);
   }
+  return blobs;
+}
+/** Session volume includes every distinct referenced body/id-set blob, not just the small JSONL previews. */
+export function answersBytes(home: string, sessionId: string): number {
+  const file = join(home, "answers", `${sessionId}.jsonl`);
+  if (!existsSync(file)) return 0;
   let bytes = statSync(file).size;
-  for (const blob of blobs) {
+  for (const blob of blobPaths(scanLog(file).records)) {
     if (/^[a-f0-9]{64}\.txt$/.test(blob)) bytes += statSync(join(home, "blobs", blob)).size;
   }
   return bytes;
