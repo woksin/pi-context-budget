@@ -7,6 +7,7 @@ import { randomUUID } from "node:crypto";
 import { effectiveMode, modelThresholds, parseConfig, renderHandoff, validateHandoff, ownsWrapper, effectiveThresholds, launchPromptKind, shorten, RETRY, normalizeFilesToRead, initialState, transition, policyStatus,
   restoreHistory, handoffBackoff, forced, fallbackFor, degradedFor, type Effect, type Frame, type MachineEvent, type AutoState, type Handoff, type HandoffInput, type HistoryItem } from "./core.ts";
 import { checkHandoff } from "./validate.ts";
+import { handoffMemory, legacyBranch, legacyReplay } from "./memory/handoff-hook.ts";
 import { canHandoff, softNotice } from "./budget-notice.ts";
 import { OverflowRecovery } from "./overflow-recovery.ts";
 import { graceEligible } from "./grace.ts";
@@ -15,7 +16,7 @@ import { appendEvent, atomicJson, collectRepos, handoffHead, issueClaims, runnin
 import { bindRequests, createRequestsHook, wire } from "./memory/requests-hook.ts";
 import { processLaunchFacts, type LaunchFacts } from "./memory/launch.ts";
 import { createIntentHook } from "./memory/tools.ts";
-import { bytePrefix, chainIdentity, emergencyHandoff, emergencySummary, previousHandoff, primaryHead, userMessagesSince } from "./collect.ts";
+import { bytePrefix, chainIdentity, emergencyHandoff, emergencySummary, previousHandoff, primaryHead } from "./collect.ts";
 
 type ActionResult = BoundaryResult & ToolCallEventResult & SessionBeforeCompactResult;
 type StatusState = "active" | "ended";
@@ -113,7 +114,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
       const home = process.env.PI_QUESTIONS_HOME || join(agentDir, "user-questions");
       return { cwd: resolve(ctx.cwd), root: collected.cwdRoot ?? resolve(ctx.cwd), branch: primary?.branch ?? (collected.repos.length ? "see repositories below" : "unknown/detached"),
         head: primary?.head ?? primaryHead(collected.repos), dirty: collected.dirty, sync: primary?.sync ?? "unknown", ...running,
-        repos: collected.repos, claims: collected.claims, userMessages: userMessagesSince(branch, state.lastHandoff?.at),
+        repos: collected.repos, claims: collected.claims, userMessages: legacyReplay(intent, ctx, branch, state.lastHandoff?.at),
         questions: pendingQuestions(home, chainIdentity(branch, id, state.lastHandoff?.path)) };
     }
     function checkCommand(ctx: ExtensionContext) {
@@ -129,7 +130,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
     function validateObserved(ctx: ExtensionContext, input: HandoffInput, running: ReturnType<typeof runningState>, enforce: boolean) {
       const checked = checkHandoff(input, { running, knownIds: [...knownIds], exists: isFile,
         mtimeMs: path => { try { const s = statSync(path); return s.isFile() ? s.mtimeMs : undefined; } catch { return undefined; } },
-        branch: ctx.sessionManager.getBranch(), enforce });
+        branch: ctx.sessionManager.getBranch(), enforce, memoryIntent: intent.enabled(ctx) });
       if (checked.lint.length) log(ctx, "handoff_lint", { warnings: checked.lint });
       return checked;
     }
@@ -147,7 +148,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
         writeLaunchPrompt(promptPath, input.launch_prompt);
         input = { ...input, launch_prompt: promptPath };
       }
-      const h = renderHandoff(input, { ...auto, ...await requests.handoff(ctx) }, id, sequence, path, new Date().toISOString());
+      const h = renderHandoff(input, { ...auto, ...await requests.handoff(ctx), memory: await handoffMemory(intent, ctx, state.lastHandoff) }, id, sequence, path, new Date().toISOString());
       writeHandoff(h, auto, input);
       handoffRejections = 0;
       log(ctx, "handoff_written", { path, n: h.n, bytes: Buffer.byteLength(h.text) });
@@ -156,7 +157,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
     function emergencyInput(ctx: ExtensionContext): HandoffInput {
       const branch = ctx.sessionManager.getBranch();
       const previous = previousHandoff(branch, state.lastHandoff, path => readFileSync(path, "utf8"));
-      return emergencyHandoff(branch, ctx.sessionManager.getSessionFile(), previous, state.lastHandoff?.at);
+      return emergencyHandoff(legacyBranch(intent, ctx, branch), ctx.sessionManager.getSessionFile(), previous, state.lastHandoff?.at);
     }
     async function compact(ctx: ExtensionContext, attempt: number): Promise<void> {
       await new Promise<void>(done => {
@@ -211,7 +212,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
             // Mechanical recovery must fit and work even if handoff storage/metadata is unavailable.
             const h = effect.handoff, emergency = h ? undefined : emergencyInput(ctx);
             const lint = emergency ? validateObserved(ctx, emergency, runningState([...knownIds], { cwd: ctx.cwd, sessionId: ctx.sessionManager.getSessionId() }), false).lint : [];
-            const summary = `${h?.text ?? emergencySummary(emergency!, await requests.render(ctx, true))}${lint.length ? `\n## Handoff lint\n${bytePrefix(lint.join("\n"), 1024)}` : ""}\nCompaction instance: ${randomUUID()}\n`;
+            const summary = `${h?.text ?? emergencySummary(emergency!, await requests.render(ctx, true), await handoffMemory(intent, ctx, state.lastHandoff))}${lint.length ? `\n## Handoff lint\n${bytePrefix(lint.join("\n"), 1024)}` : ""}\nCompaction instance: ${randomUUID()}\n`;
             log(ctx, "backstop", { path: h?.path, reason: "machine-authorized" });
             requests.expectBackstop({ kind: backstopKind(effect.source, !!h, ctx), handoffPath: h?.path });
             result = { compaction: { summary, firstKeptEntryId: null as unknown as string, tokensBefore: effect.tokensBefore,

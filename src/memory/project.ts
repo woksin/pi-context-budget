@@ -7,7 +7,7 @@ import { compare, MESSAGE_SECTION, pointerExcerpt, projectionBudgets, renderMemo
 import type { Budgets, IndexRow, MemoryIndex, MessageRow, Projection, RenderRecord } from "./render.ts";
 
 export type { Budgets, Projection } from "./render.ts";
-export type ProjectQuery = { scopes: Scope[]; session: string; budgets?: Partial<Budgets> };
+export type ProjectQuery = { scopes: Scope[]; session: string; sessions?: string[]; taskItemIds?: readonly string[]; reportOtherScopes?: boolean; budgets?: Partial<Budgets> };
 export type ProjectionMessageQuery = MessageQuery & { unresolvedOnly?: boolean };
 export interface MemoryStore extends MemoryStoreCore {
   project(query: ProjectQuery): Projection;
@@ -81,9 +81,11 @@ function hygieneScopes(items: FoldedItem[]): string[] {
 /** Pure read-side projection; no boundary cursor, writes, extension hooks or pi dependencies. */
 export function project(store: MemoryStoreCore, query: ProjectQuery): Projection {
   const budgets = projectionBudgets(query.budgets), state = store.readFolded(), resolve = spanResolver(state);
-  const items = Object.values(state.items).filter(item => scopeMatches(item, query.scopes)).sort((a, b) => compare(a.id, b.id));
-  const messages = allMessages(store, { sessionId: query.session, origin: "human" })
-    .filter(entry => entry.session.id === query.session && entry.origin === "human").sort((a, b) => compare(a.id, b.id));
+  const taskItemIds = new Set(query.taskItemIds);
+  const items = Object.values(state.items).filter(item => scopeMatches(item, query.scopes) || taskItemIds.has(item.id)).sort((a, b) => compare(a.id, b.id));
+  const sessions = [...new Set(query.sessions ?? [query.session])];
+  const messages = sessions.flatMap(sessionId => allMessages(store, { sessionId, origin: "human" })
+    .filter(entry => entry.session.id === sessionId && entry.origin === "human")).sort((a, b) => compare(a.id, b.id));
   const dispositions = messages.map(entry => ({ entry, disposition: resolve(entry) }));
   const unresolved = dispositions.filter(row => !row.disposition.resolved).map(row => row.entry);
   const index: MemoryIndex = { items: items.length, messages: messages.length, unresolved: unresolved.length,
@@ -92,7 +94,21 @@ export function project(store: MemoryStoreCore, query: ProjectQuery): Projection
     dispositions: dispositions.filter(row => row.disposition.wholeNone).map(row => ({ messageId: row.entry.id, reason: row.disposition.wholeNone!.reason! })),
     hygiene: hygieneScopes(items) };
   const records = [...items.map(itemRecord), ...dispositions.map(({ entry, disposition }) => messageRecord(entry, disposition))];
-  return renderMemory(records, index, budgets);
+  const otherScopes = query.reportOtherScopes ? Object.keys(state.items).length - items.length : 0;
+  return renderProjection(records, index, budgets, otherScopes);
+}
+
+/** Reserve the optional cross-scope count inside both the index and total budgets. */
+function renderProjection(records: RenderRecord[], index: MemoryIndex, budgets: Budgets, otherScopes: number): Projection {
+  const notice = otherScopes ? `${otherScopes} items in other scopes; memory_list scope=<..> cursor=<..>.\n` : "";
+  const reserved = Buffer.byteLength(notice);
+  // Tiny caller-supplied budgets may not have room even for the extra count line.
+  const include = budgets.index - reserved >= 512;
+  const extra = include ? notice : "";
+  const result = renderMemory(records, index, include ? { ...budgets, index: budgets.index - reserved } : budgets);
+  result.text += extra;
+  result.sections.index += extra;
+  return result;
 }
 
 /** Filter before paging, so a page full of resolved messages cannot hide later unresolved ones. */

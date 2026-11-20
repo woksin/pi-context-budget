@@ -1,6 +1,7 @@
 /** Bounded handoff collectors. All filesystem, clock and process observations are injected. */
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { HandoffInput, RepoState } from "./core.ts";
+import { handoffBlocks, type HandoffMemory } from "./memory/handoff-block.ts";
 
 export type Git = (cwd: string, ...args: string[]) => string | undefined;
 export interface PathDeps { home: string; exists: (path: string) => boolean; isDirectory: (path: string) => boolean }
@@ -253,12 +254,13 @@ export function emergencyHandoff(branch: readonly unknown[], sessionFile?: strin
     next_step: "Re-establish state from files and git, re-read user constraints in the session file, then continue. Do not assume any prior check passed." });
 }
 /** Mechanical backstops have no auto-state dependency, but must retain bounded emergency constraints/files. */
-export function emergencySummary(input: HandoffInput, requests = ""): string {
+export function emergencySummary(input: HandoffInput, requests = "", memory?: HandoffMemory): string {
   input = boundedEmergency(input);
-  return ["# Emergency handoff", input.goal, input.facts,
-    input.user_constraints && `\n## User constraints (verbatim)\n${input.user_constraints}`,
+  const blocks = handoffBlocks({ requests }, memory);
+  return ["# Emergency handoff", input.goal, blocks.afterGoal, input.facts,
+    input.user_constraints && `\n## ${blocks.constraints}\n${input.user_constraints}`,
     input.files_to_read?.length && `\n## Read first\n${input.files_to_read.join("\n")}`,
-    requests, input.next_step].filter(Boolean).join("\n");
+    blocks.requests, input.next_step].filter(Boolean).join("\n");
 }
 export interface InventoryRecord { id?: string; agentId?: string; status?: string; label?: string; description?: string; exitCode?: number | null; logPath?: string; finishedAt?: number | string; endedAt?: number | string }
 export interface JobManager { list: () => InventoryRecord[] }
