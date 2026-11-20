@@ -3,7 +3,7 @@ import type { FoldedItem, JournalEntry, MessageQuery, Page, Scope } from "./type
 import { requireValid } from "./validate.ts";
 import { spanResolver } from "./spans.ts";
 import type { Disposition } from "./spans.ts";
-import { compare, MESSAGE_SECTION, pointerExcerpt, projectionBudgets, renderMemory } from "./render.ts";
+import { compare, MESSAGE_SECTION, pointerExcerpt, projectionBudgets, renderMemory, singleLine } from "./render.ts";
 import type { Budgets, IndexRow, MemoryIndex, MessageRow, Projection, RenderRecord } from "./render.ts";
 
 export type { Budgets, Projection } from "./render.ts";
@@ -28,25 +28,28 @@ function scopeMatches(item: FoldedItem, scopes: Scope[]): boolean {
 }
 function sourcePointer(item: FoldedItem): string {
   const source = item.source, span = source.span ? `[${source.span.start}:${source.span.end}]` : "";
-  return source.ref ? `journal:${source.ref}${span}` : `source:${source.type}`;
+  return source.ref ? `journal:${singleLine(source.ref)}${span}` : `source:${singleLine(source.type)}`;
 }
 function itemRecord(item: FoldedItem): RenderRecord {
-  const scope = `${item.scope.kind}:${item.scope.key}`, pointer = sourcePointer(item);
+  const scope = `${singleLine(item.scope.kind)}:${singleLine(item.scope.key)}`, pointer = sourcePointer(item);
   const titles = { directive: "User directives (verbatim, from source)", order: "Coordinator orders", decision: "Agent decisions" };
   const section = item.status === "proposed" ? "Proposed directives (not binding)" : titles[item.kind];
-  const identity = `[${item.id}] (${scope}, ${pointer}, ${item.at})`;
-  const gloss = item.gloss ? `\nagent gloss: ${item.gloss}` : "";
+  const identity = `[${singleLine(item.id)}] (${scope}, ${pointer}, ${singleLine(item.at)})`;
+  const gloss = item.gloss ? `\nagent gloss: ${singleLine(item.gloss)}` : "";
   return { id: item.id, type: "item", scope: item.scope, at: item.at, section,
-    full: `${identity} "${item.text}"${gloss}`, pointer: `${identity} ${pointerExcerpt(item.text)}`,
+    full: `${identity} ${singleLine(item.text)}${gloss}`, pointer: `${identity} ${singleLine(pointerExcerpt(item.text))}`,
     eligible: item.status === "active" || item.status === "proposed", withheld: false };
 }
 function messageRecord(entry: JournalEntry, disposition: Disposition): RenderRecord {
-  const ranges = disposition.uncovered, first = ranges[0]?.start ?? 0, last = ranges.at(-1)?.end ?? 0;
+  const ranges = disposition.uncovered, first = ranges[0];
   const remainder = ranges.map(span => entry.text!.slice(span.start, span.end)).join("\n");
-  const identity = `[${entry.id}] (session:${entry.session.id}, journal:${entry.id}[${first}:${last}], ${entry.at})`;
-  const reason = entry.text === null ? `withheld: ${entry.withheld ?? "unavailable"}` : pointerExcerpt(remainder);
+  const range = first ? `[${first.start}:${first.end}]` : "";
+  const gaps = ranges.length > 1 ? ` (+${ranges.length - 1} more gap${ranges.length === 2 ? "" : "s"})` : "";
+  const identity = `[${singleLine(entry.id)}] (session:${singleLine(entry.session.id)}, journal:${singleLine(entry.id)}${range}${gaps}, ${singleLine(entry.at)})`;
+  const excerpt = first ? entry.text!.slice(first.start, first.end) : "";
+  const reason = entry.text === null ? `withheld: ${singleLine(entry.withheld ?? "unavailable")}` : singleLine(pointerExcerpt(excerpt));
   return { id: entry.id, type: "message", scope: { kind: "session", key: entry.session.id }, at: entry.at, section: MESSAGE_SECTION,
-    full: `${identity} "${remainder}"`, pointer: `${identity} ${reason}`, eligible: !disposition.resolved, withheld: entry.text === null };
+    full: `${identity} ${singleLine(remainder)}`, pointer: `${identity} ${reason}`, eligible: !disposition.resolved, withheld: entry.text === null };
 }
 function itemRows(items: FoldedItem[]): IndexRow[] {
   const rows = new Map<string, IndexRow>();

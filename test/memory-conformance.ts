@@ -52,7 +52,7 @@ function projectionConformance(create: () => MemoryStore): void {
     assert.ok(Buffer.byteLength(result.text) <= 2048);
     assert.equal(Buffer.from(result.text).toString("utf8"), result.text);
     assert.equal(result.entries.find(row => row.id === withheld.id)?.label, "pointer");
-    assert.match(result.text, /withheld: too_large/);
+    assert.match(result.text, /withheld: "too_large"/);
     assert.match(result.text, /Proposed directives \(not binding\)/);
     assert.equal(result.index.proposed, 1);
     assert.equal(store.listMessages({ unresolvedOnly: true, limit: 1 }).items[0].id, withheld.id);
