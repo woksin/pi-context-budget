@@ -28,12 +28,12 @@ export type Source = { type: "user_message" | "coordinator_order" | "agent_decis
 export type Authority = { mode: "auto" | "command" | "none"; ruleVersion: number; commandRef?: string };
 export type Item = { id: string; kind: "directive" | "order" | "decision"; scope: Scope; text: string; gloss?: string;
   source: Source; rationale?: string; authority?: Authority; supersedes: string[] };
-export type ItemStatus = "active" | "proposed" | "done" | "superseded" | "withdrawn";
+export type ItemStatus = "active" | "proposed" | "done" | "superseded" | "withdrawn" | "rejected";
 export type FoldedItem = Item & { status: ItemStatus; at: string; eventId: string; changedBy: string; retiredByAgent?: boolean };
 export type EventBase = { schema: "memory.event/2"; id: string; at: string; actor: Actor };
 export type AddEvent = EventBase & { type: "add"; item: Item };
 export type ConfirmEvent = EventBase & { type: "confirm"; itemId: string; via: "ui" };
-export type RetireEvent = EventBase & { type: "retire"; itemId: string; status: "done" | "superseded" | "withdrawn"; reason: string; source: Source };
+export type RetireEvent = EventBase & { type: "retire"; itemId: string; status: "done" | "superseded" | "withdrawn" | "rejected"; reason: string; source: Source };
 export type Classification = { messageId: string; spans: (Span & { result: "directive" | "decision" | "none"; itemIds: string[] })[];
   whole: "none" | null; reason?: string };
 export type ClassifyEvent = EventBase & Classification & { type: "classify" };

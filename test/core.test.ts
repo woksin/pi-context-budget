@@ -12,6 +12,75 @@ mkdirSync(root, { recursive: true });
 const dir = () => mkdtempSync(join(root, "case-"));
 const config = parseConfig({});
 const t = config.main;
+test("intent recovery does not change unavailable or degraded handoff behavior", () => {
+  for (const handoffAvailable of [false, true]) {
+    const frame: Frame = { mode: "enforce", tokens: t.hard, thresholds: t, config, wrapped: false, handoffAvailable };
+    const state = { ...initialState("enforce"), floor: 0,
+      handoffTurns: Array(config.loop.maxHandoffsWithoutProgress + 1).fill(0) } as ReturnType<typeof initialState>;
+    for (let i = 0; i < 13; i++) {
+      const event: MachineEvent = { type: "tool_call", tool: "memory_list", id: String(i) };
+      const expected = transition(state, event, frame);
+      const actual = transition(state, event, { ...frame, memoryIntent: true });
+      assert.deepEqual(actual, expected);
+      const end: MachineEvent = { type: "tool_end", tool: "memory_list", id: String(i), error: false };
+      assert.deepEqual(transition(actual.state, end, { ...frame, memoryIntent: true }), transition(expected.state, end, frame));
+    }
+  }
+});
+test("a recovery completion after degradation falls through to ordinary tool cleanup", () => {
+  const frame: Frame = { mode: "enforce", tokens: t.handoff, thresholds: t, config, wrapped: true, memoryIntent: true };
+  const marker = { path: "/tmp/handoff" } as any;
+  const seed = { ...initialState("enforce"), floor: 0, stored: marker, pending: marker };
+  const started = transition(seed, { type: "tool_call", tool: "memory_list", id: "recovery" }, frame).state;
+  assert.deepEqual(started.memoryRecovery?.calls, ["recovery"]);
+  const degraded = { ...started, handoffTurns: Array(config.loop.maxHandoffsWithoutProgress + 1).fill(started.turn) };
+  const finished = transition(degraded, { type: "tool_end", tool: "memory_list", id: "recovery", error: false }, { ...frame, wrapped: false });
+  assert.equal(finished.state.stored, undefined); assert.equal(finished.state.pending, undefined);
+  assert.deepEqual(finished.state.handoffTurns, []); assert.deepEqual(finished.state.memoryRecovery?.calls, []);
+});
+test("intent recovery tools preserve pending/stored state and grace; call thirteen is blocked", () => {
+  const frame: Frame = { mode: "enforce", tokens: t.handoff, thresholds: t, config, wrapped: true, memoryIntent: true };
+  const marker = { path: "/tmp/handoff" } as any;
+  let state = { ...initialState("enforce"), floor: 0, pending: marker, stored: marker };
+  const names = ["memory_add", "memory_retire", "memory_classify", "memory_list", "recall"];
+  for (let n = 0; n < 12; n++) {
+    const tool = names[n % names.length], id = String(n);
+    const result = transition(state, { type: "tool_call", tool, id, graceEligible: true }, frame);
+    assert.ok(!result.effects.some(e => e.type === "block"));
+    state = transition(result.state, { type: "tool_end", tool, id, error: false }, frame).state as typeof state;
+    assert.equal(state.pending, marker); assert.equal(state.stored, marker); assert.equal(state.graceUsed, 0);
+  }
+  const blocked = transition(state, { type: "tool_call", tool: "memory_add", id: "13", graceEligible: true }, frame);
+  assert.ok(blocked.effects.some(e => e.type === "block"));
+  const handoff = transition(blocked.state, { type: "tool_call", tool: "context_handoff", id: "h" }, frame);
+  assert.ok(!handoff.effects.some(e => e.type === "block"));
+});
+test("intent recovery also covers stored-only and required-only windows, resetting on compaction", () => {
+  const frame: Frame = { mode: "enforce", tokens: t.handoff, thresholds: t, config, wrapped: true, memoryIntent: true };
+  for (const seed of [{ ...initialState("enforce"), floor: 0 }, { ...initialState("enforce"), floor: 0, stored: { path: "/tmp/stored" } as any }]) {
+    let state: ReturnType<typeof initialState> = seed;
+    for (let n = 0; n < 12; n++) {
+      const call: MachineEvent = { type: "tool_call", tool: "memory_list", id: String(n), graceEligible: true };
+      const result = transition(state, call, frame);
+      assert.ok(!result.effects.some(effect => effect.type === "block"));
+      state = transition(result.state, { type: "tool_end", tool: "memory_list", id: String(n), error: n === 2 }, frame).state;
+      assert.equal(state.stored, seed.stored); assert.equal(state.graceUsed, 0);
+    }
+    assert.ok(transition(state, { type: "tool_call", tool: "recall", id: "13" }, frame).effects.some(effect => effect.type === "block"));
+    const compacted = transition(state, { type: "session_compact", owned: true }, frame).state;
+    assert.equal(compacted.memoryRecovery, undefined);
+    const next = transition(compacted, { type: "tool_call", tool: "memory_add", id: "new" }, { ...frame, tokens: t.hard - 1 });
+    assert.ok(!next.effects.some(effect => effect.type === "block"));
+  }
+});
+test("intent exemption at required threshold is bounded; off is byte-identical and ordinary tools still block", () => {
+  const frame: Frame = { mode: "enforce", tokens: t.handoff, thresholds: t, config, wrapped: true };
+  const state = { ...initialState("enforce"), floor: 0 }, event: MachineEvent = { type: "tool_call", tool: "memory_add", id: "a" };
+  assert.deepEqual(transition(state, event, frame), transition(state, event, { ...frame, memoryIntent: false }));
+  assert.ok(transition(state, event, frame).effects.some(e => e.type === "block"));
+  assert.ok(!transition(state, event, { ...frame, memoryIntent: true }).effects.some(e => e.type === "block"));
+  assert.ok(transition(state, { ...event, tool: "bash" }, { ...frame, memoryIntent: true }).effects.some(e => e.type === "block"));
+});
 test("overflow recovery configuration defaults and validation", () => {
   assert.equal(parseConfig({}).overflowRecovery, true);
   assert.equal(parseConfig({ overflowRecovery: false }).overflowRecovery, false);

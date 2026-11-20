@@ -123,6 +123,14 @@ function countActivePerScope(state: FoldedState): Health["activePerScope"] {
   return counts;
 }
 
+function sourcedEvent(event: MemoryEvent, messages: Map<string, JournalEntry>): MemoryEvent {
+  if (event.type !== "add") return event;
+  if (event.item.kind === "decision") return event;
+  const source = event.item.source;
+  const text = messages.get(source.ref!)!.text!.slice(source.span!.start, source.span!.end);
+  return { ...event, item: { ...event.item, text } };
+}
+
 /** Inert until explicitly constructed; no pi imports, extension hooks or flag changes. */
 export class FileMemoryStore implements MemoryStoreCore {
   readonly home: string;
@@ -188,15 +196,14 @@ export class FileMemoryStore implements MemoryStoreCore {
     const state = foldEvents(records, entries, this.options);
     const existing = knownResult(state, event);
     if (existing) return existing;
-    try { validateEvent(event, state, new Map(entries.map(entry => [entry.id, entry])), this.options); }
+    const messages = new Map(entries.map(entry => [entry.id, entry]));
+    try { validateEvent(event, state, messages, this.options); }
     catch (error) { return rejection(event.id, error); }
-    return this.appendEvent(event);
+    return this.appendEvent(sourcedEvent(event, messages));
   }
   private base(actor: Actor) { return { schema: "memory.event/2" as const, id: newId(), at: new Date().toISOString(), actor }; }
   addItem(item: Item, actor: Actor): WriteResult {
-    const stored = { ...item };
-    if (item.kind !== "decision" && Buffer.byteLength(item.text) > 4096) stored.text = utf8Head(item.text, 1024);
-    return this.write({ ...this.base(actor), type: "add", item: stored });
+    return this.write({ ...this.base(actor), type: "add", item: { ...item } });
   }
   confirm(itemId: string, actor: Actor): WriteResult { return this.write({ ...this.base(actor), type: "confirm", itemId, via: "ui" }); }
   retireItem(itemId: string, status: RetireEvent["status"], reason: string, source: Source, actor: Actor): WriteResult {

@@ -16,6 +16,67 @@ function fixture(options = {}) {
   directories.push(home);
   return new FileMemoryStore({ home, ...options });
 }
+test("only a confirmed human rejection can retire a proposed directive", () => {
+  const store = fixture(), entry = message({ text: "Do not run tests" });
+  store.appendMessage(entry);
+  const item = directive(entry); store.addItem(item, agent);
+  const rejection = message({ text: `/memory reject ${item.id}`, originEvidence: ["tui-confirm"] });
+  store.appendMessage(rejection);
+  const source = { type: "user_message" as const, ref: rejection.id };
+  assert.equal(store.retireItem(item.id, "withdrawn", "No", source, human).reason, "conflict");
+  assert.equal(store.retireItem(item.id, "rejected", "No", source, agent).reason, "not_authorised");
+  assert.equal(store.retireItem(item.id, "rejected", "No", { type: "user_message", ref: entry.id }, human).reason, "not_authorised");
+  const extended = message({ text: `/memory reject ${item.id}\n${item.text}`, originEvidence: ["tui-confirm"] });
+  store.appendMessage(extended);
+  assert.equal(store.retireItem(item.id, "rejected", "No", { type: "user_message", ref: extended.id }, human).reason, "not_authorised");
+  assert.equal(store.retireItem(item.id, "rejected", "No", source, human).ok, true);
+  assert.equal(store.readFolded().items[item.id]!.status, "rejected");
+  assert.equal(store.retireItem(item.id, "rejected", "No", source, human).reason, "not_proposed");
+  assert.equal(store.confirm(item.id, human).reason, "not_proposed");
+});
+test("fold ignores an active status on an order add without a human UI confirmation event", () => {
+  const store = fixture({ coordinators: ["L0"] });
+  const source = message({ origin: "injected", injectedKind: "lane_message", injectedFrom: "L0" }); store.appendMessage(source);
+  const item = decision({ kind: "order", text: source.text!, source: { type: "coordinator_order", ref: source.id,
+    span: { start: 0, end: source.text!.length } } });
+  const eventId = forged(store, { type: "add", item: { ...item, status: "active" }, actor: { ...agent, kind: "coordinator", id: "L0" } });
+  assert.equal(store.readFolded().events[eventId].ok, true);
+  assert.equal(store.readFolded().items[item.id].status, "proposed");
+  const invalid = forged(store, { type: "confirm", itemId: item.id, actor: human, via: "tool" });
+  assert.equal(store.readFolded().events[invalid].reason, "not_authorised");
+  assert.equal(store.readFolded().items[item.id].status, "proposed");
+  assert.equal(store.confirm(item.id, human).ok, true);
+  assert.equal(store.readFolded().items[item.id].status, "active");
+});
+test("fold cannot auto-activate an overlapping source after a human withdrawal", () => {
+  const store = fixture({ eligibilityCheck: () => ({ eligible: true, reasons: [] }) });
+  const source = message(); store.appendMessage(source);
+  const item = directive(source, { authority: { mode: "auto", ruleVersion: 1 } }); store.addItem(item, agent);
+  const withdrawal = message({ text: "Withdraw", at: new Date(Date.now() + 1000).toISOString() }); store.appendMessage(withdrawal);
+  assert.equal(store.retireItem(item.id, "withdrawn", "Withdraw", { type: "user_message", ref: withdrawal.id }, human).ok, true);
+  const readded = { ...item, id: newId() };
+  forged(store, { type: "add", item: readded });
+  assert.equal(store.readFolded().items[readded.id].status, "proposed");
+});
+test("human retirement is remembered even without a human source; agent completion does not block re-add", () => {
+  for (const actor of [human, agent]) {
+    const store = fixture({ eligibilityCheck: () => ({ eligible: true, reasons: [] }) });
+    const source = message(); store.appendMessage(source);
+    const item = directive(source, { authority: { mode: "auto", ruleVersion: 1 } }); store.addItem(item, agent);
+    assert.equal(store.retireItem(item.id, "done", "Finished", { type: "agent_decision" }, actor).ok, true);
+    const readded = { ...item, id: newId() }; store.addItem(readded, agent);
+    assert.equal(store.readFolded().items[readded.id].status, actor.kind === "human" ? "proposed" : "active");
+  }
+});
+test("fold rejects non-exact quote code units", () => {
+  const store = fixture(), source = message({ text: "Never\u00a0run tests" }); store.appendMessage(source);
+  const event = forged(store, { type: "add", item: directive(source, { text: "Never run tests" }) });
+  assert.equal(store.readFolded().events[event].reason, "quote_mismatch");
+});
+test("source quotes over the item cap are refused rather than truncated", () => {
+  const store = fixture(), source = message({ text: "word ".repeat(1000) }); store.appendMessage(source);
+  assert.equal(store.addItem(directive(source), agent).reason, "too_large");
+});
 function forged(store: FileMemoryStore, fields: object) {
   const id = newId();
   appendRecord(join(store.home, "events.jsonl"), { schema: "memory.event/2", id, at: "2026-01-02T00:00:00Z", actor: agent, ...fields });
@@ -74,13 +135,17 @@ test("fold rejects forged confirmation and malformed classification", () => {
   assert.equal(store.readFolded().items[item.id].status, "proposed");
 });
 
-test("orders require an allowlisted injected coordinator; directives cannot be overridden", () => {
+test("orders stay proposed with or without a configured sender until a human UI confirmation", () => {
   const store = fixture({ coordinators: ["lead"] });
   const source = message({ origin: "injected", injectedKind: "lane_message", injectedFrom: "lead" });
   store.appendMessage(source);
   const order = decision({ kind: "order", text: source.text!, source: { type: "coordinator_order", ref: source.id,
     span: { start: 0, end: source.text!.length } } });
   assert.equal(store.addItem(order, agent).status, "applied");
-  assert.equal(new FileMemoryStore({ home: store.home }).readFolded().items[order.id], undefined);
+  assert.equal(store.readFolded().items[order.id].status, "proposed");
+  assert.equal(new FileMemoryStore({ home: store.home }).readFolded().items[order.id].status, "proposed");
+  assert.equal(store.confirm(order.id, agent).reason, "not_authorised");
+  assert.equal(store.confirm(order.id, human).ok, true);
+  assert.equal(store.readFolded().items[order.id].status, "active");
   assert.equal(store.addItem(decision({ kind: "order", source: { ...order.source, ref: "missing" } }), agent).status, "rejected");
 });

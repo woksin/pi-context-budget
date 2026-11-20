@@ -112,14 +112,28 @@ test("all decisions carry evidence without copying prompt bodies", () => {
   }
 });
 
-test("flags-off inertness: runtime entry points cannot reach any memory module", () => {
+test("runtime memory imports are limited to gated extension hooks and the pure core helper", () => {
   const root = join(import.meta.dirname, "..");
   const runtime = ["context-budget.ts", ...readdirSync(join(root, "src")).filter(f => f.endsWith(".ts")).map(f => `src/${f}`)];
   for (const file of runtime) {
-    // Wired: the pure flag parser, the flag-gated journal and requests hooks, and the pure launch-fact derivation.
-    const wired = ["./memory/config.ts", "./memory/journal-hook.ts", "./memory/requests-hook.ts", "./memory/launch.ts"];
+    // The extension wires pure configuration/launch helpers and flag-gated journal, requests and intent hooks.
+    // Only core's type-import-only authorization helper is exempt; no other runtime file may import memory.
+    const wired: Record<string, string[]> = {
+      "src/extension.ts": ["./memory/config.ts", "./memory/journal-hook.ts", "./memory/requests-hook.ts", "./memory/launch.ts", "./memory/tools.ts"],
+      "src/core.ts": ["./memory/authorize.ts"],
+    };
     const specifiers = [...readFileSync(join(root, file), "utf8").matchAll(/(?:from\s*|import\s*\(|require\s*\()\s*["']([^"']*memory\/[^"']*)["']/g)].map(match => match[1]);
-    assert.deepEqual(specifiers.filter(specifier => !wired.includes(specifier)), [], file);
-    if (file !== "src/extension.ts") assert.deepEqual(specifiers, [], file);
+    const allowed = wired[file] ?? [];
+    assert.deepEqual(specifiers.filter(specifier => !allowed.includes(specifier)), [], file);
+    if (!Object.hasOwn(wired, file)) assert.deepEqual(specifiers, [], file);
   }
+});
+
+test("core authorization helper imports types only and cannot reach runtime memory modules", () => {
+  const source = readFileSync(join(import.meta.dirname, "../src/memory/authorize.ts"), "utf8");
+  const imports = [...source.matchAll(/^\s*import\b[\s\S]*?;/gmu)].map(match => match[0].trim());
+  assert.ok(imports.length > 0);
+  for (const statement of imports) assert.match(statement, /^import\s+type\s/u);
+  assert.doesNotMatch(source, /\b(?:import|require)\s*\(/u);
+  assert.doesNotMatch(source, /\bexport\s+(?:type\s+)?(?:\*|\{)[^;]*\bfrom\s/u);
 });

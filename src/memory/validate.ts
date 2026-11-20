@@ -65,32 +65,43 @@ function sourceMessage(source: Source, messages: Map<string, JournalEntry>): Jou
   requireValid(message, "no_source");
   return message;
 }
-const normalise = (text: string) => text.replace(/\s+/gu, " ").trim();
 function validateQuote(item: Item, message: JournalEntry): void {
   requireValid(message.text !== null, "no_source");
   validateSpan(item.source.span, message.text);
   const quote = message.text.slice(item.source.span.start, item.source.span.end);
-  const expected = Buffer.byteLength(quote) > 4096 ? utf8Head(quote, 1024) : quote;
-  requireValid(normalise(item.text) === normalise(expected), "quote_mismatch");
+  requireValid(item.text === quote, "quote_mismatch");
 }
 function validateAuthority(authority: Authority | undefined): asserts authority is Authority {
   requireValid(authority, "not_authorised");
   requireValid(["none", "auto", "command"].includes(authority.mode), "not_authorised");
   requireValid(Number.isInteger(authority.ruleVersion) && authority.ruleVersion > 0, "not_authorised");
 }
+function directiveSpan(item: Item, message: JournalEntry): boolean {
+  return message.text!.startsWith("/directive ") && item.source.span!.start === 11 && item.source.span!.end === message.text!.length;
+}
 function validCommand(item: Item, message: JournalEntry): boolean {
   const authority = item.authority!;
-  return authority.ruleVersion === 1 && message.text!.startsWith("/directive ") && item.source.span!.start >= 11 && authority.commandRef === message.id;
+  return authority.ruleVersion === 1 && directiveSpan(item, message) && authority.commandRef === message.id;
 }
-function autoEligible(item: Item, message: JournalEntry, options: FoldOptions): boolean {
+function overlappingSource(left: Source, right: Source): boolean {
+  if (left.ref !== right.ref) return false;
+  if (!left.span || !right.span) return false;
+  return left.span.start < right.span.end && right.span.start < left.span.end;
+}
+function humanRetiredSource(item: Item, state: FoldedState): boolean {
+  return Object.values(state.items).some(previous => previous.retiredByAgent === false && overlappingSource(previous.source, item.source));
+}
+function autoEligible(item: Item, message: JournalEntry, state: FoldedState, options: FoldOptions): boolean {
+  if (humanRetiredSource(item, state)) return false;
+  if (message.originEvidence.includes("tui-confirm") && !directiveSpan(item, message)) return false;
   try { return options.eligibilityCheck?.(message.text!, item.source.span!, item.authority!.ruleVersion).eligible ?? false; }
   catch { return false; }
 }
-function directiveStatus(item: Item, message: JournalEntry, options: FoldOptions): ItemStatus {
+function directiveStatus(item: Item, message: JournalEntry, state: FoldedState, options: FoldOptions): ItemStatus {
   validateAuthority(item.authority);
   if (message.origin !== "human") return "proposed";
   if (item.authority.mode === "command") return validCommand(item, message) ? "active" : "proposed";
-  if (item.authority.mode === "auto") return autoEligible(item, message, options) ? "active" : "proposed";
+  if (item.authority.mode === "auto") return autoEligible(item, message, state, options) ? "active" : "proposed";
   return "proposed";
 }
 function validateSupersedes(item: Item, state: FoldedState, status: ItemStatus): void {
@@ -119,19 +130,18 @@ function validateItem(item: Item): void {
   requireValid(item.source, "no_source");
   requireValid(["user_message", "coordinator_order", "agent_decision"].includes(item.source.type), "no_source");
 }
-function validateDirective(item: Item, messages: Map<string, JournalEntry>, options: FoldOptions): ItemStatus {
+function validateDirective(item: Item, state: FoldedState, messages: Map<string, JournalEntry>, options: FoldOptions): ItemStatus {
   requireValid(item.source.type === "user_message", "no_source");
   const message = sourceMessage(item.source, messages);
   requireValid(message.origin !== "injected", "not_human");
   validateQuote(item, message);
-  return directiveStatus(item, message, options);
+  return directiveStatus(item, message, state, options);
 }
-function validateOrder(item: Item, messages: Map<string, JournalEntry>, options: FoldOptions): void {
+function validateOrder(item: Item, messages: Map<string, JournalEntry>): void {
   requireValid(item.source.type === "coordinator_order", "no_source");
   const message = sourceMessage(item.source, messages);
   requireValid(message.origin === "injected", "not_authorised");
   requireValid(message.injectedKind === "lane_message", "not_authorised");
-  requireValid(options.coordinators?.includes(message.injectedFrom!), "not_authorised");
   validateQuote(item, message);
 }
 function validateAdd(event: AddEvent, state: FoldedState, messages: Map<string, JournalEntry>, options: FoldOptions): ItemStatus {
@@ -139,8 +149,8 @@ function validateAdd(event: AddEvent, state: FoldedState, messages: Map<string, 
   validateItem(item);
   let status: ItemStatus = "active";
   switch (item.kind) {
-    case "directive": status = validateDirective(item, messages, options); break;
-    case "order": validateOrder(item, messages, options); break;
+    case "directive": status = validateDirective(item, state, messages, options); break;
+    case "order": validateOrder(item, messages); status = "proposed"; break;
     case "decision": if (item.source.type !== "agent_decision") sourceMessage(item.source, messages); break;
   }
   validateSupersedes(item, state, status);
@@ -158,7 +168,20 @@ function validateHumanRetirement(event: RetireEvent, itemAt: string, messages: M
   requireValid(source.origin === "human", "would_override_user");
   requireValid(Date.parse(source.at) > Date.parse(itemAt), "would_override_user");
 }
+function validateReject(event: RetireEvent, state: FoldedState, messages: Map<string, JournalEntry>): void {
+  const item = state.items[event.itemId];
+  requireValid(item, "no_source");
+  requireValid(item.status === "proposed", "not_proposed");
+  requireValid(event.actor.kind === "human", "not_authorised");
+  requireValid(event.source.type === "user_message", "not_authorised");
+  const source = sourceMessage(event.source, messages);
+  requireValid(source.origin === "human", "not_authorised");
+  requireValid(source.originEvidence.includes("tui-confirm"), "not_authorised");
+  requireValid(source.text === `/memory reject ${event.itemId}`, "not_authorised");
+  requireValid(typeof event.reason === "string" && event.reason.trim(), "invalid_retirement");
+}
 function validateRetire(event: RetireEvent, state: FoldedState, messages: Map<string, JournalEntry>): void {
+  if (event.status === "rejected") return validateReject(event, state, messages);
   const item = activeItem(event.itemId, state);
   requireValid(["done", "superseded", "withdrawn"].includes(event.status), "invalid_retirement");
   requireValid(typeof event.reason === "string" && event.reason.trim(), "invalid_retirement");
