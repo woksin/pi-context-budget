@@ -17,6 +17,7 @@ import { bindRequests, createRequestsHook, wire } from "./memory/requests-hook.t
 import { processLaunchFacts, type LaunchFacts } from "./memory/launch.ts";
 import { createIntentHook } from "./memory/tools.ts";
 import { createRecallHook } from "./memory/recall.ts";
+import { createResumeHook } from "./memory/resume.ts";
 import { bytePrefix, chainIdentity, emergencyHandoff, emergencySummary, previousHandoff, primaryHead } from "./collect.ts";
 
 type ActionResult = BoundaryResult & ToolCallEventResult & SessionBeforeCompactResult;
@@ -57,6 +58,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
     }
     const memoryDeps = { agentDir, configFile, log, host: () => host };
     const intent = createIntentHook(pi, memoryDeps), recall = createRecallHook(pi, memoryDeps);
+    const resume = createResumeHook({ agentDir, configFile, observe: autoState });
     const requests = createRequestsHook({ ...memoryDeps, hasTools: () => hasActiveTools(pi) });
     const journal = wire(requests, { ...memoryDeps, launchFacts });
     function reload(ctx: ExtensionContext): void {
@@ -206,7 +208,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
           case "commit":
             await requests.commit(ctx, effect.handoff.path, effect.source === "idle");
             log(ctx, "handoff_committed", { path: effect.handoff.path, n: effect.handoff.n, count: state.count, source: effect.source });
-            result = { entries: [{ type: "compaction", summary: effect.handoff.text, firstKeptEntryId: null,
+            result = { entries: [{ type: "compaction", summary: await resume.append(ctx, effect.handoff.text, effect.handoff), firstKeptEntryId: null,
               details: { kind: "handoff", path: effect.handoff.path, n: effect.handoff.n, source: effect.source } }], continue: true }; break;
           case "compact": await compact(ctx, effect.attempt); break;
           case "backstop": {
@@ -216,12 +218,13 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
             const summary = `${h?.text ?? emergencySummary(emergency!, await requests.render(ctx, true), await handoffMemory(intent, ctx, state.lastHandoff))}${lint.length ? `\n## Handoff lint\n${bytePrefix(lint.join("\n"), 1024)}` : ""}\nCompaction instance: ${randomUUID()}\n`;
             log(ctx, "backstop", { path: h?.path, reason: "machine-authorized" });
             requests.expectBackstop({ kind: backstopKind(effect.source, !!h, ctx), handoffPath: h?.path });
-            result = { compaction: { summary, firstKeptEntryId: null as unknown as string, tokensBefore: effect.tokensBefore,
+            result = { compaction: { summary: await resume.append(ctx, summary, h, emergency), firstKeptEntryId: null as unknown as string, tokensBefore: effect.tokensBefore,
               details: { kind: "handoff", path: h?.path, n: h?.n, source: effect.source } } }; break;
           }
           case "relaunch": {
             if (!frame(ctx).wrapped) break;
             const h = effect.handoff ?? await createHandoff(ctx, emergencyInput(ctx));
+            await resume.persist(ctx, h);
             writeMarker(process.env.PI_RELAUNCH_MARKER!, { cwd: resolve(ctx.cwd), launchPrompt: h.launchPrompt ?? null,
               handoff: h.path, sessionFile: ctx.sessionManager.getSessionFile() ?? null });
             log(ctx, "relaunch", { marker: process.env.PI_RELAUNCH_MARKER, path: h.path });
@@ -315,6 +318,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
           await execute(effects, ctx);
           return { content: [{ type: "text", text: "Handoff inactive; no automatic action. Continue the task." }], details: {} };
         }
+        const resumeFiles = input.files_to_read;
         input = { ...input, files_to_read: normalizeFilesToRead(input.files_to_read, ctx.cwd) as string[] | undefined };
         if (input.files_to_read === undefined) delete input.files_to_read;
         validateHandoff(input);
@@ -329,6 +333,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
         const refusal = handoffBackoff(input, state.lastHandoff, handoffHead(ctx.cwd, ctx.sessionManager.getBranch()), Boolean(forced(state, f)));
         if (refusal) throw new Error(refusal);
         const handoff = await createHandoff(ctx, input, checked.lint, observed);
+        await resume.remember(ctx, handoff, resumeFiles);
         const lintNotice = checked.lint.length ? " Handoff lint recorded warnings; they are in the handoff file." : "";
         await run({ type: "handoff_written", handoff }, ctx);
         const degraded = degradedFor(state, frame(ctx));

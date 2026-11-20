@@ -130,7 +130,7 @@ test("an appended line missing from readback returns an explicit rejection", () 
 // Only the extension may wire flag-gated hooks (which load the store lazily).
 // Core may import the pure, type-import-only authorization helper; all other runtime files stay memory-free.
 const WIRED: Record<string, string[]> = {
-  "src/extension.ts": ["./memory/config.ts", "./memory/journal-hook.ts", "./memory/requests-hook.ts", "./memory/launch.ts", "./memory/tools.ts", "./memory/handoff-hook.ts", "./memory/recall.ts"],
+  "src/extension.ts": ["./memory/config.ts", "./memory/journal-hook.ts", "./memory/requests-hook.ts", "./memory/launch.ts", "./memory/tools.ts", "./memory/handoff-hook.ts", "./memory/recall.ts", "./memory/resume.ts"],
   "src/core.ts": ["./memory/authorize.ts", "./memory/handoff-block.ts"],
   "src/collect.ts": ["./memory/handoff-block.ts"],
   "src/validate.ts": ["./memory/handoff-block.ts"],
