@@ -4,9 +4,10 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
-import { effectiveMode, modelThresholds, parseConfig, renderHandoff, validateHandoff, ownsWrapper, effectiveThresholds, launchPromptKind, shorten, RETRY, normalizeFilesToRead, SOFT_NOTICE, FINISH_NOTICE, initialState, transition, policyStatus,
+import { effectiveMode, modelThresholds, parseConfig, renderHandoff, validateHandoff, ownsWrapper, effectiveThresholds, launchPromptKind, shorten, RETRY, normalizeFilesToRead, initialState, transition, policyStatus,
   restoreHistory, handoffBackoff, forced, fallbackFor, degradedFor, type Effect, type Frame, type MachineEvent, type AutoState, type Handoff, type HandoffInput, type HistoryItem } from "./core.ts";
 import { checkHandoff } from "./validate.ts";
+import { canHandoff, softNotice } from "./budget-notice.ts";
 import { OverflowRecovery } from "./overflow-recovery.ts";
 import { graceEligible } from "./grace.ts";
 import { resumeCommand, runResumeCheck } from "./resume-check.ts";
@@ -15,12 +16,6 @@ import { bytePrefix, chainIdentity, emergencyHandoff, emergencySummary, previous
 
 type ActionResult = BoundaryResult & ToolCallEventResult & SessionBeforeCompactResult;
 type StatusState = "active" | "ended";
-function canHandoff(pi: ExtensionAPI, subagent: boolean): boolean {
-  return !subagent && (pi.getActiveTools?.().includes("context_handoff") ?? false);
-}
-function softNotice(frame: Frame, handoffNotice = SOFT_NOTICE): string {
-  return frame.handoffAvailable === false ? FINISH_NOTICE : handoffNotice;
-}
 function statusIdentity(host: ReturnType<SessionHosts["acquire"]> | undefined, state: StatusState = "active") {
   return { primarySessionId: host?.primarySessionId, state };
 }
@@ -64,7 +59,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
     function frame(ctx: ExtensionContext, observedTokens?: number | null): Frame {
       return { mode: mode(ctx), tokens: observedTokens === undefined ? ctx.getContextUsage()?.tokens ?? null : observedTokens,
         thresholds: modelThresholds(config, ref(ctx), host?.subagent ?? false), config,
-        handoffAvailable: canHandoff(pi, host?.subagent ?? false),
+        handoffAvailable: canHandoff(pi, host),
         wrapped: !!host && ownsWrapper(process.pid, process.env, host.subagent) };
     }
     function step(event: MachineEvent, ctx: ExtensionContext, observed = frame(ctx)): Effect[] {
