@@ -37,11 +37,13 @@ function citedStrings(home: string): Set<string> | undefined {
   for (const located of scan.records) collectStrings(located.record, cited);
   return cited;
 }
-/** Fail safe: unreadable, oversized or malformed files count as cited. */
+/** Fail safe: unreadable, oversized or malformed files (any corrupt line or torn tail) count as cited. */
 function citedByEvents(file: string, cited: Set<string>): boolean {
   try {
     if (statSync(file).size > MAX_READ_BYTES) return true;
-    return scanLog(file, JOURNAL_LINE_BYTES).records.some(({ record: entry }) => {
+    const scan = scanLog(file, JOURNAL_LINE_BYTES);
+    if (scan.tornTail > 0 || scan.corrupt > 0) return true;
+    return scan.records.some(({ record: entry }) => {
       const id = text(record(entry).id);
       return id === undefined || cited.has(id);
     });

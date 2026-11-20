@@ -123,6 +123,17 @@ test("retire/reject sources in aged files pin them: the retired item stays retir
   assert.deepEqual(after, before);
 });
 
+test("an aged file with a corrupt line or torn tail is kept even when its readable records are uncited", () => {
+  for (const damage of ["{not json\n", "{\"id\":\"torn"]) {
+    const w = world();
+    w.say("damaged"); w.say("clean");
+    writeFileSync(w.file("damaged"), damage, { flag: "a" });
+    ageAll(w);
+    pruneJournals(w.options());
+    assert.deepEqual([w.exists("damaged"), w.exists("clean")], [true, false], JSON.stringify(damage));
+  }
+});
+
 test("a human withdrawal that blocks an overlapping agent directive keeps its file", () => {
   const w = world();
   const first = w.say("s-first", { text: "Never deploy on Fridays" });
