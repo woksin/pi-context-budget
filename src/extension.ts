@@ -30,6 +30,8 @@ export default async function (pi: ExtensionAPI) {
   const { getAgentDir } = await import("@earendil-works/pi-coding-agent");
   return createContextBudgetExtension({ agentDir: getAgentDir() })(pi);
 }
+const hasActiveTools = (pi: ExtensionAPI) => (pi.getActiveTools?.().length ?? 1) > 0;
+
 export function createContextBudgetExtension({ agentDir, hosts = processSessionHosts(), launchFacts = processLaunchFacts }: { agentDir: string; hosts?: SessionHosts; launchFacts?: () => LaunchFacts }) {
   return async function contextBudgetExtension(pi: ExtensionAPI) {
     const stateDir = resolve(process.env.PI_CONTEXT_BUDGET_STATE_DIR || join(agentDir, "context-budget"));
@@ -51,7 +53,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
       catch (error) { console.error(`context-budget: event log unavailable: ${String(error)}`); }
     }
     const memoryDeps = { agentDir, configFile, log, host: () => host };
-    const requests = createRequestsHook(memoryDeps);
+    const requests = createRequestsHook({ ...memoryDeps, hasTools: () => hasActiveTools(pi) });
     const journal = wire(requests, { ...memoryDeps, launchFacts });
     function reload(ctx: ExtensionContext): void {
       journal.reload(ctx); requests.reload();

@@ -8,7 +8,9 @@ import { REQUEST_MARKER, type Delivery } from "../src/memory/render-requests.ts"
 function fixture() {
   let data: Delivery | undefined = { sessionId: "main", requests: [{ id: "r", text: "open user prompt" }] };
   let boundaryId: string | undefined = "boundary";
-  const carrier = createCarrier({ read: async () => data && ({ data, boundaryId }) });
+  const carrier = createCarrier({ read: async () => data && ({ data, boundary: boundaryId ? {
+    event: { id: boundaryId, lastAnswerId: "a" }, open: { count: 1, ids: ["r"] },
+  } as any : undefined }) });
   return { carrier, ctx: {} as any, event: { type: "context" as const, messages: [] },
     setData: (value: Delivery | undefined) => { data = value; }, setBoundary: (value: string | undefined) => { boundaryId = value; } };
 }
@@ -38,14 +40,31 @@ test("request injection needs a reset, is flag-gated, and catches reader failure
   assert.equal(await broken.context(h.event, h.ctx), undefined);
 });
 
-test("same-run answer is delivered once past a boundary; open tasks still project on every request", async () => {
+test("same-run answer is delivered once after a successful call; only cutoff tasks continue projecting", async () => {
   const h = fixture();
   h.setData({ sessionId: "main", requests: [], lastAnswer: { id: "a", text: "answer", sameRunAsAnswer: true } });
   assert.match(JSON.stringify(await h.carrier.context(h.event, h.ctx)), /short recap/);
+  h.carrier.completed("stop");
   h.setBoundary("later"); assert.equal(await h.carrier.context(h.event, h.ctx), undefined);
   h.setData({ sessionId: "main", requests: [{ id: "r", text: "still open" }], lastAnswer: { id: "a", text: "answer", sameRunAsAnswer: true } });
   const again = await h.carrier.context(h.event, h.ctx);
-  assert.match(JSON.stringify(again), /still open/); assert.doesNotMatch(JSON.stringify(again), /short recap/);
+  assert.match(JSON.stringify(again), /still open/); assert.doesNotMatch(JSON.stringify(again), /short recap|Last answer before this reset/);
+});
+
+for (const reason of ["error", "aborted", "stop", "toolUse", "length"]) test(`recap acknowledgement waits for provider completion: ${reason}`, async () => {
+  const h = fixture();
+  h.setData({ sessionId: "main", requests: [], lastAnswer: { id: "a", text: "answer", sameRunAsAnswer: true } });
+  assert.match(JSON.stringify(await h.carrier.context(h.event, h.ctx)), /short recap/);
+  h.carrier.completed(reason);
+  const retry = await h.carrier.context(h.event, h.ctx);
+  if (["error", "aborted"].includes(reason)) assert.match(JSON.stringify(retry), /short recap/);
+  else assert.equal(retry, undefined);
+});
+
+test("N1 unresolved cutoff membership is never guessed", async () => {
+  const carrier = createCarrier({ read: async () => ({ boundary: { event: { id: "cut" }, open: { count: 99, unresolved: true } } as any,
+    data: { sessionId: "main", requests: [{ id: "new", text: "visible request" }] } }) });
+  assert.equal(await carrier.context({ type: "context", messages: [] }, {} as any), undefined);
 });
 
 for (const mode of ["observe", "guard-off", "enforce"]) test(`B3 (g) ${mode} mechanical overflow fallback is followed by fresh context delivery`, async () => {
@@ -60,7 +79,10 @@ for (const mode of ["observe", "guard-off", "enforce"]) test(`B3 (g) ${mode} mec
     h.duringCompact(async () => { if (h.compactions() === 2) h.setCompact("ok"); });
     await h.recover();
     const result = await h.emit("context", { type: "context", messages: [] });
-    assert.match(JSON.stringify(result), /still open package request/);
+    if (mode === "enforce") {
+      assert.equal(result, undefined, "harness summary already carries the requests");
+      assert.match(h.lastCompactResult()?.compaction?.summary, /still open package request/);
+    } else assert.match(JSON.stringify(result), /still open package request/);
     assert.equal(h.lastCompactResult()?.compaction?.details.kind, mode === "enforce" ? "handoff" : "overflow-mechanical");
     assert.equal(h.compactions(), mode === "enforce" ? 1 : 2);
   } finally { delete global[key]; }

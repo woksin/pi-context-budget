@@ -13,13 +13,13 @@ import { buildSessionContext, SessionManager } from "@earendil-works/pi-coding-a
 
 const base = new URL("../.ai-work/delivery/", import.meta.url).pathname;
 mkdirSync(base, { recursive: true });
-export async function deliveryFixture(on = true) {
+export async function deliveryFixture(on = true, hasTools = () => true) {
   const dir = mkdtempSync(join(base, "case-")), agentDir = join(dir, "agent"), configFile = join(dir, "config.json");
   mkdirSync(agentDir); delete process.env.PI_MEMORY_HOME;
   writeFileSync(configFile, JSON.stringify({ memory: on ? { journal: true, requests: true, scope: { mode: "all" } } : {} }));
   const ctx: any = { cwd: dir, hasUI: true, isIdle: () => true,
     sessionManager: { getSessionId: () => "main", getSessionFile: () => join(dir, "session.jsonl") } };
-  const deps = { agentDir, configFile, host: () => ({ subagent: false, primarySessionId: "main" }), log() {}, launchFacts: () => ({ initialPrompt: null, relaunchPrompt: null }) };
+  const deps = { agentDir, configFile, hasTools, host: () => ({ subagent: false, primarySessionId: "main" }), log() {}, launchFacts: () => ({ initialPrompt: null, relaunchPrompt: null }) };
   const requests = createRequestsHook(deps), journal = wire(requests, deps);
   requests.reload(); journal.reload(ctx);
   const human = (text: string) => journal.onInput({ text, source: "interactive" }, ctx);
@@ -138,6 +138,7 @@ test("Option A context uses only durable redacted answers, not an unwritten held
   writeFileSync(join(h.home, "answers", "main.jsonl"), "", { mode: 0o400 }); // readable but not appendable
   await h.answer("unwritten held answer"); await h.requests.commit(h.ctx, "/handoff", false);
   assert.match(await h.requests.render(h.ctx), /unwritten held answer/, "harness summary may use the redacted memory fallback");
+  await h.requests.compacted({ reason: "manual", compactionEntry: { id: "native" } }, h.ctx, false);
   const result = await h.requests.context({ type: "context", messages: [] }, h.ctx);
   assert.match(JSON.stringify(result), /durable task/);
   assert.doesNotMatch(JSON.stringify(result), /unwritten held answer/);
@@ -145,11 +146,12 @@ test("Option A context uses only durable redacted answers, not an unwritten held
 
 test("minor: stored unseen answer is delivered once, not on every later compaction", async () => {
   const h = await deliveryFixture(); await h.human("question"); await h.answer("stored answer");
-  await h.requests.commit(h.ctx, "/handoff", false);
+  await h.requests.compacted({ reason: "manual", compactionEntry: { id: "native" } }, h.ctx, false);
   h.requests.agentStart(); // force selection from disk rather than the prior run's held answer
   const event = { type: "context" as const, messages: [] };
   const first = await h.requests.context(event, h.ctx);
   assert.match(JSON.stringify(first), /short recap/);
+  await h.requests.messageEnd({ role: "assistant", stopReason: "stop", content: [] }, h.ctx);
   const before = readFileSync(join(h.home, "journal/main.jsonl"), "utf8");
   await h.requests.compacted({ reason: "manual", compactionEntry: { id: "later" } }, h.ctx, false);
   assert.equal(await h.requests.context(event, h.ctx), undefined);
@@ -157,7 +159,8 @@ test("minor: stored unseen answer is delivered once, not on every later compacti
 });
 
 test("(l) enabled to disabled reload removes all delivery behavior without losing durable history", async () => {
-  const h = await deliveryFixture(); await h.human("still open"); await h.requests.commit(h.ctx, "/handoff", false);
+  const h = await deliveryFixture(); await h.human("still open");
+  await h.requests.compacted({ reason: "manual", compactionEntry: { id: "native" } }, h.ctx, false);
   const event = { type: "context" as const, messages: [] };
   assert.match(JSON.stringify(await h.requests.context(event, h.ctx)), /still open/);
   writeFileSync(h.configFile, JSON.stringify({ memory: {} })); h.requests.reload();
@@ -166,6 +169,46 @@ test("(l) enabled to disabled reload removes all delivery behavior without losin
   assert.deepEqual(await h.requests.handoff(h.ctx), { requests: "", requestsTask: false });
   writeFileSync(h.configFile, JSON.stringify({ memory: { journal: true, requests: true, scope: { mode: "all" } } })); h.requests.reload();
   assert.match(JSON.stringify(await h.requests.context(event, h.ctx)), /still open/);
+});
+
+test("N1 reset then new prompt never injects a still-visible request", async () => {
+  const h = await deliveryFixture();
+  await h.requests.compacted({ reason: "manual", compactionEntry: { id: "empty" } }, h.ctx, false);
+  await h.human("new visible prompt");
+  assert.equal(await h.requests.context({ type: "context", messages: [] }, h.ctx), undefined);
+});
+
+test("N1 only latest reset openRequests project, never later prompts or answers", async () => {
+  const h = await deliveryFixture(); await h.human("cutoff question");
+  await h.requests.compacted({ reason: "manual", compactionEntry: { id: "cut" } }, h.ctx, false);
+  await h.human("later visible question");
+  const event = { type: "context" as const, messages: [] };
+  const projected = JSON.stringify(await h.requests.context(event, h.ctx));
+  assert.match(projected, /cutoff question/); assert.doesNotMatch(projected, /later visible question/);
+  await h.answer("visible post-reset answer", true);
+  const next = JSON.stringify(await h.requests.context(event, h.ctx));
+  assert.match(next, /cutoff question/); assert.doesNotMatch(next, /visible post-reset answer/);
+  await h.requests.commit(h.ctx, "/latest-harness-summary", false);
+  assert.equal(await h.requests.context(event, h.ctx), undefined, "latest reset supersedes earlier native reset");
+});
+
+for (const kind of ["handoff", "overflow-mechanical", "native"]) test(`N1 structured ${kind} summary ownership controls duplicate delivery`, async () => {
+  const h = await deliveryFixture(); await h.human("cutoff request");
+  h.ctx.sessionManager.getBranch = () => [{ type: "compaction", id: "cut", details: { kind } }];
+  await h.requests.compacted({ reason: "threshold", compactionEntry: { id: "cut" } }, h.ctx, false);
+  const result = await h.requests.context({ type: "context", messages: [] }, h.ctx);
+  if (kind === "handoff") assert.equal(result, undefined);
+  else assert.match(JSON.stringify(result), /cutoff request/);
+});
+
+test("tool-less sessions receive no requests or carrier; capability is checked at call time", async () => {
+  let tools = true;
+  const h = await deliveryFixture(true, () => tools); await h.human("tool-bearing task");
+  await h.requests.compacted({ reason: "manual", compactionEntry: { id: "cut" } }, h.ctx, false);
+  tools = false;
+  assert.equal(await h.requests.render(h.ctx), "");
+  assert.equal(await h.requests.context({ type: "context", messages: [] }, h.ctx), undefined);
+  tools = true; assert.match(await h.requests.render(h.ctx), /tool-bearing task/);
 });
 
 test("launcher fact is narrow: fresh TTY only, never positional/@file/piped/relaunch/unknown vars", () => {

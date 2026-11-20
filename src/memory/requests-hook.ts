@@ -18,7 +18,7 @@ export const SESSION_CAP_BYTES = 50 * 1024 * 1024;
 const HELD_LIMIT = 100;
 type HookContext = { cwd: string; sessionManager: { getSessionId(): string; getSessionFile?(): string | undefined; getSessionName?(): string | undefined } };
 type AssistantMessage = { role?: string; content?: unknown; stopReason?: string; model?: string };
-export type RequestsHookDeps = { agentDir: string; configFile: string; host: () => HostFacts | undefined; blobWriter?: BlobWriter; capBytes?: number;
+export type RequestsHookDeps = { agentDir: string; configFile: string; host: () => HostFacts | undefined; hasTools?: () => boolean; blobWriter?: BlobWriter; capBytes?: number;
   log: (ctx: ExtensionContext, event: string, data?: Record<string, unknown>) => void };
 /** One assistant message as kept in process memory: it survives a failed write so a handoff can still carry it. */
 export type RunAnswer = { id: string; kind: AnswerKind; textBytes: number; stopReason: string; parts: Omit<AnswerParts, "requests">;
@@ -41,7 +41,8 @@ export function createRequestsHook(deps: RequestsHookDeps) {
   const reported = new Set<string>();
   const home = async () => (await (store ??= import("./store.ts").then(({ FileMemoryStore }) => new FileMemoryStore({ agentDir: deps.agentDir })))).home;
   const scanners = () => scanner ??= loadScanner(deps.agentDir);
-  const enabled = (ctx: HookContext) => !deps.host()?.subagent && flagOn(memory, ctx.sessionManager.getSessionName?.(), "requests");
+  const enabled = (ctx: HookContext) => [!deps.host()?.subagent, deps.hasTools?.() ?? true,
+    flagOn(memory, ctx.sessionManager.getSessionName?.(), "requests")].every(Boolean);
   const session = (ctx: HookContext) => ({ id: ctx.sessionManager.getSessionId(), role: "main" as const, file: ctx.sessionManager.getSessionFile?.() });
 
   /** Loud but non-blocking (contract 10.6): the event log gets one record per failure kind, the next render one line. */
@@ -124,11 +125,11 @@ export function createRequestsHook(deps: RequestsHookDeps) {
     try {
       await load(ctx);
       const state = readSessionState(await home(), session(ctx).id);
-      const boundaryId = state.boundaries.filter(b => b.event.kind !== "abort").at(-1)?.event.id;
-      return { boundaryId, data: selectDelivery({ ...state, sessionId: session(ctx).id, degraded }, held, humanSeq) };
+      const boundary = state.boundaries.filter(b => b.event.kind !== "abort").at(-1);
+      return { boundary, data: selectDelivery({ ...state, sessionId: session(ctx).id, degraded }, held, humanSeq) };
     } catch (error) {
       degrade(ctx, "render", error);
-      return { boundaryId: undefined, data: { sessionId: session(ctx).id, requests: [], degraded } };
+      return { boundary: undefined, data: { sessionId: session(ctx).id, requests: [], degraded } };
     }
   }
   async function render(ctx: HookContext, emergency = false): Promise<string> {
@@ -165,7 +166,9 @@ export function createRequestsHook(deps: RequestsHookDeps) {
     }),
     /** Awaited by the runtime before the message is persisted and before turn_end, so no boundary effect can run first. */
     messageEnd: (message: AssistantMessage, ctx: HookContext) => guarded(ctx, "answer_capture", async () => {
-      if (message?.role === "assistant") await captureAnswer(message, ctx);
+      if (message?.role !== "assistant") return;
+      carrier.completed(message.stopReason);
+      await captureAnswer(message, ctx);
     }),
     commit: (ctx: HookContext, handoffPath: string | undefined, idle: boolean) =>
       guarded(ctx, "boundary_write", () => boundary(ctx, idle ? "idle" : "handoff", { handoffPath })),
