@@ -32,7 +32,7 @@ function world() {
   const auto = (entry: MessageInput, overrides: Partial<Item> = {}) =>
     directive(entry, { authority: { mode: "auto", ruleVersion: 1 }, ...overrides });
   const options = (extra: Partial<PruneOptions> = {}): PruneOptions =>
-    ({ home, state: () => store.readFolded(), requestsOn: false, days: 30, now, ...extra });
+    ({ home, state: hidden => store.readFoldedWithout(hidden), requestsOn: false, days: 30, now, ...extra });
   const exists = (session: string) => existsSync(file(session));
   const live = (state: FoldedState) => Object.values(state.items).filter(item => item.status === "active" || item.status === "proposed");
   return { home, store, file, age, say, auto, options, exists, live };
@@ -58,7 +58,7 @@ test("old unreferenced files go; fresh, cutoff-boundary-minus and future files s
 test("non-matching names, directories and symlinks are never touched", () => {
   const w = world();
   w.say("real"); w.age("real", 90);
-  const state = w.store.readFolded(), journal = join(w.home, "journal"), outside = tmp("outside-"), target = join(outside, "target.jsonl");
+  const journal = join(w.home, "journal"), snapshot = w.store.readFolded(), outside = tmp("outside-"), target = join(outside, "target.jsonl");
   writeFileSync(target, "keep me");
   mkdirSync(join(outside, "dir.jsonl"));
   const old = (NOW - 90 * DAY_MS) / 1000;
@@ -67,7 +67,7 @@ test("non-matching names, directories and symlinks are never touched", () => {
   mkdirSync(join(journal, "dir.jsonl"));
   symlinkSync(target, join(journal, "link.jsonl"));
   symlinkSync(join(outside, "dir.jsonl"), join(journal, "dirlink.jsonl"));
-  const result = pruneJournals(w.options({ state }));
+  const result = pruneJournals(w.options({ state: () => snapshot }));
   assert.equal(w.exists("real"), false);
   assert.equal(result.removed, 1);
   for (const name of [...names, "dir.jsonl", "link.jsonl", "dirlink.jsonl"]) assert.ok(existsSync(join(journal, name)), name);
@@ -75,7 +75,7 @@ test("non-matching names, directories and symlinks are never touched", () => {
   assert.ok(existsSync(join(outside, "dir.jsonl")));
 });
 
-test("live items protect their evidence; retired and unreferenced files are removed; fold is unchanged", () => {
+test("events cite evidence in any state (retired included); only unreferenced files are removed; fold is unchanged", () => {
   const w = world();
   const active = w.say("s-active"), proposedSource = w.say("s-proposed"), retiredSource = w.say("s-retired"), ancestorSource = w.say("s-ancestor");
   const successorSource = w.say("s-successor"), commandSource = w.say("s-command", { text: "/directive Always lint", originEvidence: ["tui-confirm"] });
@@ -94,14 +94,77 @@ test("live items protect their evidence; retired and unreferenced files are remo
   const before = w.store.readFolded();
   assert.equal(before.items[ancestor.id]!.status, "superseded");
   const result = pruneJournals(w.options());
-  for (const kept of ["s-active", "s-proposed", "s-ancestor", "s-successor", "s-command"]) assert.ok(w.exists(kept), kept);
-  for (const gone of ["s-retired", "s-unref"]) assert.equal(w.exists(gone), false, gone);
-  assert.equal(result.removed, 2);
-  assert.equal(result.protectedCount, 5);
+  for (const kept of ["s-active", "s-proposed", "s-retired", "s-ancestor", "s-successor", "s-command"]) assert.ok(w.exists(kept), kept);
+  assert.equal(w.exists("s-unref"), false);
+  assert.equal(result.removed, 1);
+  assert.equal(result.protectedCount, 6);
   const after = new FileMemoryStore({ home: w.home, eligibilityCheck: eligible }).readFolded();
   assert.deepEqual(w.live(after), w.live(before));
   assert.ok(w.live(after).length >= 4);
   assert.equal(after.items[ancestor.id]!.status, "superseded");
+});
+
+test("retire/reject sources in aged files pin them: the retired item stays retired after a purge", () => {
+  const w = world();
+  const retireSource = w.say("s-retire-src"), addA = w.say("s-add-a"), addB = w.say("s-add-b");
+  const done = w.auto(addA), turned = directive(addB);
+  const rejectSource = w.say("s-reject-src", { text: `/memory reject ${turned.id}`, originEvidence: ["tui-confirm"] });
+  w.store.addItem(done, agent); w.store.addItem(turned, agent);
+  assert.equal(w.store.retireItem(done.id, "done", "Finished", { type: "user_message", ref: retireSource.id }, human).ok, true);
+  assert.equal(w.store.retireItem(turned.id, "rejected", "No", { type: "user_message", ref: rejectSource.id }, human).ok, true);
+  ageAll(w);
+  const before = w.store.readFolded();
+  const result = pruneJournals(w.options());
+  assert.equal(result.removed, 0);
+  for (const name of ["s-retire-src", "s-reject-src", "s-add-a", "s-add-b"]) assert.ok(w.exists(name), name);
+  const after = new FileMemoryStore({ home: w.home, eligibilityCheck: eligible }).readFolded();
+  assert.equal(after.items[done.id]!.status, before.items[done.id]!.status);
+  assert.equal(after.items[turned.id]!.status, "rejected");
+  assert.deepEqual(after, before);
+});
+
+test("a human withdrawal that blocks an overlapping agent directive keeps its file", () => {
+  const w = world();
+  const first = w.say("s-first", { text: "Never deploy on Fridays" });
+  const withdrawal = w.say("s-withdraw", { origin: "human", text: "stop that", at: "2099-01-01T00:00:00.000Z" });
+  const older = w.auto(first);
+  assert.equal(w.store.addItem(older, agent).ok, true);
+  assert.equal(w.store.retireItem(older.id, "withdrawn", "Human says no", { type: "user_message", ref: withdrawal.id }, human).ok, true);
+  const later = w.auto(first);
+  assert.equal(w.store.addItem(later, agent).ok, true);
+  assert.equal(w.store.readFolded().items[later.id]!.status, "proposed", "the human withdrawal blocks the overlapping auto directive");
+  ageAll(w);
+  const before = w.store.readFolded();
+  assert.equal(pruneJournals(w.options()).removed, 0);
+  assert.ok(w.exists("s-withdraw"));
+  assert.deepEqual(new FileMemoryStore({ home: w.home, eligibilityCheck: eligible }).readFolded(), before);
+});
+
+test("verification: when hiding the candidates changes the projection nothing is deleted and the mismatch is reported", () => {
+  const w = world();
+  w.say("s-a"); w.say("s-b");
+  ageAll(w);
+  const result = pruneJournals(w.options({ state: hidden => ({ ...w.store.readFolded(), rejectedEvents: hidden.size ? [{ eventId: "x", reason: "no_source" }] : [] } as never) }));
+  assert.equal(result.removed, 0);
+  assert.equal(result.mismatch, true);
+  assert.equal(result.kept, 2);
+  assert.ok(w.exists("s-a") && w.exists("s-b"));
+});
+
+test("a candidate cited by an event appended after it was scanned is kept", () => {
+  const w = world();
+  const racy = w.say("s-racy"); w.say("s-a"); w.say("s-z");
+  ageAll(w);
+  let calls = 0;
+  const clock = () => {
+    if (++calls === 4) appendRecord(join(w.home, "events.jsonl"), { schema: "memory.event/2", id: newId(), at: new Date().toISOString(), actor: human,
+      type: "request_close", requestId: racy.id, status: "abandoned", reason: "x" });
+    return NOW;
+  };
+  const result = pruneJournals(w.options({ now: clock }));
+  assert.ok(w.exists("s-racy"));
+  assert.equal(w.exists("s-a") || w.exists("s-z"), false);
+  assert.equal(result.removed, 2);
 });
 
 test("a confirm of a proposed item and its cited source are kept", () => {
@@ -117,7 +180,7 @@ test("a confirm of a proposed item and its cited source are kept", () => {
   assert.equal(w.exists("s-other"), false);
 });
 
-test("open requests protect only when requests are on; closed requests do not", () => {
+test("open requests protect only when requests are on; closed requests are pinned by their close event", () => {
   const w = world();
   const open = w.say("s-open"), closed = w.say("s-closed");
   appendRecord(join(w.home, "events.jsonl"), { schema: "memory.event/2", id: newId(), at: new Date().toISOString(), actor: human,
@@ -125,12 +188,11 @@ test("open requests protect only when requests are on; closed requests do not", 
   assert.ok(open && closed);
   ageAll(w);
   const off = pruneJournals(w.options({ dryRun: true, requestsOn: false }));
-  assert.equal(off.wouldRemove, 2);
+  assert.equal(off.wouldRemove, 1, "the closed request is cited by its close event; only the open one is unreferenced");
   const on = pruneJournals(w.options({ requestsOn: true }));
-  assert.equal(on.removed, 1);
-  assert.ok(w.exists("s-open"));
-  assert.equal(w.exists("s-closed"), false);
-  assert.equal(on.protectedCount, 1);
+  assert.equal(on.removed, 0);
+  assert.ok(w.exists("s-open") && w.exists("s-closed"));
+  assert.equal(on.protectedCount, 2);
 });
 
 test("fail safe: broken evidence, throwing fold or unreadable file keeps everything", () => {
@@ -204,7 +266,7 @@ test("retentionPass: daily throttle, stamp written even when capped, cursor resu
   const w = world();
   for (const id of ["a", "b", "c"]) w.say(id);
   ageAll(w);
-  const base = { home: w.home, state: () => w.store.readFolded(), requestsOn: false, days: 30 };
+  const base = { home: w.home, state: (hidden: ReadonlySet<string>) => w.store.readFoldedWithout(hidden), requestsOn: false, days: 30 };
   const first = retentionPass({ ...base, now, maxFiles: 1 })!;
   assert.deepEqual([first.removed, first.capped, first.cursor], [1, true, "a.jsonl"]);
   assert.deepEqual(JSON.parse(readFileSync(join(w.home, STAMP_FILE), "utf8")), { at: NOW, cursor: "a.jsonl" });

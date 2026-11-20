@@ -1,7 +1,7 @@
-import { closeSync, fstatSync, lstatSync, openSync, readdirSync, readFileSync, unlinkSync, existsSync, type Stats } from "node:fs";
+import { lstatSync, readdirSync, readFileSync, unlinkSync, existsSync, statSync, type Stats } from "node:fs";
 import { join } from "node:path";
 import { atomicJson } from "../storage.ts";
-import { scanLog } from "./log.ts";
+import { JOURNAL_LINE_BYTES, scanLog } from "./log.ts";
 import { readSessionState } from "./requests.ts";
 import type { FoldedState } from "./types.ts";
 
@@ -12,64 +12,40 @@ const MAX_READ_BYTES = 8 * 1024 * 1024;
 const AUTO_MAX_MS = 200;
 const DEFAULT_MAX_FILES = 5000;
 
-export type PruneOptions = {
-  home: string; state: FoldedState | (() => FoldedState); requestsOn: boolean; days: number; now?: () => number;
-  currentSessionId?: string; dryRun?: boolean; maxFiles?: number; maxMs?: number; cursor?: string;
-};
-export type PruneResult = { examined: number; removed: number; wouldRemove: number; kept: number; protectedCount: number;
-  errors: number; capped: boolean; cursor: string };
-type Evidence = { ids: string[] } | undefined;
-
 const text = (value: unknown): string | undefined => typeof value === "string" && value.length > 0 ? value : undefined;
 const record = (value: unknown): Record<string, unknown> => typeof value === "object" && value !== null ? value as Record<string, unknown> : {};
 
-/** Active/proposed items plus everything they supersede: ancestors must stay valid for the live item's add to fold. */
-function liveChain(state: FoldedState): Set<string> {
-  const chain = new Set<string>(), queue = Object.values(state.items).filter(item => item.status === "active" || item.status === "proposed").map(item => item.id);
-  for (let id = queue.pop(); id !== undefined; id = queue.pop()) {
-    if (chain.has(id)) continue;
-    chain.add(id);
-    queue.push(...(state.items[id]?.supersedes ?? []));
-  }
-  return chain;
+export type PruneOptions = {
+  home: string; state: (hidden: ReadonlySet<string>) => FoldedState; requestsOn: boolean; days: number; now?: () => number;
+  currentSessionId?: string; dryRun?: boolean; maxFiles?: number; maxMs?: number; cursor?: string;
+};
+export type PruneResult = { examined: number; removed: number; wouldRemove: number; kept: number; protectedCount: number;
+  errors: number; capped: boolean; cursor: string; mismatch: boolean };
+type Candidate = { name: string; file: string; stat: Stats };
+
+/** Every string anywhere in the events log: an event that cites a message id (any kind, any state) pins that message's file. */
+function collectStrings(value: unknown, into: Set<string>): void {
+  if (typeof value === "string") into.add(value);
+  else if (Array.isArray(value)) for (const entry of value) collectStrings(entry, into);
+  else if (typeof value === "object" && value !== null) for (const entry of Object.values(value)) collectStrings(entry, into);
 }
-function itemRefs(item: Record<string, unknown>): (string | undefined)[] {
-  return [text(record(item.source).ref), text(record(item.authority).commandRef)];
-}
-function eventItemIds(event: Record<string, unknown>): string[] {
-  const ids = [text(record(event.item).id), text(event.itemId)];
-  for (const span of Array.isArray(event.spans) ? event.spans : []) {
-    const itemIds = record(span).itemIds;
-    if (Array.isArray(itemIds)) ids.push(...itemIds.map(text));
-  }
-  return ids.filter((id): id is string => id !== undefined);
-}
-function eventRefs(event: Record<string, unknown>): (string | undefined)[] {
-  return [...itemRefs(record(event.item)), ...itemRefs(event), text(event.messageId)];
-}
-const present = (refs: (string | undefined)[]): string[] => refs.filter((ref): ref is string => ref !== undefined);
-function eventEvidence(records: ReturnType<typeof scanLog>["records"], chain: Set<string>): string[] {
-  const events = records.map(located => record(located.record));
-  return events.filter(event => eventItemIds(event).some(id => chain.has(id))).flatMap(event => present(eventRefs(event)));
-}
-/** Message ids that live items need in the journal. Corrupt events log means evidence cannot be proven: undefined. */
-function protectedIds(state: FoldedState, home: string): Evidence {
-  const chain = liveChain(state), scan = scanLog(join(home, "events.jsonl"));
+/** Cited strings, or undefined when the events log is not wholly readable (cannot prove anything: keep everything). */
+function citedStrings(home: string): Set<string> | undefined {
+  const scan = scanLog(join(home, "events.jsonl"));
   if (scan.tornTail > 0 || scan.corrupt > 0) return undefined;
-  const itemEvidence = [...chain].flatMap(id => present(itemRefs(record(state.items[id]))));
-  return { ids: [...new Set([...itemEvidence, ...eventEvidence(scan.records, chain)])] };
+  const cited = new Set<string>();
+  for (const located of scan.records) collectStrings(located.record, cited);
+  return cited;
 }
-/** Fail safe: unreadable, oversized or ambiguous files count as backing live evidence. */
-function citesProtectedId(file: string, ids: string[]): boolean {
-  if (!ids.length) return false;
-  let fd: number | undefined;
+/** Fail safe: unreadable, oversized or malformed files count as cited. */
+function citedByEvents(file: string, cited: Set<string>): boolean {
   try {
-    fd = openSync(file, "r");
-    if (fstatSync(fd).size > MAX_READ_BYTES) return true;
-    const body = readFileSync(fd, "utf8");
-    return ids.some(id => body.includes(id));
+    if (statSync(file).size > MAX_READ_BYTES) return true;
+    return scanLog(file, JOURNAL_LINE_BYTES).records.some(({ record: entry }) => {
+      const id = text(record(entry).id);
+      return id === undefined || cited.has(id);
+    });
   } catch { return true; }
-  finally { if (fd !== undefined) try { closeSync(fd); } catch { /* Keep result. */ } }
 }
 function hasOpenRequest(home: string, name: string): boolean {
   try { return readSessionState(home, name.slice(0, -".jsonl".length)).open.length > 0; }
@@ -78,32 +54,21 @@ function hasOpenRequest(home: string, name: string): boolean {
 const sameFile = (a: Stats, b: Stats) => a.ino === b.ino && a.mtimeMs === b.mtimeMs && a.size === b.size && b.isFile();
 
 class Pass {
-  readonly result: PruneResult = { examined: 0, removed: 0, wouldRemove: 0, kept: 0, protectedCount: 0, errors: 0, capped: false, cursor: "" };
-  private evidence: Evidence | null = null;
+  readonly result: PruneResult = { examined: 0, removed: 0, wouldRemove: 0, kept: 0, protectedCount: 0, errors: 0, capped: false, cursor: "", mismatch: false };
+  readonly candidates: Candidate[] = [];
   private readonly opts: PruneOptions;
   private readonly cutoff: number;
   constructor(opts: PruneOptions, cutoff: number) { this.opts = opts; this.cutoff = cutoff; }
-  private ids(): Evidence {
-    if (this.evidence !== null) return this.evidence;
-    try {
-      const { state } = this.opts;
-      this.evidence = protectedIds(typeof state === "function" ? state() : state, this.opts.home);
-    } catch { this.evidence = undefined; }
-    if (!this.evidence) this.result.errors++;
-    return this.evidence;
+  private cited: Set<string> | undefined | null = null;
+  private isCited(cited: Set<string> | undefined, name: string, file: string): boolean {
+    if (!cited) return true;
+    return citedByEvents(file, cited) || (this.opts.requestsOn && hasOpenRequest(this.opts.home, name));
   }
-  private isProtected(name: string, file: string): boolean {
-    const evidence = this.ids();
-    if (!evidence) return true;
-    return citesProtectedId(file, evidence.ids) || (this.opts.requestsOn && hasOpenRequest(this.opts.home, name));
+  private evidence(): Set<string> | undefined {
+    if (this.cited === null) this.cited = citedStrings(this.opts.home);
+    return this.cited;
   }
-  private remove(file: string, before: Stats): void {
-    if (this.opts.dryRun) { this.result.wouldRemove++; return; }
-    if (!sameFile(before, lstatSync(file))) { this.result.kept++; return; }
-    unlinkSync(file);
-    this.result.removed++;
-  }
-  /** Any exception means keep. */
+  /** Rule A: expired, not current, cited by no event. Evidence is read once per file visit, after the stat. */
   visit(name: string): void {
     const result = this.result, file = join(this.opts.home, "journal", name);
     result.examined++;
@@ -111,9 +76,45 @@ class Pass {
       const stat = lstatSync(file);
       const old = stat.isFile() && stat.mtimeMs <= this.cutoff && name !== `${this.opts.currentSessionId}.jsonl`;
       if (!old) { result.kept++; return; }
-      if (this.isProtected(name, file)) { result.kept++; result.protectedCount++; return; }
-      this.remove(file, stat);
+      if (this.isCited(this.evidence(), name, file)) { result.kept++; result.protectedCount++; return; }
+      this.candidates.push({ name, file, stat });
     } catch { result.kept++; result.errors++; }
+  }
+  private keepAll(mismatch: boolean): void {
+    this.result.kept += this.candidates.length;
+    this.result.errors++;
+    this.result.mismatch = mismatch;
+  }
+  /** Rule B: the projection must be identical with and without the candidates (in memory only). */
+  private verified(): boolean {
+    try {
+      const full = JSON.stringify(this.opts.state(new Set())), hidden = JSON.stringify(this.opts.state(new Set(this.candidates.map(c => c.name))));
+      if (full === hidden) return true;
+      this.keepAll(true);
+    } catch { this.keepAll(false); }
+    return false;
+  }
+  private remove(candidate: Candidate): void {
+    try {
+      if (!sameFile(candidate.stat, lstatSync(candidate.file))) { this.result.kept++; return; }
+      if (this.opts.dryRun) { this.result.wouldRemove++; return; }
+      unlinkSync(candidate.file);
+      this.result.removed++;
+    } catch { this.result.kept++; this.result.errors++; }
+  }
+  /** Events appended since the scan may cite a candidate: re-read the evidence and drop what is now cited. */
+  private recheck(): void {
+    const cited = citedStrings(this.opts.home), all = this.candidates.splice(0);
+    for (const candidate of all) {
+      if (this.isCited(cited, candidate.name, candidate.file)) { this.result.kept++; this.result.protectedCount++; }
+      else this.candidates.push(candidate);
+    }
+  }
+  finish(): void {
+    if (!this.candidates.length) return;
+    this.recheck();
+    if (!this.candidates.length || !this.verified()) return;
+    for (const candidate of this.candidates) this.remove(candidate);
   }
 }
 
@@ -123,7 +124,7 @@ function candidateNames(home: string, cursor: string | undefined): string[] {
   } catch { return []; }
 }
 
-/** Deletes aged per-session journal files that no live item or open request needs. Total: never throws, never creates directories. */
+/** Deletes aged per-session journal files that no event cites and whose absence provably changes nothing. Total: never throws, never creates directories. */
 export function pruneJournals(opts: PruneOptions): PruneResult {
   const now = opts.now ?? Date.now, started = now(), maxFiles = opts.maxFiles ?? DEFAULT_MAX_FILES, maxMs = opts.maxMs ?? Infinity;
   const pass = new Pass(opts, started - opts.days * DAY_MS);
@@ -136,6 +137,7 @@ export function pruneJournals(opts: PruneOptions): PruneResult {
     }
     pass.visit(name);
   }
+  pass.finish();
   return pass.result;
 }
 

@@ -82,10 +82,10 @@ export function createJournalHook(deps: JournalHookDeps): JournalHook {
     const home = memoryHome({ agentDir: deps.agentDir });
     if (!existsSync(join(home, "journal"))) return; // Nothing to prune; never create the store just for this.
     const store = new FileMemoryStore({ home, eligibilityCheck, coordinators: memory.coordinators });
-    const result = retentionPass({ home, state: () => store.readFolded(), requestsOn: flagOn(memory, name, "requests"),
+    const result = retentionPass({ home, state: hidden => store.readFoldedWithout(hidden), requestsOn: flagOn(memory, name, "requests"),
       days: memory.retentionDays, currentSessionId: ctx.sessionManager.getSessionId() });
     if (result) deps.log(ctx as ExtensionContext, "journal_pruned", { examined: result.examined, removed: result.removed,
-      kept: result.kept, protected: result.protectedCount, errors: result.errors, capped: result.capped });
+      kept: result.kept, protected: result.protectedCount, errors: result.errors, capped: result.capped, mismatch: result.mismatch });
   }
   return {
     reload,

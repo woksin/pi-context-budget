@@ -76,12 +76,13 @@ export function parsePurgeArgs(args: string[]): { days?: number; dryRun: boolean
 async function purge(runtime: IntentServices, ctx: ExtensionCommandContext, args: string[]): Promise<string> {
   const options = parsePurgeArgs(args), config = runtime.memoryConfig?.() ?? memoryOff(), name = ctx.sessionManager.getSessionName?.();
   requireValid(flagOn(config, name, "journal"), MEMORY_DISABLED);
-  const [{ pruneJournals }, { memoryHome }] = await Promise.all([import("./retention.ts"), import("./store.ts")]);
-  const store = await runtime.store(ctx);
-  const result = pruneJournals({ home: memoryHome({ agentDir: runtime.agentDir }), state: store.readFolded(), requestsOn: flagOn(config, name, "requests"),
+  const [{ pruneJournals }, { FileMemoryStore, memoryHome }, { eligibilityCheck }] =
+    await Promise.all([import("./retention.ts"), import("./store.ts"), import("./authorize.ts")]);
+  const home = memoryHome({ agentDir: runtime.agentDir }), store = new FileMemoryStore({ home, eligibilityCheck, coordinators: config.coordinators });
+  const result = pruneJournals({ home, state: hidden => store.readFoldedWithout(hidden), requestsOn: flagOn(config, name, "requests"),
     days: options.days ?? config.retentionDays, currentSessionId: ctx.sessionManager.getSessionId(), dryRun: options.dryRun });
   const count = options.dryRun ? `would remove ${result.wouldRemove}` : `removed ${result.removed}`;
-  return `purge: ${count}, kept ${result.kept} (protected ${result.protectedCount}), errors ${result.errors}${result.capped ? ", capped: run again to continue" : ""}`;
+  return `purge: ${count}, kept ${result.kept} (protected ${result.protectedCount}), errors ${result.errors}${result.capped ? ", capped: run again to continue" : ""}${result.mismatch ? ", kept all: verification mismatch" : ""}`;
 }
 function handler(pi: ExtensionAPI, runtime: IntentServices, action: (text: string, ctx: ExtensionCommandContext) => Promise<unknown>) {
   return async (text: string, ctx: ExtensionCommandContext) => {
