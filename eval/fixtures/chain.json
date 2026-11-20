@@ -1,0 +1,16 @@
+{
+  "chains": [{
+    "id": "chain-A",
+    "directives": [
+      { "id": "health", "quote": "Limit quality checks to the files changed by this task.", "sourceTs": "2026-01-01T00:00:00Z", "paraphrase": "avoid unrelated quality campaigns" },
+      { "id": "orchestrate", "quote": "Coordinate this task and delegate every source edit.", "sourceTs": "2026-01-01T00:00:00Z", "paraphrase": "delegate source edits" },
+      { "id": "cheap", "quote": "Assign repetitive edits to the economy model.", "sourceTs": "2026-01-01T00:00:00Z", "paraphrase": "repetitive edits go to the economy model" },
+      { "id": "wait", "quote": "Run verification only after the complete editing plan.", "sourceTs": "2026-01-01T00:00:00Z", "paraphrase": "complete the editing plan before verification", "retiredAt": "2026-01-03T00:00:00Z", "retirementReason": "The synthetic user completed the editing plan." }
+    ],
+    "handoffs": [
+      { "id": "old", "ts": "2026-01-02T00:00:00Z", "text": "## User constraints (verbatim)\nLimit quality checks to the files changed by this task.\nCoordinate this task and delegate every source edit.\nAssign repetitive edits to the economy model.\nRun verification only after the complete editing plan.\n## Facts\nReady." },
+      { "id": "new", "ts": "2026-01-03T00:00:00Z", "text": "## User directives\nAvoid unrelated quality campaigns.\nCoordinate this task and delegate every source edit.\n## Facts\nRepetitive edits go to the economy model." },
+      { "id": "lost", "ts": "2026-01-04T00:00:00Z", "text": "## Goal\nContinue the work." }
+    ]
+  }]
+}
