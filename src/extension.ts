@@ -4,9 +4,10 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
-import { effectiveMode, modelThresholds, parseConfig, renderHandoff, validateHandoff, ownsWrapper, effectiveThresholds, launchPromptKind, shorten, RETRY, normalizeFilesToRead, SOFT_NOTICE, initialState, transition, policyStatus,
+import { effectiveMode, modelThresholds, parseConfig, renderHandoff, validateHandoff, ownsWrapper, effectiveThresholds, launchPromptKind, shorten, RETRY, normalizeFilesToRead, initialState, transition, policyStatus,
   restoreHistory, handoffBackoff, forced, fallbackFor, degradedFor, type Effect, type Frame, type MachineEvent, type AutoState, type Handoff, type HandoffInput, type HistoryItem } from "./core.ts";
 import { checkHandoff } from "./validate.ts";
+import { canHandoff, softNotice } from "./budget-notice.ts";
 import { OverflowRecovery } from "./overflow-recovery.ts";
 import { graceEligible } from "./grace.ts";
 import { resumeCommand, runResumeCheck } from "./resume-check.ts";
@@ -58,6 +59,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
     function frame(ctx: ExtensionContext, observedTokens?: number | null): Frame {
       return { mode: mode(ctx), tokens: observedTokens === undefined ? ctx.getContextUsage()?.tokens ?? null : observedTokens,
         thresholds: modelThresholds(config, ref(ctx), host?.subagent ?? false), config,
+        handoffAvailable: canHandoff(pi, host),
         wrapped: !!host && ownsWrapper(process.pid, process.env, host.subagent) };
     }
     function step(event: MachineEvent, ctx: ExtensionContext, observed = frame(ctx)): Effect[] {
@@ -163,10 +165,10 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
         switch (effect.type) {
           case "notify":
             log(ctx, "soft_crossing");
-            ctx.ui.notify("Context is large (soft threshold): the agent is asked to update its state file and prepare a handoff; none is forced yet.", "info"); break;
+            ctx.ui.notify(softNotice(frame(ctx), "Context is large (soft threshold): the agent is asked to update its state file and prepare a handoff; none is forced yet."), "info"); break;
           case "notice_soft":
             log(ctx, "soft_model_notice");
-            result = { entries: [{ type: "custom_message", customType: "context-budget", display: true, content: SOFT_NOTICE }] }; break;
+            result = { entries: [{ type: "custom_message", customType: "context-budget", display: true, content: softNotice(frame(ctx)) }] }; break;
           case "notify_degraded":
             log(ctx, `${effect.reason}_degraded`);
             ctx.ui.notify("Context-budget handoff loop limit reached and no relaunch wrapper is available. Tools stay available and handoff enforcement is paused until a tool call makes progress; start a fresh session soon (/new, or relaunch under the wrapper).", "warning"); break;

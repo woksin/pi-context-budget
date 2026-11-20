@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { isContextOverflowError, guardOffCrossings, parseConfig, effectiveMode, isSubagent, ownsWrapper, modelThresholds, renderHandoff, MAX_HANDOFF_BYTES, validateHandoff, shorten, RETRY, launchPromptKind, normalizeFilesToRead, effectiveThresholds } from "../src/core.ts";
-import { initialState, transition, restoreHistory, type MachineEvent } from "../src/core.ts";
+import { initialState, transition, restoreHistory, type Frame, type MachineEvent } from "../src/core.ts";
 import { parseHandoffSections } from "../src/collect.ts";
 import { atomicJson, issueClaims, runningState, watchCheck, writeHandoff, writeMarker, SessionHosts } from "../src/storage.ts";
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
@@ -100,6 +100,25 @@ test("watch actions, lint and discarded drafts render without corrupting read-fi
   assert.deepEqual(parseHandoffSections(h.text).filesToRead, ["/read.md"]);
   assert.equal(h.recordedSubagents?.[0].id, "agent");
   assert.ok(Buffer.byteLength(h.text) <= MAX_HANDOFF_BYTES);
+});
+test("sessions without handoff capability never block or steer, including idle, cap and failure recovery", () => {
+  const frame: Frame = { mode: "enforce", tokens: t.hard, thresholds: t, config, wrapped: true, handoffAvailable: false };
+  const events: MachineEvent[] = [
+    { type: "tool_call", tool: "read", id: "read" },
+    { type: "turn_end", continues: true },
+    { type: "agent_before_settle", pendingWork: true },
+    { type: "agent_settled", now: 1, aborted: false, pendingWork: true },
+  ];
+  const handoff = renderHandoff(input, auto, "s", 1, "/manual.md", "now");
+  for (const tokens of [t.soft, t.handoff, t.hard]) {
+    for (const extra of [{}, { count: config.maxHandoffsPerSession }, { compactionFallback: true }, { pending: handoff, stored: handoff }]) {
+      for (const event of events) {
+        const state = { ...initialState(), floor: 0, ...extra };
+        const result = transition(state, event, { ...frame, tokens });
+        assert.ok(result.effects.every(effect => !["block", "steer", "notice_required", "relaunch", "notify_cap_advisory", "notify_degraded"].includes(effect.type)), `${tokens}: ${event.type}`);
+      }
+    }
+  }
 });
 test("discard detection logs once, keeps history immutable and ignores committed drafts", () => {
   const handoff = renderHandoff(input, auto, "s", 1, "/old.md", "now");

@@ -147,7 +147,8 @@ export interface MachineState {
   /** Counterfactual policy state only; never mixed into actual history or action execution. */
   observation?: MachineState;
 }
-export interface Frame { mode: Mode; tokens: number | null; thresholds: Thresholds; config: Config; wrapped: boolean }
+/** handoffAvailable is false for subagents or when the model cannot call the handoff tool. */
+export interface Frame { mode: Mode; tokens: number | null; thresholds: Thresholds; config: Config; wrapped: boolean; handoffAvailable?: boolean }
 export type MachineEvent =
   | { type: "turn_end"; usage?: number; failure?: MachineState["providerFailure"]; continues?: boolean }
   | { type: "tool_call"; tool: string; id: string; graceEligible?: boolean }
@@ -193,6 +194,7 @@ export function classifyFailure(e: { aborted?: boolean; errorMessage?: string })
   return "persistent";
 }
 export function fallbackFor(s: MachineState, f: Frame): Fallback | undefined {
+  if (f.handoffAvailable === false) return undefined;
   if (s.handoffTurns.filter(t => s.turn - t <= f.config.loop.withinTurns).length > f.config.loop.maxHandoffsWithoutProgress) return "loop";
   if (f.wrapped && s.count >= f.config.maxHandoffsPerSession) return "cap";
   if (s.compactionFallback) return "compaction";
@@ -210,11 +212,11 @@ export function effectiveThresholds(floor: number | null, t: Thresholds): { soft
   return { soft: Math.min(handoff, Math.max(t.soft, handoff - (t.handoff - t.soft))), handoff };
 }
 function handoffRequired(s: MachineState, f: Frame): boolean {
-  return s.tokens !== null && s.floor !== null && s.tokens >= effectiveThresholds(s.floor, f.thresholds).handoff;
+  return f.handoffAvailable !== false && s.tokens !== null && s.floor !== null && s.tokens >= effectiveThresholds(s.floor, f.thresholds).handoff;
 }
 /** Unwrapped sessions cannot relaunch at the cap: it only warns, in-place enforcement continues. */
 function capAdvisory(s: MachineState, f: Frame): boolean {
-  return !f.wrapped && s.count >= f.config.maxHandoffsPerSession;
+  return f.handoffAvailable !== false && !f.wrapped && s.count >= f.config.maxHandoffsPerSession;
 }
 /** Loud, per-turn (deduplicated) notices for unwrapped cap advisory and loop degradation. */
 function notices(s: MachineState, e: MachineEvent, f: Frame): Effect[] {
@@ -249,6 +251,7 @@ function resetEnforcement(s: MachineState): void {
   s.lastAction = "none"; s.requiredNoticed = false;
   s.softModelNoticed = false; s.graceUsed = 0;
 }
+export const FINISH_NOTICE = "Context budget: soft threshold reached. Finish the current step and return your final answer now.";
 export const SOFT_NOTICE = "Context budget: soft threshold reached. Finish the current atomic step, bring .ai-work/<task>/STATE.md up to date (and any task notes), and prepare your handoff; call context_handoff at the next safe point. The handoff becomes mandatory at the handoff threshold, after which only a few state-recording calls are allowed.";
 export const REQUIRED = "Call context_handoff now with goal, next_step and verified facts; preserve user_constraints verbatim and hypotheses separately. Then end the turn without further tools. Only the user may disable enforcement via config or the optional /guards off context.";
 function graceRemaining(s: MachineState, f: Frame): number {
@@ -344,6 +347,16 @@ function compactionFailed(s: MachineState, e: Extract<MachineEvent, { type: "ses
   return [{ type: "log", event: s.compactionFallback ? "compaction_fallback" : "compaction_retry_pending",
     data: { classification, failures: s.failures, retry: "next eligible input or automatic compaction boundary" } }];
 }
+function softNotices(s: MachineState, continues: boolean | undefined, f: Frame): Effect[] {
+  const soft = effectiveThresholds(s.floor, f.thresholds).soft;
+  if (s.tokens === null || s.tokens < soft) s.softNotified = s.softModelNoticed = false;
+  const effects: Effect[] = [];
+  if (!s.softNotified && (s.tokens ?? 0) >= soft) { s.softNotified = true; effects.push({ type: "notify" }); }
+  if (continues && s.softNotified && !s.softModelNoticed && !forced(s, f)) {
+    s.softModelNoticed = true; effects.push({ type: "notice_soft" });
+  }
+  return effects;
+}
 function active(s: MachineState, e: MachineEvent, f: Frame): Effect[] {
   const notice = notices(s, e, f);
   return [...notice, ...decide(s, e, f)];
@@ -367,7 +380,7 @@ function decide(s: MachineState, e: MachineEvent, f: Frame): Effect[] {
         s.graceUsed++; s.graceCalls.push(e.id);
         return [{ type: "log", event: "grace_allowed", data: { used: s.graceUsed, calls: f.config.handoffGrace.calls } }];
       }
-      if (e.tool !== "context_handoff" && (s.pending || fallback || handoffRequired(s, f))) {
+      if (f.handoffAvailable !== false && e.tool !== "context_handoff" && (s.pending || fallback || handoffRequired(s, f))) {
         s.blockedCalls.push(e.id);
         return [{ type: "block", reason: s.pending || (fallback && s.stored) ? "Handoff stored. End this turn; do not call more tools." : `Every tool except context_handoff is blocked. ${REQUIRED}${graceHint(graceRemaining(s, f))}` }];
       }
@@ -403,16 +416,10 @@ function decide(s: MachineState, e: MachineEvent, f: Frame): Effect[] {
       if (e.continues && required && !s.pending && !s.stored && !s.requiredNoticed && !fallback) {
         s.requiredNoticed = true; return [{ type: "notice_required", content: REQUIRED + graceHint(graceRemaining(s, f)) }];
       }
-      const soft = effectiveThresholds(s.floor, f.thresholds).soft;
-      if (s.tokens === null || s.tokens < soft) s.softNotified = s.softModelNoticed = false;
-      const effects: Effect[] = [];
-      if (!s.softNotified && (s.tokens ?? 0) >= soft) { s.softNotified = true; effects.push({ type: "notify" }); }
-      if (e.continues && s.softNotified && !s.softModelNoticed && !required && !fallback) {
-        s.softModelNoticed = true; effects.push({ type: "notice_soft" });
-      }
-      return effects;
+      return softNotices(s, e.continues, f);
     }
     case "agent_before_settle":
+      if (f.handoffAvailable === false) return [];
       if (s.providerFailure !== "none" || s.settleRequest !== "none" || s.pending || (fallback && s.stored)) return [];
       if (fallback || handoffRequired(s, f)) { s.settleRequest = "budget"; return [{ type: "steer", idleOnly: false }]; }
       if (!s.stored && e.pendingWork && (s.tokens ?? 0) >= f.config.idleMinTokens) {
