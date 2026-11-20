@@ -1,50 +1,34 @@
-import type { CompactionResult, ExtensionAPI, ExtensionContext, SessionBeforeCompactResult } from "@earendil-works/pi-coding-agent";
-import { REQUEST_MARKER } from "./render-requests.ts";
+import type { ContextEvent, ContextEventResult, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { renderRequests, type Delivery } from "./render-requests.ts";
 
-type BeforeEvent = { preparation?: unknown; customInstructions?: string; signal?: AbortSignal; reason?: string };
-type CompactEvent = { compactionEntry?: { id?: string; summary?: string } };
-type CarrierDeps = { render: (ctx: ExtensionContext) => Promise<string>;
-  summarize?: (event: BeforeEvent, ctx: ExtensionContext) => Promise<CompactionResult> };
+type Projection = { boundaryId?: string; data: Delivery };
+type CarrierDeps = { read: (ctx: ExtensionContext) => Promise<Projection | undefined> };
 
-/** The runtime's own lower-level summarizer, not ctx.compact() (which would recursively re-enter the hook).
- * The registry stream retains provider request-time authentication and registered provider implementations.
+function afterDelivery(data: Delivery, delivered: Set<string>): Delivery {
+  const answer = data.lastAnswer;
+  if (!answer || !delivered.has(answer.id)) return data;
+  return { ...data, lastAnswer: { ...answer, sameRunAsAnswer: false } };
+}
+const needed = (data: Delivery) => data.requests.length > 0 || data.lastAnswer?.sameRunAsAnswer;
+
+/** Pi 1.2.0 `context` is a cloned per-LLM-call projection, not a transcript write.
+ * Native compaction, routing/auth/retries and summaries are never intercepted here.
  */
-async function summarize(event: BeforeEvent, ctx: ExtensionContext): Promise<CompactionResult> {
-  const { compact } = await import("@earendil-works/pi-coding-agent");
-  if (!ctx.model || !event.preparation) throw Error("Request carrier requires native compaction preparation and model");
-  return compact(event.preparation as Parameters<typeof compact>[0], ctx.model, undefined, undefined,
-    event.customInstructions, event.signal, ctx.thinkingLevel,
-    (model, context, options) => ctx.modelRegistry.streamSimple(model, context, options));
-}
-function embed(result: SessionBeforeCompactResult, block: string): SessionBeforeCompactResult {
-  if (!result.compaction || result.compaction.summary.includes(REQUEST_MARKER)) return result;
-  return { ...result, compaction: { ...result.compaction, summary: `${result.compaction.summary}\n\n${block}` } };
-}
-/** One carrier per committed compaction entry. The summary is primary; idle custom messages are fallback only. */
 export function createCarrier(deps: CarrierDeps) {
-  const sent = new Set<string>();
+  const delivered = new Set<string>();
   return {
-    reset(): void { sent.clear(); },
-    async beforeCompact(event: BeforeEvent, ctx: ExtensionContext, result: SessionBeforeCompactResult | undefined): Promise<SessionBeforeCompactResult | undefined> {
-      if (result?.cancel) return result;
-      const block = await deps.render(ctx);
-      if (!block) return result;
-      if (result?.compaction) return embed(result, block);
-      const compaction = await (deps.summarize ?? summarize)(event, ctx);
-      // A human prompt may have arrived while the model was summarizing. It must not disappear at the cut.
-      return embed({ compaction }, await deps.render(ctx));
-    },
-    async compacted(pi: ExtensionAPI, event: CompactEvent, ctx: ExtensionContext): Promise<void> {
-      const entry = event.compactionEntry;
-      if (!entry?.id || sent.has(entry.id)) return;
-      if (entry.summary?.includes(REQUEST_MARKER)) { sent.add(entry.id); return; }
-      // While streaming sendMessage queues, so it is not a safe next-request carrier.
-      if (!ctx.isIdle()) return;
-      const block = await deps.render(ctx);
-      if (!block) return;
-      pi.sendMessage({ customType: "context-budget-requests", content: block, display: true,
-        details: { boundaryId: entry.id } }, { triggerTurn: false });
-      sent.add(entry.id);
+    reset(): void { delivered.clear(); },
+    async context(event: ContextEvent, ctx: ExtensionContext): Promise<ContextEventResult | undefined> {
+      try {
+        const projection = await deps.read(ctx);
+        if (!projection?.boundaryId) return;
+        const data = afterDelivery(projection.data, delivered);
+        if (!needed(data)) return;
+        const content = renderRequests(data);
+        if (data.lastAnswer?.sameRunAsAnswer) delivered.add(data.lastAnswer.id);
+        return { messages: [...event.messages, { role: "custom", customType: "context-budget-requests", content,
+          display: false, timestamp: Date.now(), details: { boundaryId: projection.boundaryId } }] };
+      } catch { return; } // A projection failure must not cancel native compaction or a provider request.
     },
   };
 }

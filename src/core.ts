@@ -148,6 +148,7 @@ export interface MachineState {
   /** Counterfactual policy state only; never mixed into actual history or action execution. */
   observation?: MachineState;
   deferredHandoff?: boolean;
+  deferredHumanTurn?: boolean;
 }
 /** handoffAvailable is false for subagents or when the model cannot call the handoff tool. */
 export interface Frame { mode: Mode; tokens: number | null; thresholds: Thresholds; config: Config; wrapped: boolean; handoffAvailable?: boolean; deferAnswered?: boolean }
@@ -161,7 +162,7 @@ export type MachineEvent =
   | { type: "before_agent_start" }
   | { type: "agent_before_settle"; pendingWork: boolean }
   | { type: "agent_settled"; now: number; aborted: boolean; pendingWork: boolean }
-  | { type: "input"; now: number; streaming: boolean; alreadyCompacted: boolean }
+  | { type: "input"; now: number; streaming: boolean; alreadyCompacted: boolean; human?: boolean }
   | { type: "session_before_compact"; reason: string; tokensBefore?: number }
   | { type: "session_compact"; owned: boolean; attempt?: number }
   | { type: "session_compact_failed"; reason: string; errorMessage?: string; aborted?: boolean; fromExtension?: boolean; attempt?: number }
@@ -363,6 +364,27 @@ function active(s: MachineState, e: MachineEvent, f: Frame): Effect[] {
   const notice = notices(s, e, f);
   return [...notice, ...decide(s, e, f)];
 }
+function deferredStart(s: MachineState): Effect[] {
+  if (!s.deferredHumanTurn) return [];
+  s.deferredHumanTurn = false; s.deferredHandoff = false;
+  return [{ type: "notice_required", content: REQUIRED }];
+}
+function deferAnswered(s: MachineState, f: Frame, fallback: ReturnType<typeof fallbackFor>): boolean {
+  if (fallback || !f.deferAnswered) return false;
+  s.deferredHandoff = handoffRequired(s, f);
+  return true;
+}
+function beforeSettle(s: MachineState, f: Frame, pendingWork: boolean): Effect[] {
+  const fallback = fallbackFor(s, f);
+  if (f.handoffAvailable === false) return [];
+  if (s.providerFailure !== "none" || s.settleRequest !== "none" || s.pending || (fallback && s.stored)) return [];
+  if (deferAnswered(s, f, fallback)) return [];
+  if (fallback || handoffRequired(s, f)) { s.settleRequest = "budget"; return [{ type: "steer", idleOnly: false }]; }
+  if (!s.stored && pendingWork && (s.tokens ?? 0) >= f.config.idleMinTokens) {
+    s.settleRequest = "idle"; return [{ type: "steer", idleOnly: true }];
+  }
+  return [];
+}
 function decide(s: MachineState, e: MachineEvent, f: Frame): Effect[] {
   const fallback = fallbackFor(s, f);
   // Loop with no wrapper cannot relaunch: degrade to notify-only so the session is never deadlocked.
@@ -420,24 +442,15 @@ function decide(s: MachineState, e: MachineEvent, f: Frame): Effect[] {
       }
       return softNotices(s, e.continues, f);
     }
-    case "before_agent_start":
-      if (s.deferredHandoff) { s.deferredHandoff = false; return [{ type: "notice_required", content: REQUIRED }]; }
-      return [];
-    case "agent_before_settle":
-      if (f.handoffAvailable === false) return [];
-      if (s.providerFailure !== "none" || s.settleRequest !== "none" || s.pending || (fallback && s.stored)) return [];
-      if (!fallback && f.deferAnswered) { s.deferredHandoff = handoffRequired(s, f); return []; }
-      if (fallback || handoffRequired(s, f)) { s.settleRequest = "budget"; return [{ type: "steer", idleOnly: false }]; }
-      if (!s.stored && e.pendingWork && (s.tokens ?? 0) >= f.config.idleMinTokens) {
-        s.settleRequest = "idle"; return [{ type: "steer", idleOnly: true }];
-      }
-      return [];
+    case "before_agent_start": return deferredStart(s);
+    case "agent_before_settle": return beforeSettle(s, f, e.pendingWork);
     case "agent_settled":
       if (!fallback || s.relaunchSent || e.aborted || ["error", "aborted"].includes(s.providerFailure)) return [];
       if (!f.wrapped) return [{ type: "log", event: "relaunch_unavailable", data: { reason: fallback } }];
       s.relaunchSent = true;
       return [{ type: "relaunch", handoff: s.pending ?? s.stored }];
     case "input":
+      if (e.human) s.deferredHumanTurn = !!s.deferredHandoff;
       s.settleRequest = "none";
       if (!e.streaming && s.lastSettled > 0 && e.now - s.lastSettled >= f.config.idleMinutes * 60000
         && (s.tokens ?? 0) > f.config.keepRecentTokens && !e.alreadyCompacted) {
@@ -532,7 +545,7 @@ export interface AutoState {
   jobs: unknown[]; subagents: unknown[]; claims: unknown[]; unavailable: string[];
   resumeCheck?: string;
   questions?: string[];
-  repos?: RepoState[]; userMessages?: string; requests?: string; scheduled?: string[]; finishedJobs?: string[];
+  repos?: RepoState[]; userMessages?: string; requests?: string; requestsTask?: boolean; scheduled?: string[]; finishedJobs?: string[];
   previous?: PreviousHandoff;
   lint?: string[]; discarded?: { path: string; reason: string }[];
   /** `git status --short` lines and upstream ahead/behind; collected only for handoffs. */
@@ -661,7 +674,7 @@ export function boundedAutoState(auto: AutoState): AutoState {
     dirty: auto.dirty && boundedLines(auto.dirty.slice(0, 31), String, (expanded ? 1 : 6) * 1024).map(chars),
     sync: auto.sync === undefined ? undefined : short(auto.sync),
     repos: auto.repos?.slice(0, 8).map(r => ({ root: bytePrefix(r.root, 120), branch: bytePrefix(r.branch, 40), head: bytePrefix(r.head, 64), dirty: r.dirty, sync: bytePrefix(r.sync, 50) })),
-    userMessages: auto.userMessages === undefined ? undefined : bytePrefix(auto.userMessages, 4096), requests: auto.requests,
+    userMessages: auto.userMessages === undefined ? undefined : bytePrefix(auto.userMessages, 4096), requests: auto.requests, requestsTask: auto.requestsTask,
     scheduled: auto.scheduled && boundedLines(auto.scheduled.slice(0, 10), r => chars(String(r)), 1024),
     finishedJobs: auto.finishedJobs && boundedLines(auto.finishedJobs.slice(0, 10), r => chars(String(r)), 2 * 1024),
     lint: auto.lint && boundedLines(auto.lint.slice(0, 8), line => bytePrefix(String(line), 300), 1024),
@@ -716,7 +729,7 @@ export function renderHandoff(p: HandoffInput, auto: AutoState, id: string, n: n
     auto.resumeCheck && `## Resume check\n${auto.resumeCheck}`,
     discarded.length && `## Discarded earlier handoffs\nStored, never committed; re-read if you rely on them:\n${discarded.join("\n")}`,
     auto.lint?.length && `## Handoff lint\n${bytePrefix(auto.lint.join("\n"), 1024)}`,
-    auto.requests?.includes(REQUEST_TASK) ? REQUEST_TASK : "Resume now from Next step without asking the user. Verify current git HEAD and re-establish external state before trusting prior review/CI/issue facts.",
+    auto.requestsTask ? REQUEST_TASK : "Resume now from Next step without asking the user. Verify current git HEAD and re-establish external state before trusting prior review/CI/issue facts.",
   ];
   const text = sections.filter(Boolean).join("\n\n") + "\n";
   const bytes = Buffer.byteLength(text) - Buffer.byteLength(auto.requests ?? "");

@@ -1,0 +1,28 @@
+# Handoff s-1
+
+Timestamp: now
+Handoff file: /h
+
+## Goal
+work
+
+## Verified facts (agent-reported; verify before relying on them)
+verified
+
+## Next step
+continue
+
+## Automatically collected state
+Cwd: /repo
+Repository root: /repo
+Branch: main
+HEAD: abc
+Launch prompt: not supplied
+Running jobs / watches:
+none
+Running subagents:
+none
+Issue claims: []
+Unavailable: none
+
+Resume now from Next step without asking the user. Verify current git HEAD and re-establish external state before trusting prior review/CI/issue facts.

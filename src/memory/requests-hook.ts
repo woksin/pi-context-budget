@@ -1,4 +1,4 @@
-import { renderRequests, type DeliveryAnswer } from "./render-requests.ts";
+import { renderRequests, selectDelivery } from "./render-requests.ts";
 import { createCarrier } from "./carrier.ts";
 import { flagOn, memoryOff, readMemoryConfig, type MemoryConfig } from "./config.ts";
 import { appendAnswer, newAnswerId, pickLastAnswer, redactAnswer, type AnswerBody, type AnswerKind, type AnswerParts, type AnswerRecord } from "./answers.ts";
@@ -8,7 +8,7 @@ import { loadScanner, type Scanner } from "./redact.ts";
 import { answersBytes, closeEvent, isRequest, readSessionState } from "./requests.ts";
 import { newId, type JournalEntry } from "./types.ts";
 import { createJournalHook, type HostFacts, type JournalHookDeps } from "./journal-hook.ts";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { BoundaryResult, ContextEvent, ContextEventResult, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { MachineEvent } from "../core.ts";
 import type { OverflowRecovery } from "../overflow-recovery.ts";
 import type { FileMemoryStore } from "./store.ts";
@@ -37,7 +37,7 @@ export function createRequestsHook(deps: RequestsHookDeps) {
   let memory: MemoryConfig = memoryOff(), store: Promise<FileMemoryStore> | undefined, scanner: Promise<Scanner | undefined> | undefined;
   let loadedFor: string | undefined, open = new Set<string>(), compactions = new Set<string>();
   let answers: RunAnswer[] = [], capture: string[] | undefined, expected: CompactionHint | undefined;
-  let runId = newId(), turn = 0, humanSeq = 0, captureSeq = 0, degraded: string | undefined, interimsDropped = 0;
+  let runId = newId(), turn = 0, humanSeq = 0, captureSeq = 0, humanTurn = false, degraded: string | undefined, interimsDropped = 0;
   const reported = new Set<string>();
   const home = async () => (await (store ??= import("./store.ts").then(({ FileMemoryStore }) => new FileMemoryStore({ agentDir: deps.agentDir })))).home;
   const scanners = () => scanner ??= loadScanner(deps.agentDir);
@@ -119,36 +119,43 @@ export function createRequestsHook(deps: RequestsHookDeps) {
   const guarded = async (ctx: HookContext, what: string, action: () => Promise<void>): Promise<void> => {
     try { if (enabled(ctx)) await action(); } catch (error) { degrade(ctx, what, error); }
   };
-  async function render(ctx: HookContext, emergency = false, boundaryOnly = false): Promise<string> {
-    if (!enabled(ctx)) return "";
+  async function selection(ctx: HookContext, held = answers) {
+    if (!enabled(ctx)) return;
     try {
       await load(ctx);
       const state = readSessionState(await home(), session(ctx).id);
-      const last = pickLastAnswer(answers.filter(a => !a.dropped)), stored = pickLastAnswer(state.answers);
-      let lastAnswer: DeliveryAnswer | undefined;
-      if (stored) lastAnswer = { id: stored.id, text: stored.text, withheld: stored.withheld,
-        sameRunAsAnswer: state.possiblyUnseen.has(stored.id) };
-      if (last) lastAnswer = { id: last.id, text: last.body.text, withheld: last.body.withheld, sameRunAsAnswer: last.humanSeq === humanSeq };
-      if (boundaryOnly && !open.size && !lastAnswer?.sameRunAsAnswer) return "";
-      return renderRequests({ sessionId: session(ctx).id, requests: state.requests.filter(r => open.has(r.id)), lastAnswer, degraded }, emergency);
-    } catch (error) { degrade(ctx, "render", error); return renderRequests({ sessionId: session(ctx).id, requests: [], degraded }, emergency); }
+      const boundaryId = state.boundaries.filter(b => b.event.kind !== "abort").at(-1)?.event.id;
+      return { boundaryId, data: selectDelivery({ ...state, sessionId: session(ctx).id, degraded }, held, humanSeq) };
+    } catch (error) {
+      degrade(ctx, "render", error);
+      return { boundaryId: undefined, data: { sessionId: session(ctx).id, requests: [], degraded } };
+    }
   }
-  const carrier = createCarrier({ render: ctx => render(ctx, false, true) });
+  async function render(ctx: HookContext, emergency = false): Promise<string> {
+    const selected = await selection(ctx);
+    return selected ? renderRequests(selected.data, emergency) : "";
+  }
+  const carrier = createCarrier({ read: ctx => selection(ctx, []) });
   const compactionKind = (reason: string | undefined, packageInFlight: boolean): BoundaryKind => {
     if (reason === "overflow") return packageInFlight ? "overflow_package" : "overflow_native";
     return reason === "manual" ? (packageInFlight ? "overflow_package" : "manual") : "emergency";
   };
   return {
     render,
-    beforeCompact: carrier.beforeCompact,
-    deliver: carrier.compacted,
+    context: carrier.context,
+    async handoff(ctx: HookContext) {
+      const selected = await selection(ctx);
+      return { requests: selected ? renderRequests(selected.data) : "", requestsTask: (selected?.data.requests.length ?? 0) > 0 };
+    },
+    takeHumanTurn(): boolean { const human = humanTurn; humanTurn = false; return human; },
     deferAnswered: (ctx: HookContext): boolean => enabled(ctx) && memory.answerPolicy === "defer" && answers.some(isClosingAnswer),
     reload(): void { memory = readMemoryConfig(deps.configFile).config; },
-    reset(): void { carrier.reset(); loadedFor = undefined; open = new Set(); compactions = new Set(); answers = []; capture = undefined; expected = undefined; humanSeq = 0; degraded = undefined; interimsDropped = 0; reported.clear(); },
+    reset(): void { carrier.reset(); loadedFor = undefined; open = new Set(); compactions = new Set(); answers = []; capture = undefined; expected = undefined; humanSeq = 0; humanTurn = false; degraded = undefined; interimsDropped = 0; reported.clear(); },
     onJournaled: (entry: JournalEntry, ctx: HookContext) => guarded(ctx, "request_open", async () => {
       if (!isRequest(entry)) return;
       await load(ctx);
       open.add(entry.id); humanSeq++;
+      if (entry.origin === "human") humanTurn = true;
     }),
     agentStart(): void { runId = newId(); turn = 0; answers = []; capture = undefined; expected = undefined; },
     messageStart: (message: AssistantMessage, ctx: HookContext) => guarded(ctx, "answer_capture", async () => {
@@ -191,10 +198,20 @@ type BindDeps = {
   pendingWork: (ctx: ExtensionContext) => boolean;
   compactionOwned: () => boolean;
   status: (ctx: ExtensionContext) => void;
+  context: (event: ContextEvent, ctx: ExtensionContext) => Promise<ContextEventResult | undefined>;
 };
+function startMessage(result: BoundaryResult | undefined) {
+  const entry = result?.entries?.[0];
+  if (entry?.type === "custom_message") return { message: { customType: entry.customType, content: entry.content, display: false } };
+}
 /** Keep answer durability and request-boundary ordering together with the adapter's existing policy effects. */
 export function bindRequests(pi: ExtensionAPI, requests: RequestsHook, deps: BindDeps): void {
   const { safe, run, overflow, pendingWork, compactionOwned, status } = deps;
+  pi.on("context", safe(async (event, ctx) => {
+    const prior = await deps.context(event, ctx);
+    return await requests.context({ ...event, messages: prior?.messages ?? event.messages }, ctx) ?? prior;
+  }));
+  pi.on("before_agent_start", safe(async (_event, ctx) => startMessage(await run({ type: "before_agent_start" }, ctx) as BoundaryResult | undefined)));
   pi.on("agent_start", safe(async (_e, ctx) => { requests.agentStart(); await run({ type: "agent_start" }, ctx); }));
   pi.on("message_start", safe(async (e, ctx) => { await requests.messageStart(e.message, ctx); }));
   // Pi awaits message_end before turn_end, so an answer is durable before any commit effect.
@@ -205,7 +222,7 @@ export function bindRequests(pi: ExtensionAPI, requests: RequestsHook, deps: Bin
   }));
   pi.on("session_compact", safe(async (e, ctx) => {
     overflow.nativeCompaction(ctx, e.reason); await run({ type: "session_compact", owned: compactionOwned() && e.fromExtension }, ctx); status(ctx);
-    await requests.compacted(e, ctx, overflow.packageCompacting); await requests.deliver(pi, e, ctx);
+    await requests.compacted(e, ctx, overflow.packageCompacting);
   }));
   pi.on("session_compact_failed", safe(async (e, ctx) => { requests.compactionFailed(); overflow.nativeCompaction(ctx, e.reason); await run(e, ctx); }));
 }

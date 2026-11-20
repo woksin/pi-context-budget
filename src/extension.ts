@@ -1,5 +1,5 @@
 /** Pi adapter: collect observations, translate events, execute pure-machine outputs. */
-import type { ExtensionAPI, ExtensionContext, BoundaryResult, ToolCallEventResult, SessionBeforeCompactResult } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ContextEvent, BoundaryResult, ToolCallEventResult, SessionBeforeCompactResult } from "@earendil-works/pi-coding-agent";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -143,7 +143,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
         writeLaunchPrompt(promptPath, input.launch_prompt);
         input = { ...input, launch_prompt: promptPath };
       }
-      const h = renderHandoff(input, { ...auto, requests: await requests.render(ctx) }, id, sequence, path, new Date().toISOString());
+      const h = renderHandoff(input, { ...auto, ...await requests.handoff(ctx) }, id, sequence, path, new Date().toISOString());
       writeHandoff(h, auto, input);
       handoffRejections = 0;
       log(ctx, "handoff_written", { path, n: h.n, bytes: Buffer.byteLength(h.text) });
@@ -261,7 +261,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
     pi.on("session_tree", safe((_e, ctx) => reset(ctx)));
     // Context runs after Pi has installed the boundary and before the resumed
     // provider call, including retain-none commits returned from turn_end.
-    pi.on("context", safe(async (event, ctx) => {
+    async function requestContext(event: ContextEvent, ctx: ExtensionContext) {
       if (mode(ctx) !== "enforce") return;
       const boundary = [...ctx.sessionManager.getBranch()].reverse().find(e => e.type === "compaction");
       if (!boundary || (boundary.details as { kind?: string } | undefined)?.kind !== "handoff") return;
@@ -281,14 +281,9 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
       }
       const message = [resumeMessage, watchMessage].filter(Boolean).join("\n\n");
       if (message) return { messages: [...event.messages, { role: "custom" as const, customType: "context-budget-resume-check", content: message, display: false, timestamp: Date.now() }] };
-    }));
+    }
     const pendingWork = (ctx: ExtensionContext) => { const r = runningState([...knownIds], { cwd: ctx.cwd, sessionId: ctx.sessionManager.getSessionId() }); return !!(r.jobs.length || r.subagents.length); };
-    bindRequests(pi, requests, { safe, run, overflow, pendingWork, status, compactionOwned: () => !!state.compaction });
-    pi.on("before_agent_start", safe(async (_e, ctx) => {
-      const result = await run({ type: "before_agent_start" }, ctx);
-      const entry = result?.entries?.[0];
-      if (entry?.type === "custom_message") return { message: { customType: entry.customType, content: entry.content, display: false } };
-    }));
+    bindRequests(pi, requests, { safe, run, overflow, pendingWork, status, compactionOwned: () => !!state.compaction, context: requestContext });
     pi.registerTool({
       name: "context_handoff", label: "Context handoff",
       description: "Write a concise structured handoff, then END THIS TURN without more tools. Recovery continues automatically; an idle request resets the context at the end of this turn. Separate facts from hypotheses and preserve user constraints verbatim.",
@@ -356,14 +351,11 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
     pi.on("agent_before_settle", safe((_e, ctx) => run({ type: "agent_before_settle", pendingWork: pendingWork(ctx) }, ctx)));
     pi.on("input", safe(async (e, ctx) => {
       reload(ctx); await journal.onInput(e, ctx); overflow.input(e.source);
-      await run({ type: "input", now: Date.now(), streaming: !!e.streamingBehavior, alreadyCompacted: ctx.sessionManager.getBranch().at(-1)?.type === "compaction" }, ctx);
+      await run({ type: "input", now: Date.now(), streaming: !!e.streamingBehavior, alreadyCompacted: ctx.sessionManager.getBranch().at(-1)?.type === "compaction", human: requests.takeHumanTurn() }, ctx);
       return { action: "continue" as const };
     }));
     pi.on("session_before_compact", (e, ctx) => overflow.beforeCompact(e, ctx, async () => {
-      try {
-        const result = await run({ type: "session_before_compact", reason: e.reason, tokensBefore: e.preparation?.tokensBefore }, ctx);
-        return await requests.beforeCompact(e, ctx, result);
-      }
+      try { return await run({ type: "session_before_compact", reason: e.reason, tokensBefore: e.preparation?.tokensBefore }, ctx); }
       catch (error) {
         log(ctx, "backstop_error", { error: String(error) });
         try {
