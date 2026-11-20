@@ -288,7 +288,7 @@ Directive authority is checked again at fold time against journal provenance. Wi
 
 ## Intent-memory origin gate (inert)
 
-`src/memory/origin.ts` exports the pure `classifyOrigin(input, context)` gate. It is **not registered or imported by the extension** and does not write memory. S3b must check `enabled && journal` before any store or journal access, supply trusted adapter facts, and skip writes when `journal` is false. Input text, tool arguments and model claims must never supply these facts.
+`src/memory/origin.ts` exports the pure `classifyOrigin(input, context)` gate. It is pure and does not write memory; the flag-gated journal hook (below) is its only caller. S3b must check `enabled && journal` before any store or journal access, supply trusted adapter facts, and skip writes when `journal` is false. Input text, tool arguments and model claims must never supply these facts.
 
 The adapter supplies `hasUI`, the host's subagent bit, `{ sessionId, primarySessionId }`, and `firstInput` (count every input, including injected inputs). Either child signal skips journaling, regardless of source/UI. Missing identity, host bit or input position cannot grant human provenance. `originEvidence` records decisions without copying prompt bodies.
 
@@ -332,6 +332,23 @@ node eval/origin-matrix.mjs "$HOME/.local/share/pi-runtime/lib/node_modules/@ear
 | Child initial prompt / source-less structured retry | skip journal |
 | Job notification / question answer / child completion custom message | no input, no journal call |
 | Skill / prompt-template expansion | retain human provenance |
+
+## Intent-memory journal (`memory.journal`, off by default)
+
+With the `memory` block absent, or `journal` not `true`, the extension behaves exactly as before: no memory directory is created, the store module is never loaded, the tool list and prompt are unchanged. The block lives in `context-budget.json`:
+
+```json
+{ "memory": { "journal": false, "requests": false, "answers": "final", "answerPolicy": "carry", "intent": false,
+  "resume": false, "recall": false, "scope": { "mode": "only", "names": [] }, "coordinators": [], "trustRpc": false } }
+```
+
+**Fail closed.** A missing block, a missing flag, an invalid value or a parse error means `false`; the reason is logged once as `memory_config_invalid` in the event log. `scope.mode: "only"` with empty `names` is nobody, names match the session name, and everyone must be spelled `{"mode":"all"}`. `requests` needs `journal`. The file is re-read on every input and at session start, so journal on/off applies without a restart. Tools (none ship in this slice) are registered at load only when a tool-bearing flag (`intent`, `recall`) is true then; each call re-checks flags and answers `memory disabled` when off, so rollback is immediate, while enabling a tool for an already-running session needs a restart (`registerMemoryTool`).
+
+**Journal.** Each input that the origin gate accepts (human, launch, unattended, injected; child sessions skipped) is appended to `<agentDir>/memory/journal/<sessionId>.jsonl` (dirs 0700, files 0600, `PI_MEMORY_HOME` overrides). Bodies over 64 KiB keep head 2 KiB + tail 1 KiB inline and the whole redacted body in `blobs/`. The hook never throws into pi: failures are logged as `journal_error` (message only, never prompt text) and swallowed. The launch prompts are not yet verifiable from inside the extension, so the **first input of every session is journaled `unattended` (`launch-unverified`)**; later typed input is `human`.
+
+**Redaction (`src/memory/redact.ts`).** Pass 1 is `<agentDir>/lib/secret-mask.ts` `scan()` when present (loaded with a dynamic import). Pass 2 always runs a built-in set (GitHub tokens, AWS keys, `sk-`/`sk_live_`, Slack, JWT, `Bearer`, PEM blocks, URL credentials, `NAME_(SECRET|TOKEN|PASSWORD|KEY)=value`, long hex/base64 runs on key-like lines) and is the only pass when the module is absent. A scanner that throws, returns an unrecognised shape or `skipped`, a module that is present but unusable, or a body over 2 MiB makes the entry **withheld** (`text: null`, `withheld: "redactor_failed" | "too_large"`, hash of the empty string). Raw text is never stored or hashed. Pass 2 is intentionally broad and may over-redact.
+
+The origin gate runs inside the extension's `input` handler, so it sees the text after any extension that registered earlier; it cannot see the untransformed input.
 
 ## Related projects
 

@@ -12,6 +12,8 @@ import { OverflowRecovery } from "./overflow-recovery.ts";
 import { graceEligible } from "./grace.ts";
 import { resumeCommand, runResumeCheck } from "./resume-check.ts";
 import { appendEvent, atomicJson, collectRepos, handoffHead, issueClaims, runningState, writeHandoff, writeLaunchPrompt, writeMarker, processSessionHosts, pendingQuestions, watchCheck, pruneStatus, type SessionHosts } from "./storage.ts";
+import { memoryOff, readMemoryConfig, type MemoryConfig } from "./memory/config.ts";
+import { createJournalHook } from "./memory/journal-hook.ts";
 import { bytePrefix, chainIdentity, emergencyHandoff, emergencySummary, previousHandoff, primaryHead, userMessagesSince } from "./collect.ts";
 
 type ActionResult = BoundaryResult & ToolCallEventResult & SessionBeforeCompactResult;
@@ -29,6 +31,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
     const configFile = resolve(process.env.PI_CONTEXT_BUDGET_CONFIG || join(agentDir, "context-budget.json"));
     let config = parseConfig({}), state = initialState();
     let host: ReturnType<SessionHosts["acquire"]> | undefined;
+    let memory: MemoryConfig = memoryOff(), memoryReasons = "";
     let sequence = 0;
     const overflow = new OverflowRecovery({ pi, log, frame, run, refresh: reload, model: ctx => ref(ctx), emergencyInput,
       guardOff: ctx => modeStatus(ctx).reason === "context guard off", tokens: () => state.tokens, relaunchSent: () => state.relaunchSent });
@@ -43,7 +46,16 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
       try { appendEvent(stateDir, { at: new Date().toISOString(), pid: process.pid, sessionId: ctx.sessionManager.getSessionId(), event, ...data }); }
       catch (error) { console.error(`context-budget: event log unavailable: ${String(error)}`); }
     }
+    function reloadMemory(ctx: ExtensionContext): void {
+      const parsed = readMemoryConfig(configFile);
+      memory = parsed.config;
+      const reasons = parsed.reasons.join("; ");
+      if (reasons !== memoryReasons) { memoryReasons = reasons; if (reasons) log(ctx, "memory_config_invalid", { reasons: parsed.reasons, memory: "off" }); }
+    }
+    const journal = createJournalHook({ agentDir, config: () => memory, log: (ctx, event, data) => log(ctx as ExtensionContext, event, data),
+      host: () => host && { subagent: host.subagent, primarySessionId: host.primarySessionId } });
     function reload(ctx: ExtensionContext): void {
+      reloadMemory(ctx);
       try { config = parseConfig(existsSync(configFile) ? JSON.parse(readFileSync(configFile, "utf8")) : {}); }
       catch (error) { config = parseConfig({}); log(ctx, "config_error", { error: String(error), mode: "observe" }); }
     }
@@ -225,7 +237,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
     };
     function reset(ctx: ExtensionContext): void {
       host?.release(); host = hosts.acquire(ctx.sessionManager.getSessionId());
-      reload(ctx); overflow.reset(ctx); knownIds.clear(); handoffRejections = 0; resumeBoundary = resumeMessage = mismatchLogged = undefined;
+      reload(ctx); journal.reset(); overflow.reset(ctx); knownIds.clear(); handoffRejections = 0; resumeBoundary = resumeMessage = mismatchLogged = undefined;
       const history: HistoryItem[] = ctx.sessionManager.getBranch().flatMap((e): HistoryItem[] => {
         if (e.type === "compaction") {
           const details = e.details as { kind?: string; source?: string } | undefined;
@@ -337,7 +349,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
     pi.on("agent_before_settle", safe((_e, ctx) => run({ type: "agent_before_settle", pendingWork: pendingWork(ctx) }, ctx)));
     pi.on("agent_settled", safe(async (e, ctx) => { await run({ type: "agent_settled", now: Date.now(), aborted: e.aborted, pendingWork: pendingWork(ctx) }, ctx); await overflow.settled(ctx, e.aborted); }));
     pi.on("input", safe(async (e, ctx) => {
-      reload(ctx); overflow.input(e.source);
+      reload(ctx); await journal.onInput(e, ctx); overflow.input(e.source);
       await run({ type: "input", now: Date.now(), streaming: !!e.streamingBehavior, alreadyCompacted: ctx.sessionManager.getBranch().at(-1)?.type === "compaction" }, ctx);
       return { action: "continue" as const };
     }));
