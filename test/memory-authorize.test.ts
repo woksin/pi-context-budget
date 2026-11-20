@@ -25,9 +25,38 @@ for (const [name, prefix] of Object.entries({
   assert.equal(check(prefix + "\n" + instruction), false);
   assert.equal(check(prefix + "\n" + instruction + "\n```"), false);
 });
-test("only a same-character, sufficiently long, whitespace-only closer ends a fence", () => {
+test("even a valid closed fence refuses the entire message", () => {
   for (const prefix of ["```text\n```", "~~~text\n ~~~~ \t", "````text\n   `````\t", "```text\r\n```\r"]) {
-    assert.equal(check(prefix + "\n" + instruction), true);
+    assert.equal(check(prefix + "\n" + instruction), false);
+  }
+});
+for (const [name, text] of Object.entries({
+  listFence: "- ```\n  " + instruction + "\n  ```", numberedFence: "1. ```\n   " + instruction + "\n   ```",
+  quoteFence: "> ```\n> " + instruction + "\n> ```", inlineFence: "Example ``` " + instruction,
+  inlineTilde: "Example ~~~ " + instruction, htmlPre: "<pre>" + instruction + "</pre>",
+  htmlCode: "<CoDe class='example'>" + instruction + "</CoDe>",
+  fenceElsewhere: instruction + "\nA literal ``` marker", htmlElsewhere: instruction + "\n<PRE>example</PRE>",
+  nestedQuote: "> > " + instruction, listQuote: "- > " + instruction, numberedQuote: "1. > " + instruction,
+  nestedListQuote: "- - > " + instruction, taskQuote: "- [ ] > " + instruction,
+  lazyQuote: "> Quoted paragraph\n" + instruction, lazyListQuote: "- > Quoted paragraph\n  " + instruction,
+  lazyUnicodeBlank: "> Quoted paragraph\n\u00a0\n" + instruction,
+  listCode: "-     " + instruction, numberedCode: "1.     " + instruction, listTabCode: "- \t" + instruction,
+  mixedIndent: " \t" + instruction, nestedIndentedCode: "- item\n\n      " + instruction,
+  inlineCode: "Example `" + instruction + "`", doubleCode: "Example ``" + instruction + "``",
+  multilineCode: "Example `\n" + instruction + "\n`", htmlQuote: "<blockquote>\n\n" + instruction + "\n</blockquote>",
+  htmlInlineQuote: "<q>" + instruction + "</q>",
+  carriageReturnQuote: "Intro\r> " + instruction, carriageReturnIndent: "Intro\r    " + instruction,
+  orderedParenQuote: "1) > " + instruction, orderedNestedQuote: "1. 1. > " + instruction,
+})) test(`Markdown self-check: ${name} is not auto-eligible`, () => assert.equal(check(text), false));
+test("inline delimiters handle unmatched and escaped prefixes without masking later code", () => {
+  for (const text of ["` literal ``" + instruction + "``", "\\` ``intro ` " + instruction + "``", "\\``" + instruction + "`", "``intro \\` " + instruction + "``"]) {
+    assert.equal(check(text), false);
+  }
+});
+test("ordinary list prose and prose outside inline code or a completed quote remain eligible", () => {
+  for (const text of ["- " + instruction, "1. " + instruction, instruction + " and `example`", "> Example\n\n" + instruction,
+    "\"" + instruction + "\"", "`" + instruction, "&lt;code>" + instruction + "&lt;/code>"]) {
+    assert.equal(check(text), true);
   }
 });
 test("recovery hint appears only on recovery-eligible, non-idle steering", () => {

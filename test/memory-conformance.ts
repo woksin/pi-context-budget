@@ -46,7 +46,8 @@ function projectionConformance(create: () => MemoryStore): void {
     store.appendMessage(withheld);
     const entry = message({ text: "漢😀".repeat(1000) });
     store.appendMessage(entry);
-    store.addItem(directive(entry), agent);
+    const quote = entry.text!.slice(0, 120);
+    store.addItem(directive(entry, { text: quote, source: { type: "user_message", ref: entry.id, span: { start: 0, end: quote.length } } }), agent);
     const result = store.project({ scopes: [{ kind: "global", key: "*" }], session: "session",
       budgets: { total: 2048, items: 512, messages: 1024, index: 512 } });
     assert.ok(Buffer.byteLength(result.text) <= 2048);

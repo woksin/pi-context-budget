@@ -97,6 +97,45 @@ test("sender labels from every input path produce only proposed orders until TUI
   const entry = message({ origin: "injected", text: phrase, injectedKind: "lane_message", injectedFrom: "L2" }); f.store.appendMessage(entry);
   assert.equal(details(await f.call("memory_add", addition(entry, { kind: "order" }))).item.status, "proposed");
 });
+test("whole-message fence and HTML checks propose even a clean cited span", async () => {
+  const f = fixture();
+  for (const suffix of ["\n- ```\n  example\n  ```", "\n1. ~~~\n   example\n   ~~~", "\n<pre>example</pre>", "\n<CODE>example</CODE>"]) {
+    const entry = message({ text: phrase + suffix }); f.store.appendMessage(entry);
+    assert.equal(details(await f.call("memory_add", addition(entry))).item.status, "proposed");
+  }
+});
+test("human withdrawal or rejection prevents same-source overlapping auto re-additions", async () => {
+  const f = fixture(), entry = message({ text: phrase + "\nRun tests" }); f.store.appendMessage(entry);
+  const item = details(await f.call("memory_add", addition(entry))).item;
+  assert.equal(item.status, "active");
+  const withdrawal = message({ text: "Withdraw that instruction", at: new Date(Date.now() + 1000).toISOString() }); f.store.appendMessage(withdrawal);
+  assert.equal(f.store.retireItem(item.id, "withdrawn", "Withdrawn", { type: "user_message", ref: withdrawal.id }, human).ok, true);
+  assert.equal(details(await f.call("memory_add", addition(entry))).item.status, "proposed");
+  const shorter = phrase.slice(0, -6);
+  assert.equal(details(await f.call("memory_add", { ...addition(entry), text: shorter,
+    source: { ref: entry.id, span: { start: 0, end: shorter.length } } })).item.status, "proposed");
+  const start = entry.text!.lastIndexOf("Run tests");
+  assert.equal(details(await f.call("memory_add", { ...addition(entry), text: "Run tests",
+    source: { ref: entry.id, span: { start, end: start + 9 } } })).item.status, "active");
+  const other = message({ text: phrase }); f.store.appendMessage(other);
+  const proposed = directive(other); f.store.addItem(proposed, agent);
+  await f.command("memory", "reject " + proposed.id);
+  assert.equal(details(await f.call("memory_add", addition(other))).item.status, "proposed");
+});
+test("quotes preserve source code units and reject whitespace substitutions", async () => {
+  const f = fixture();
+  for (const text of ["Never\u00a0run tests", "Never\u2028run tests", " Never  run tests "]) {
+    const entry = message({ text }); f.store.appendMessage(entry);
+    const source = { ref: entry.id, span: { start: 0, end: text.length } };
+    const input = { kind: "directive", scope: { kind: "global", key: "*" }, source };
+    const mismatch = details(await f.call("memory_add", { ...input, text: text.replace(/\s+/gu, " ").trim() }));
+    assert.equal(mismatch.reason, "quote_mismatch");
+    const result = details(await f.call("memory_add", { ...input, text }));
+    assert.equal(result.item.text, text);
+    const stored = f.store.changesSince().events.at(-1)!;
+    assert.equal(stored.type, "add"); if (stored.type === "add") assert.equal(stored.item.text, text);
+  }
+});
 test("an order with no source reference reports no_source", async () => {
   const f = fixture();
   for (const source of [undefined, {}, { ref: "missing" }]) {
@@ -232,7 +271,8 @@ test("reject changes only a proposed item; agent retire of proposed still confli
   assert.equal(details(model).reason, "conflict");
   await f.command("memory", "reject " + item.id);
   assert.equal(f.store.readFolded().items[item.id]!.status, "rejected");
-  const active = details(await f.call("memory_add", addition(entry))).item;
+  const fresh = message({ text: phrase }); f.store.appendMessage(fresh);
+  const active = details(await f.call("memory_add", addition(fresh))).item;
   await f.command("memory", "reject " + active.id); await f.command("memory", "reject missing");
   assert.equal(f.store.readFolded().items[active.id]!.status, "active");
   assert.ok(f.notices.some(text => /not_proposed|no_source/.test(text)));

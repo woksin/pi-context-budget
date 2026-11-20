@@ -27,6 +27,17 @@ test("intent recovery does not change unavailable or degraded handoff behavior",
     }
   }
 });
+test("a recovery completion after degradation falls through to ordinary tool cleanup", () => {
+  const frame: Frame = { mode: "enforce", tokens: t.handoff, thresholds: t, config, wrapped: true, memoryIntent: true };
+  const marker = { path: "/tmp/handoff" } as any;
+  const seed = { ...initialState("enforce"), floor: 0, stored: marker, pending: marker };
+  const started = transition(seed, { type: "tool_call", tool: "memory_list", id: "recovery" }, frame).state;
+  assert.deepEqual(started.memoryRecovery?.calls, ["recovery"]);
+  const degraded = { ...started, handoffTurns: Array(config.loop.maxHandoffsWithoutProgress + 1).fill(started.turn) };
+  const finished = transition(degraded, { type: "tool_end", tool: "memory_list", id: "recovery", error: false }, { ...frame, wrapped: false });
+  assert.equal(finished.state.stored, undefined); assert.equal(finished.state.pending, undefined);
+  assert.deepEqual(finished.state.handoffTurns, []); assert.deepEqual(finished.state.memoryRecovery?.calls, []);
+});
 test("intent recovery tools preserve pending/stored state and grace; call thirteen is blocked", () => {
   const frame: Frame = { mode: "enforce", tokens: t.handoff, thresholds: t, config, wrapped: true, memoryIntent: true };
   const marker = { path: "/tmp/handoff" } as any;

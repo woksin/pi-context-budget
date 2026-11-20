@@ -48,6 +48,35 @@ test("fold ignores an active status on an order add without a human UI confirmat
   assert.equal(store.confirm(item.id, human).ok, true);
   assert.equal(store.readFolded().items[item.id].status, "active");
 });
+test("fold cannot auto-activate an overlapping source after a human withdrawal", () => {
+  const store = fixture({ eligibilityCheck: () => ({ eligible: true, reasons: [] }) });
+  const source = message(); store.appendMessage(source);
+  const item = directive(source, { authority: { mode: "auto", ruleVersion: 1 } }); store.addItem(item, agent);
+  const withdrawal = message({ text: "Withdraw", at: new Date(Date.now() + 1000).toISOString() }); store.appendMessage(withdrawal);
+  assert.equal(store.retireItem(item.id, "withdrawn", "Withdraw", { type: "user_message", ref: withdrawal.id }, human).ok, true);
+  const readded = { ...item, id: newId() };
+  forged(store, { type: "add", item: readded });
+  assert.equal(store.readFolded().items[readded.id].status, "proposed");
+});
+test("human retirement is remembered even without a human source; agent completion does not block re-add", () => {
+  for (const actor of [human, agent]) {
+    const store = fixture({ eligibilityCheck: () => ({ eligible: true, reasons: [] }) });
+    const source = message(); store.appendMessage(source);
+    const item = directive(source, { authority: { mode: "auto", ruleVersion: 1 } }); store.addItem(item, agent);
+    assert.equal(store.retireItem(item.id, "done", "Finished", { type: "agent_decision" }, actor).ok, true);
+    const readded = { ...item, id: newId() }; store.addItem(readded, agent);
+    assert.equal(store.readFolded().items[readded.id].status, actor.kind === "human" ? "proposed" : "active");
+  }
+});
+test("fold rejects non-exact quote code units", () => {
+  const store = fixture(), source = message({ text: "Never\u00a0run tests" }); store.appendMessage(source);
+  const event = forged(store, { type: "add", item: directive(source, { text: "Never run tests" }) });
+  assert.equal(store.readFolded().events[event].reason, "quote_mismatch");
+});
+test("source quotes over the item cap are refused rather than truncated", () => {
+  const store = fixture(), source = message({ text: "word ".repeat(1000) }); store.appendMessage(source);
+  assert.equal(store.addItem(directive(source), agent).reason, "too_large");
+});
 function forged(store: FileMemoryStore, fields: object) {
   const id = newId();
   appendRecord(join(store.home, "events.jsonl"), { schema: "memory.event/2", id, at: "2026-01-02T00:00:00Z", actor: agent, ...fields });

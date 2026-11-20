@@ -26,7 +26,7 @@ function applyConfirm(event: ConfirmEvent, state: FoldedState): void {
 function applyRetire(event: RetireEvent, ctx: FoldContext): void {
   const source = ctx.messages.get(event.source.ref!);
   ctx.state.items[event.itemId] = { ...ctx.state.items[event.itemId], status: event.status, changedBy: event.id,
-    retiredByAgent: source?.origin !== "human" };
+    retiredByAgent: event.actor.kind !== "human" && source?.origin !== "human" };
 }
 function apply(event: MemoryEvent, status: ItemStatus | undefined, ctx: FoldContext): void {
   switch (event.type) {
