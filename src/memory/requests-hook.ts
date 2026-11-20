@@ -16,7 +16,7 @@ import type { FileMemoryStore } from "./store.ts";
 /** Contract 10.7: past this many bytes in one session file new interim answers are dropped; finals are always kept. */
 export const SESSION_CAP_BYTES = 50 * 1024 * 1024;
 const HELD_LIMIT = 100;
-type HookContext = { cwd: string; sessionManager: { getSessionId(): string; getSessionFile?(): string | undefined; getSessionName?(): string | undefined } };
+type HookContext = { cwd: string; hasUI?: boolean; sessionManager: { getSessionId(): string; getSessionFile?(): string | undefined; getSessionName?(): string | undefined } };
 type AssistantMessage = { role?: string; content?: unknown; stopReason?: string; model?: string };
 export type RequestsHookDeps = { agentDir: string; configFile: string; host: () => HostFacts | undefined; hasTools?: () => boolean; blobWriter?: BlobWriter; capBytes?: number;
   log: (ctx: ExtensionContext, event: string, data?: Record<string, unknown>) => void };
@@ -126,7 +126,7 @@ export function createRequestsHook(deps: RequestsHookDeps) {
       await load(ctx);
       const state = readSessionState(await home(), session(ctx).id);
       const boundary = state.boundaries.filter(b => b.event.kind !== "abort").at(-1);
-      return { boundary, data: selectDelivery({ ...state, sessionId: session(ctx).id, degraded }, held, humanSeq) };
+      return { boundary, data: { ...selectDelivery({ ...state, sessionId: session(ctx).id, degraded }, held, humanSeq), hasUI: ctx.hasUI } };
     } catch (error) {
       degrade(ctx, "render", error);
       return { boundary: undefined, data: { sessionId: session(ctx).id, requests: [], degraded } };
