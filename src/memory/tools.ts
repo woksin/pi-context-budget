@@ -7,6 +7,7 @@ import { loadScanner, redact } from "./redact.ts";
 import { requireValid, ValidationError } from "./validate.ts";
 import { newId } from "./types.ts";
 import { normaliseRepoScope, selectedHandoffScopes } from "./handoff-scopes.ts";
+import { laneVisible, resolveLaneScope } from "./scope.ts";
 import type { Actor, ClassifyEvent, Item, ItemQuery, RetireEvent, Source, Span } from "./types.ts";
 import type { MemoryStoreCore } from "./store.ts";
 
@@ -33,7 +34,7 @@ type AddInput = Pick<Item, "kind" | "scope" | "text" | "gloss" | "supersedes"> &
 async function add(runtime: IntentServices, store: MemoryStoreCore, ctx: ExtensionContext, input: AddInput) {
   const source = itemSource(input), actor = runtime.actor(ctx);
   const selected = selectedHandoffScopes(ctx, store);
-  const item: Item = { id: newId(), kind: input.kind, scope: normaliseRepoScope(input.scope, selected.repo), text: input.text, source,
+  const item: Item = { id: newId(), kind: input.kind, scope: normaliseRepoScope(resolveLaneScope(ctx, input.scope), selected.repo), text: input.text, source,
     supersedes: input.supersedes ?? [] };
   if (input.gloss !== undefined) item.gloss = await safeText(runtime, input.gloss);
   if (input.kind === "directive") item.authority = { mode: "auto", ruleVersion: 1 };
@@ -71,8 +72,11 @@ async function operation(runtime: IntentServices, name: keyof typeof schemas, in
         reason: input.reason === undefined ? undefined : await safeText(runtime, input.reason) } as Omit<ClassifyEvent, "schema" | "id" | "at" | "actor" | "type">, actor);
       return reply(result, result.ok ? undefined : result.reason);
     }
-    case "memory_list": return reply(store.list({ scopes: input.scopes, status: input.status, kind: input.kind,
-      cursor: input.cursor, limit: input.limit ?? 50 } as ItemQuery));
+    case "memory_list": {
+      const page = store.list({ scopes: input.scopes, status: input.status, kind: input.kind,
+        cursor: input.cursor, limit: input.limit ?? 50 } as ItemQuery);
+      return reply({ ...page, items: page.items.filter(item => laneVisible(ctx, item.scope)) });
+    }
   }
 }
 function registerTools(pi: ExtensionAPI, runtime: IntentServices) {

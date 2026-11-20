@@ -5,6 +5,7 @@ import { newId } from "./types.ts";
 import { loadScanner, redact } from "./redact.ts";
 import { singleLine } from "./render.ts";
 import { MEMORY_DISABLED } from "./config.ts";
+import { laneVisible } from "./scope.ts";
 import { requireValid, ValidationError } from "./validate.ts";
 
 function tell(pi: ExtensionAPI, ctx: ExtensionCommandContext, text: string): void {
@@ -73,7 +74,12 @@ export function registerIntentCommands(pi: ExtensionAPI, runtime: IntentServices
       const [verb, id] = text.trim().split(/\s+/u);
       if (verb === "list") {
         const store = await runtime.store(ctx);
-        return id ? store.readFolded().items[id] : store.list({ limit: 50 });
+        if (id) {
+          const item = store.readFolded().items[id];
+          return item && laneVisible(ctx, item.scope) ? item : undefined;
+        }
+        const page = store.list({ limit: 50 });
+        return { ...page, items: page.items.filter(item => laneVisible(ctx, item.scope)) };
       }
       requireValid(["confirm", "reject"].includes(verb) && id, "Use /memory confirm|reject <id> or /memory list");
       return authorise(runtime, ctx, verb, id);

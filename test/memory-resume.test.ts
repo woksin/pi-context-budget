@@ -4,7 +4,12 @@ import fs, { mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, unl
 import { syncBuiltinESMExports } from "node:module";
 import { join } from "node:path";
 import { buildSessionContext, convertToLlm, SessionManager } from "@earendil-works/pi-coding-agent";
-import { assemblePacket, createResumeHook, FILE_BYTES, PACKET_BYTES } from "../src/memory/resume.ts";
+import { assemblePacket, createResumeHook, genericResumeCheck, FILE_BYTES, PACKET_BYTES } from "../src/memory/resume.ts";
+import { FileMemoryStore } from "../src/memory/store.ts";
+import { eligibilityCheck } from "../src/memory/authorize.ts";
+import { agent, message, directive, decision } from "./memory-conformance.ts";
+import { resumeCommand } from "../src/resume-check.ts";
+import { parseConfig } from "../src/core.ts";
 import { MAX_HANDOFF_BYTES } from "../src/core.ts";
 import { createContextBudgetExtension } from "../src/extension.ts";
 import { SessionHosts } from "../src/storage.ts";
@@ -28,6 +33,44 @@ function fixture() {
   const deps = { cwdRoot: root, repos: [], agentDir, handoffAt: "2026-01-01T00:00:00Z", observation };
   return { dir, root, agentDir, file, observation, configFile, ctx, deps };
 }
+
+function checkFixture() {
+  const f = fixture(), store = new FileMemoryStore({ home: join(f.dir, "memory"), eligibilityCheck });
+  f.ctx.sessionManager.getSessionId = () => "session";
+  f.ctx.sessionManager.getBranch = () => [];
+  const entry = message(); store.appendMessage(entry);
+  const active = directive(entry, { authority: { mode: "auto", ruleVersion: 1 } });
+  assert.equal(store.addItem(active, agent).ok, true);
+  const proposed = directive(entry); assert.equal(store.addItem(proposed, agent).ok, true);
+  store.appendMessage(message({ text: "Unclassified request" }));
+  return { ...f, store, active, proposed };
+}
+test("generic check has deterministic bounded counts, newest retirement and a memory_list pointer", () => {
+  const f = checkFixture(), retired = decision();
+  assert.equal(f.store.addItem(retired, agent).ok, true);
+  assert.equal(f.store.retireItem(retired.id, "done", "Finished", { type: "agent_decision" }, agent).ok, true);
+  const event = f.store.changesSince().events.at(-1)!;
+  for (let i = 0; i < 80; i++) assert.equal(f.store.addItem(decision(), agent).ok, true);
+  const check = genericResumeCheck(f.ctx, f.store);
+  assert.equal(check, genericResumeCheck(f.ctx, f.store));
+  assert.ok(Buffer.byteLength(check) <= 1024);
+  assert.match(check, /active directives="1"/); assert.match(check, /unresolved messages="1"/);
+  assert.match(check, /proposed items="1"/); assert.ok(check.includes(retired.id)); assert.ok(check.includes(event.at));
+  assert.match(check, /unread lane messages="unknown \(no collector\)"/); assert.match(check, /memory_list/);
+});
+test("generic section is in the packet only for main sessions without an operator command", async () => {
+  const f = checkFixture();
+  const hook = (subagent: boolean, config: any = {}, env: any = {}) => createResumeHook({ agentDir: f.agentDir, configFile: f.configFile,
+    observe: () => f.observation, store: async () => f.store, host: () => ({ subagent }),
+    command: ctx => resumeCommand(parseConfig(config), ctx.sessionManager.getSessionName?.(), env) });
+  const main = await hook(false).append(f.ctx, "narrative");
+  assert.match(main, /## Memory resume check/); assert.ok(main.indexOf("## Memory resume check") > main.indexOf("## Resume packet"));
+  for (const h of [hook(true), hook(false, { resumeChecks: { lane: "printf named-check" } }), hook(false, {}, { PI_RESUME_CHECK: "printf environment-check" })]) {
+    assert.doesNotMatch(await h.append(f.ctx, "narrative"), /## Memory resume check/);
+  }
+  writeFileSync(f.configFile, JSON.stringify({ memory: { resume: false, scope: { mode: "all" } } }));
+  assert.equal(await hook(false).append(f.ctx, "unchanged\nbytes\n"), "unchanged\nbytes\n");
+});
 
 test("path boundary: absolute, existing regular files only; traversal and symlink escapes fail closed", async () => {
   const f = fixture(), good = f.file("good.txt"), outside = f.file("outside.txt", "outside-only", f.dir);

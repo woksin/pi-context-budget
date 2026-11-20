@@ -3,6 +3,7 @@ import { chainIdentity } from "../collect.ts";
 import { git } from "../storage.ts";
 import type { MemoryStoreCore } from "./store.ts";
 import type { Scope } from "./types.ts";
+import { laneScopes } from "./scope.ts";
 
 /** Strip transport differences, credentials and suffixes from a remote's repository identity. */
 export function canonicalRemote(remote: string | undefined): string | undefined {
@@ -39,7 +40,7 @@ function chainTaskItemIds(store: MemoryStoreCore, sessionIds: string[]): string[
 export function selectedHandoffScopes(ctx: ExtensionContext, store: MemoryStoreCore, lastPath?: string) {
   const { sessionIds } = chainIdentity(ctx.sessionManager.getBranch?.() ?? [], ctx.sessionManager.getSessionId(), lastPath);
   const repo = repository(ctx.cwd);
-  const scopes: Scope[] = [{ kind: "global", key: "*" }, ...sessionIds.map(key => ({ kind: "session" as const, key }))];
+  const scopes: Scope[] = [{ kind: "global", key: "*" }, ...sessionIds.map(key => ({ kind: "session" as const, key })), ...laneScopes(ctx, process.env, lastPath)];
   if (repo) scopes.push({ kind: "repo", key: repo.root });
   if (repo?.remote) scopes.push({ kind: "repo", key: repo.remote });
   const taskItemIds = chainTaskItemIds(store, sessionIds);

@@ -58,7 +58,8 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
     }
     const memoryDeps = { agentDir, configFile, log, host: () => host };
     const intent = createIntentHook(pi, memoryDeps), recall = createRecallHook(pi, memoryDeps);
-    const resume = createResumeHook({ agentDir, configFile, observe: autoState, log });
+    const resume = createResumeHook({ ...memoryDeps, observe: autoState,
+      store: ctx => intent.store(ctx), command: checkCommand });
     const requests = createRequestsHook({ ...memoryDeps, hasTools: () => hasActiveTools(pi) });
     const journal = wire(requests, { ...memoryDeps, launchFacts });
     function reload(ctx: ExtensionContext): void {
