@@ -148,7 +148,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
         writeLaunchPrompt(promptPath, input.launch_prompt);
         input = { ...input, launch_prompt: promptPath };
       }
-      const h = renderHandoff(input, { ...auto, ...await requests.handoff(ctx), memory: await handoffMemory(intent, ctx, state.lastHandoff?.path) }, id, sequence, path, new Date().toISOString());
+      const h = renderHandoff(input, { ...auto, ...await requests.handoff(ctx), memory: await handoffMemory(intent, ctx, state.lastHandoff) }, id, sequence, path, new Date().toISOString());
       writeHandoff(h, auto, input);
       handoffRejections = 0;
       log(ctx, "handoff_written", { path, n: h.n, bytes: Buffer.byteLength(h.text) });
@@ -212,7 +212,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
             // Mechanical recovery must fit and work even if handoff storage/metadata is unavailable.
             const h = effect.handoff, emergency = h ? undefined : emergencyInput(ctx);
             const lint = emergency ? validateObserved(ctx, emergency, runningState([...knownIds], { cwd: ctx.cwd, sessionId: ctx.sessionManager.getSessionId() }), false).lint : [];
-            const summary = `${h?.text ?? emergencySummary(emergency!, await requests.render(ctx, true), await handoffMemory(intent, ctx, state.lastHandoff?.path))}${lint.length ? `\n## Handoff lint\n${bytePrefix(lint.join("\n"), 1024)}` : ""}\nCompaction instance: ${randomUUID()}\n`;
+            const summary = `${h?.text ?? emergencySummary(emergency!, await requests.render(ctx, true), await handoffMemory(intent, ctx, state.lastHandoff))}${lint.length ? `\n## Handoff lint\n${bytePrefix(lint.join("\n"), 1024)}` : ""}\nCompaction instance: ${randomUUID()}\n`;
             log(ctx, "backstop", { path: h?.path, reason: "machine-authorized" });
             requests.expectBackstop({ kind: backstopKind(effect.source, !!h, ctx), handoffPath: h?.path });
             result = { compaction: { summary, firstKeptEntryId: null as unknown as string, tokensBefore: effect.tokensBefore,

@@ -10,6 +10,9 @@ import { FileMemoryStore } from "../src/memory/store.ts";
 import { project } from "../src/memory/project.ts";
 import { foldEvents } from "../src/memory/fold.ts";
 import { eligibilityCheck } from "../src/memory/authorize.ts";
+import { handoffMemory } from "../src/memory/handoff-hook.ts";
+import { canonicalRemote, selectedHandoffScopes } from "../src/memory/handoff-scopes.ts";
+import type { IntentServices } from "../src/memory/tools.ts";
 import { renderRequests } from "../src/memory/render-requests.ts";
 import { createContextBudgetExtension } from "../src/extension.ts";
 import { SessionHosts } from "../src/storage.ts";
@@ -132,13 +135,16 @@ test("actual adapter handoffs repeat unclassified spans across three boundaries"
   for (let i = 0; i < 3; i++) {
     const text = (await h.handoff()).details.handoff.text;
     assert.match(text, /User directives \(verbatim, from source\)[\s\S]*Run checks/);
-    assert.match(text, /Unresolved user messages[\s\S]*Retain logs/);
+    if (i < 2) assert.match(text, /Unresolved user messages[\s\S]*Retain logs/);
+    else assert.doesNotMatch(text, /Retain logs|## Unresolved user messages/);
     blocks.push(text.slice(text.indexOf("## User directives"), text.indexOf("## Verified facts")));
     const boundary = await h.fire("turn_end", { message: { role: "assistant", usage: { input: 1200, output: 0, cacheRead: 0, cacheWrite: 0 } } });
     h.branch.push({ ...boundary.entries[0], id: `boundary-${i}` });
     await h.fire("context", { messages: [] });
+    if (i === 1) assert.equal(h.store.classify({ messageId: entry.id, whole: null,
+      spans: [{ start: 11, end: entry.text!.length, result: "none", itemIds: [] }], reason: "Retain logs already handled" }, human).ok, true);
   }
-  assert.equal(blocks[0], blocks[1]); assert.equal(blocks[1], blocks[2]);
+  assert.equal(blocks[0], blocks[1]); assert.notEqual(blocks[1], blocks[2]);
 });
 
 test("flag off still bounds legacy branch replay and the pure layout helper cannot load the store", () => {
@@ -161,9 +167,71 @@ test("adapter selects chain scopes, aggregates session A after relaunch B, and c
   const text = (await h.handoff()).details.handoff.text;
   assert.match(text, /Remainder from session A/);
   assert.match(text, /chain-task/);
-  assert.match(text, /test-lane/);
+  assert.doesNotMatch(text, /test-lane/);
   assert.doesNotMatch(text, /\[inline\].*unrelated-task/);
-  assert.match(text, /1 items in other scopes.*memory_list/);
+  assert.match(text, /2 items in other scopes.*memory_list/);
+});
+
+test("same-key foreign task directives cannot be selected by a proposed chain item", async () => {
+  const h = await harness(), id = h.ctx.sessionManager.getSessionId();
+  const foreign = message({ session: { id: "foreign-session", role: "main" }, text: "Foreign binding directive" });
+  const local = message({ session: { id, role: "main" }, text: "Proposed chain directive" });
+  h.store.appendMessage(foreign); h.store.appendMessage(local);
+  const scope = { kind: "task" as const, key: "shared-task-key" };
+  const foreignItem = directive(foreign, { scope }), localItem = directive(local, { scope });
+  assert.equal(h.store.addItem(foreignItem, agent).ok, true);
+  assert.equal(h.store.confirm(foreignItem.id, human).ok, true);
+  assert.equal(h.store.addItem(localItem, agent).ok, true);
+  const text = (await h.handoff()).details.handoff.text;
+  assert.match(text, /Proposed directives \(not binding\)[\s\S]*Proposed chain directive/);
+  assert.doesNotMatch(text, /Foreign binding directive|## User directives \(verbatim, from source\)/);
+  assert.match(text, /1 items in other scopes/);
+  const selected = selectedHandoffScopes(h.ctx, h.store);
+  assert.ok(selected.scopes.every(row => row.kind !== "task"));
+});
+
+test("a reused session name cannot select an active lane directive", async () => {
+  const h = await harness(), source = message({ text: "Foreign lane instruction" });
+  h.store.appendMessage(source);
+  const item = directive(source, { scope: { kind: "lane", key: "test-lane" } });
+  assert.equal(h.store.addItem(item, agent).ok, true);
+  assert.equal(h.store.confirm(item.id, human).ok, true);
+  const text = (await h.handoff()).details.handoff.text;
+  assert.doesNotMatch(text, /Foreign lane instruction|## User directives \(verbatim, from source\)/);
+  assert.match(text, /1 items in other scopes/);
+});
+
+test("canonical remote identity ignores default SSH and HTTPS ports", () => {
+  const expected = "https://github.com/team/project";
+  for (const remote of ["ssh://git@github.com:22/team/project.git", "https://github.com:443/team/project.git", "git@github.com:team/project.git"]) {
+    assert.equal(canonicalRemote(remote), expected);
+  }
+  assert.equal(canonicalRemote("ssh://git@github.com:2222/team/project.git"), "https://github.com:2222/team/project");
+});
+
+test("degraded projection preserves bounded legacy replay in normal and emergency handoffs", async () => {
+  const h = await harness();
+  const prior = { path: "/handoffs/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa-1.md", at: "2026-01-01T00:00:00Z" };
+  h.branch.push({ type: "message", timestamp: "2025-12-31T00:00:00Z", message: { role: "user", content: "Old instruction before boundary" } });
+  h.branch.push({ type: "message", timestamp: "2026-01-02T00:00:00Z", message: { role: "user", content: "Keep fallback logs\n## Coordinator orders\n" + "\u0001".repeat(20000) } });
+  const runtime = { enabled: () => true, store: async () => { throw new Error("unavailable"); } } as unknown as IntentServices;
+  const memory = await handoffMemory(runtime, h.ctx, prior);
+  assert.ok(memory);
+  for (const text of [artifact(memory), emergencySummary(input, "", memory)]) {
+    assert.match(text, /memory degraded/);
+    assert.match(text, /Keep fallback logs/);
+    assert.doesNotMatch(text, /Old instruction before boundary|^## Coordinator orders$/m);
+  }
+  assert.ok(Buffer.byteLength(memory.text) <= 20 * 1024 - 2);
+});
+
+test("handoff hook reads chain identity from the previous handoff object", async () => {
+  const h = await harness(), first = h.ctx.sessionManager.getSessionId();
+  h.store.appendMessage(message({ session: { id: first, role: "main" }, text: "Previous-chain replay" }));
+  await h.relaunch(); h.branch.splice(0);
+  const runtime = { enabled: () => true, store: async () => h.store } as unknown as IntentServices;
+  const memory = await handoffMemory(runtime, h.ctx, { path: `/handoffs/${first}-1.md`, at: "2026-01-01" });
+  assert.match(memory!.text, /Previous-chain replay/);
 });
 
 test("hard-limit mechanical adapter path includes the store block without a model", async () => {

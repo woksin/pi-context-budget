@@ -7,7 +7,7 @@ import { compare, MESSAGE_SECTION, pointerExcerpt, projectionBudgets, renderMemo
 import type { Budgets, IndexRow, MemoryIndex, MessageRow, Projection, RenderRecord } from "./render.ts";
 
 export type { Budgets, Projection } from "./render.ts";
-export type ProjectQuery = { scopes: Scope[]; session: string; sessions?: string[]; reportOtherScopes?: boolean; budgets?: Partial<Budgets> };
+export type ProjectQuery = { scopes: Scope[]; session: string; sessions?: string[]; taskItemIds?: readonly string[]; reportOtherScopes?: boolean; budgets?: Partial<Budgets> };
 export type ProjectionMessageQuery = MessageQuery & { unresolvedOnly?: boolean };
 export interface MemoryStore extends MemoryStoreCore {
   project(query: ProjectQuery): Projection;
@@ -81,7 +81,8 @@ function hygieneScopes(items: FoldedItem[]): string[] {
 /** Pure read-side projection; no boundary cursor, writes, extension hooks or pi dependencies. */
 export function project(store: MemoryStoreCore, query: ProjectQuery): Projection {
   const budgets = projectionBudgets(query.budgets), state = store.readFolded(), resolve = spanResolver(state);
-  const items = Object.values(state.items).filter(item => scopeMatches(item, query.scopes)).sort((a, b) => compare(a.id, b.id));
+  const taskItemIds = new Set(query.taskItemIds);
+  const items = Object.values(state.items).filter(item => scopeMatches(item, query.scopes) || taskItemIds.has(item.id)).sort((a, b) => compare(a.id, b.id));
   const sessions = [...new Set(query.sessions ?? [query.session])];
   const messages = sessions.flatMap(sessionId => allMessages(store, { sessionId, origin: "human" })
     .filter(entry => entry.session.id === sessionId && entry.origin === "human")).sort((a, b) => compare(a.id, b.id));

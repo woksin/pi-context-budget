@@ -11,6 +11,7 @@ export function canonicalRemote(remote: string | undefined): string | undefined 
   try {
     const url = new URL(address);
     if (!["https:", "http:", "ssh:"].includes(url.protocol)) return undefined;
+    if (url.protocol === "ssh:" && url.port === "22") url.port = "";
     return `https://${url.host.toLowerCase()}${url.pathname.replace(/\/+$/, "").replace(/\.git$/, "")}`;
   } catch { return undefined; }
 }
@@ -19,7 +20,7 @@ function repository(cwd: string): { root: string; remote?: string } | undefined 
   if (!root) return undefined;
   return { root, remote: canonicalRemote(git(root, ["remote", "get-url", "origin"])) };
 }
-function taskScopes(store: MemoryStoreCore, sessionIds: string[]): Scope[] {
+function chainTaskItemIds(store: MemoryStoreCore, sessionIds: string[]): string[] {
   const sources = new Set<string>();
   for (const sessionId of sessionIds) {
     let cursor: string | undefined;
@@ -31,20 +32,19 @@ function taskScopes(store: MemoryStoreCore, sessionIds: string[]): Scope[] {
   }
   return Object.values(store.readFolded().items)
     .filter(item => item.scope.kind === "task" && !!item.source.ref && sources.has(item.source.ref))
-    .map(item => item.scope);
+    .map(item => item.id);
 }
 
 /** Keys come from runtime identity and journal provenance, not a model-selected task/repo key. */
 export function selectedHandoffScopes(ctx: ExtensionContext, store: MemoryStoreCore, lastPath?: string) {
   const { sessionIds } = chainIdentity(ctx.sessionManager.getBranch?.() ?? [], ctx.sessionManager.getSessionId(), lastPath);
-  const repo = repository(ctx.cwd), lane = ctx.sessionManager.getSessionName?.();
+  const repo = repository(ctx.cwd);
   const scopes: Scope[] = [{ kind: "global", key: "*" }, ...sessionIds.map(key => ({ kind: "session" as const, key }))];
   if (repo) scopes.push({ kind: "repo", key: repo.root });
   if (repo?.remote) scopes.push({ kind: "repo", key: repo.remote });
-  if (lane) scopes.push({ kind: "lane", key: lane });
-  scopes.push(...taskScopes(store, sessionIds));
+  const taskItemIds = chainTaskItemIds(store, sessionIds);
   const unique = [...new Map(scopes.map(scope => [JSON.stringify(scope), scope])).values()];
-  return { scopes: unique, sessionIds, repo };
+  return { scopes: unique, taskItemIds, sessionIds, repo };
 }
 
 export function normaliseRepoScope(scope: Scope, repo: ReturnType<typeof selectedHandoffScopes>["repo"]): Scope {
