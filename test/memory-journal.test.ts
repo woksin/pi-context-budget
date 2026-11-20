@@ -82,6 +82,36 @@ test("origin comes from the S3a gate: first input is unverified launch, later ty
   assert.equal(byText["rpc text"].origin, "unattended");
 });
 
+test("injectedFrom metadata is redacted; the body is too", async () => {
+  const h = await harness({ memory: ON });
+  await h.input("warm");
+  await h.input(`[orch message from ${canary}] hello`, "extension");
+  const entry = h.entries().at(-1)!;
+  assert.equal(entry.origin, "injected");
+  assert.ok(!JSON.stringify(entry).includes(canary));
+  assert.match(entry.injectedFrom ?? "", /REDACTED/);
+  for (const file of h.allFiles(h.memoryHome)) assert.ok(!readFileSync(file, "utf8").includes(canary), file);
+});
+
+test("injectedFrom is omitted when the scanner fails", async () => {
+  const h = await harness({ memory: ON, scannerSource: "export const scan = () => { throw new Error('x'); };" });
+  await h.input("warm");
+  await h.input(`[orch message from ${canary}] hello`, "extension");
+  const entry = h.entries().at(-1)!;
+  assert.equal(entry.injectedFrom, undefined);
+  for (const file of h.allFiles(h.memoryHome)) assert.ok(!readFileSync(file, "utf8").includes(canary), file);
+});
+
+test("journal stays off when any memory value is invalid; the log holds no config text", async () => {
+  const h = await harness({ memory: { journal: true, recall: canary, scope: { mode: "all" } } });
+  await h.input("a"); await h.input("b");
+  assert.equal(existsSync(h.memoryHome), false);
+  assert.ok(!JSON.stringify(h.events()).includes(canary));
+  h.setRaw(`{ "memory": "${canary}`);
+  await h.input("c");
+  assert.ok(!JSON.stringify(h.events()).includes(canary));
+});
+
 test("no-UI sessions are journaled as unattended, never human", async () => {
   const h = await harness({ memory: ON, hasUI: false });
   await h.input("first"); await h.input("second");

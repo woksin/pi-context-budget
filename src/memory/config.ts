@@ -57,12 +57,13 @@ export function parseMemoryConfig(root: unknown): ParsedMemoryConfig {
     else reasons.push("memory.coordinators must be an array of non-empty strings");
   }
   config.trustRpc = flag(raw, "trustRpc", reasons);
-  return { config, reasons };
+  // One invalid value anywhere distrusts the whole block: nothing stays on.
+  return { config: reasons.length ? memoryOff() : config, reasons };
 }
 
 export function readMemoryConfig(file: string): ParsedMemoryConfig {
   try { return existsSync(file) ? parseMemoryConfig(JSON.parse(readFileSync(file, "utf8"))) : { config: memoryOff(), reasons: [] }; }
-  catch (error) { return { config: memoryOff(), reasons: [`memory config unreadable: ${String(error)}`] }; }
+  catch { return { config: memoryOff(), reasons: ["memory config unreadable"] }; }
 }
 
 /** `names: []` is nobody; only an explicit `mode:"all"` means everyone. An unnamed session matches `all` only. */

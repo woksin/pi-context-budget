@@ -129,3 +129,29 @@ test("a scanner that mutates nothing cannot cause raw text to be returned on fai
   const result = redact(CANARIES.pem.text, failing);
   assert.equal(result.text, null);
 });
+
+test("only a complete redaction marker is exempt; a marker-prefixed value is still redacted", () => {
+  const rest = j("private", "Material");
+  for (const text of [`API_TOKEN=[REDACTED:x]${rest}`, `API_TOKEN="[REDACTED:x]${rest}"`, `API_TOKEN=[REDACTED:x]${rest}[REDACTED:y]`]) {
+    const result = redact(text, undefined);
+    assert.ok(!result.text!.includes(rest), result.text!);
+  }
+  assert.equal(redact("API_TOKEN=[REDACTED:x]", undefined).text, "API_TOKEN=[REDACTED:x]");
+});
+
+test("Bearer values of any length are redacted", () => {
+  for (const value of ["abc123", "Q", "x1"]) assert.ok(!redact(`Authorization: Bearer ${value}`, undefined).text!.includes(` ${value}`), value);
+});
+
+test("a scanner module that never finishes loading withholds instead of falling back to built-in only", async () => {
+  const scanner = await loadScanner(agentDir("await new Promise(() => {}); export const scan = (t: string) => ({ text: t, kinds: [], count: 0, skipped: false });"), 100);
+  assert.ok(scanner, "a timed-out load must not look like an absent scanner");
+  assert.deepEqual(redact(CANARIES.github.text, scanner), { text: null, withheld: "redactor_failed", redactions: [] });
+});
+
+test("scanner loading is cached per process", async () => {
+  const dir = agentDir(PASSTHROUGH);
+  assert.equal(await loadScanner(dir), await loadScanner(dir));
+  const absent = agentDir();
+  assert.equal(await loadScanner(absent), undefined);
+});
