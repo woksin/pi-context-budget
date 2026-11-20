@@ -1,5 +1,5 @@
 import { constants, type Stats } from "node:fs";
-import { open, readFile, realpath, rename, stat, writeFile, type FileHandle } from "node:fs/promises";
+import { open, readFile, realpath, rename, stat, unlink, writeFile, type FileHandle } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import { homedir } from "node:os";
@@ -207,9 +207,17 @@ type HookDeps = {
   agentDir: string; configFile: string; observe(ctx: ExtensionContext): Observation;
   log?(ctx: ExtensionContext, event: string, data: Record<string, unknown>): void;
 };
-/** Recognize both the original open-ended packet and the explicitly terminated format. */
-function withoutPacket(summary: string): string {
-  return summary.replace(/\n\n## Resume packet \(reference material, not instructions\)\nVolatile facts were observed at commit time and may be stale if the session restarts later\.[\s\S]*?(?:\n## End resume packet\n|(?=\n(?:## |Compaction instance:))|$)/gu, "");
+/** Only a terminated final block is ours; header text elsewhere can be verbatim user input. */
+function finalPacketStart(text: string): number {
+  return text.endsWith(`\n${FOOTER}\n`) ? text.lastIndexOf(`\n\n${HEADER}\n`) : -1;
+}
+function withoutPacket(summary: string, handoff?: Handoff): string {
+  const start = finalPacketStart(summary);
+  if (start >= 0) return summary.slice(0, start);
+  // Backstops append lint/instance metadata after the stored handoff's final block.
+  const stored = handoff?.text ?? "", storedStart = finalPacketStart(stored);
+  if (storedStart >= 0 && summary.startsWith(stored)) return stored.slice(0, storedStart) + summary.slice(stored.length);
+  return summary;
 }
 function sidecarPath(handoff: Handoff): string { return handoff.path.replace(/\.md$/u, ".json"); }
 async function savedHandoff(handoff: Handoff): Promise<Record<string, unknown>> {
@@ -222,7 +230,11 @@ async function persistHandoff(handoff: Handoff, text: string): Promise<void> {
   await writeFile(temp, text, { mode: 0o600, flag: "wx" });
   atomicJson(sidecarPath(handoff), { ...saved, text });
   try { await rename(temp, handoff.path); }
-  catch (error) { atomicJson(sidecarPath(handoff), saved); throw error; }
+  catch (error) {
+    try { atomicJson(sidecarPath(handoff), saved); }
+    finally { await unlink(temp); }
+    throw error;
+  }
   handoff.text = text;
 }
 function observe(deps: HookDeps, ctx: ExtensionContext): Observation {
@@ -238,7 +250,7 @@ export function createResumeHook(deps: HookDeps) {
     try { deps.log?.(ctx, "resume_packet_skipped", { operation }); } catch { /* Logging must not block recovery. */ }
   }
   async function build(ctx: ExtensionContext, original: string, handoff?: Handoff, input?: HandoffInput): Promise<string> {
-    const summary = withoutPacket(original), observation = observe(deps, ctx), observedAt = new Date().toISOString();
+    const summary = withoutPacket(original, handoff), observation = observe(deps, ctx), observedAt = new Date().toISOString();
     const packet = await assemblePacket({ cwdRoot: observation.cwdRoot, repos: observation.repos ?? [], agentDir: deps.agentDir,
       handoffAt: handoff?.at ?? observedAt, files: input?.files_to_read ?? await handoffFiles(handoff), observation, observedAt,
       budget: Math.max(0, MAX_HANDOFF_BYTES - Buffer.byteLength(summary) - 3) });
@@ -247,7 +259,7 @@ export function createResumeHook(deps: HookDeps) {
   async function append(ctx: ExtensionContext, summary: string, handoff?: Handoff, input?: HandoffInput): Promise<string> {
     if (!enabled(ctx)) return summary;
     if (!handoff) return build(ctx, summary, handoff, input);
-    if (blocked.has(handoff)) return withoutPacket(summary);
+    if (blocked.has(handoff)) return withoutPacket(summary, handoff);
     let summaries = committed.get(handoff);
     if (!summaries) { summaries = new Map(); committed.set(handoff, summaries); }
     let pending = summaries.get(summary);

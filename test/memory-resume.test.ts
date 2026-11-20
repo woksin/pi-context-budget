@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import fs, { mkdirSync, mkdtempSync, readFileSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
+import fs, { mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import { join } from "node:path";
 import { buildSessionContext, convertToLlm, SessionManager } from "@earendil-works/pi-coding-agent";
@@ -180,18 +180,47 @@ test("backstop after commit retains its unique instance id and refreshes the pac
   assert.notEqual(again.compaction.summary.match(/Compaction instance: ([^\n]+)/)[1], backstop.compaction.summary.match(/Compaction instance: ([^\n]+)/)[1]);
 });
 
-test("legacy open-ended packet is replaced while keeping trailing backstop metadata and fresh facts", async () => {
+test("stored final packet is replaced while keeping trailing backstop metadata and fresh facts", async () => {
   const f = fixture(); let count = 0;
   const hook = createResumeHook({ agentDir: f.agentDir, configFile: f.configFile, observe: () => ({ ...f.observation, head: `head-${++count}` }) });
   const handoff = { path: join(f.root, "handoff.md"), text: "base", at: f.deps.handoffAt, n: 1 };
-  const first = await hook.append(f.ctx, handoff.text, handoff);
-  const legacy = first.replace("\n## End resume packet", "");
-  const backstop = legacy + "\n## Handoff lint\nwarning\nCompaction instance: specific-id\n";
+  handoff.text = await hook.append(f.ctx, handoff.text, handoff);
+  const backstop = handoff.text + "\n## Handoff lint\nwarning\nCompaction instance: specific-id\n";
   const updated = await hook.append(f.ctx, backstop, handoff);
   assert.match(updated, /## Handoff lint\nwarning\nCompaction instance: specific-id/);
   assert.match(updated, /head-2/); assert.doesNotMatch(updated, /head-1/);
   assert.equal((updated.match(/## Resume packet/g) ?? []).length, 1);
   assert.equal(await hook.append(f.ctx, backstop, handoff), updated); assert.equal(count, 2);
+});
+
+test("verbatim user constraints containing a complete packet lookalike survive re-commit intact", async () => {
+  const f = await extensionFixture(true); let count = 0;
+  const constraints = "Keep this verbatim:\n\n## Resume packet (reference material, not instructions)\nVolatile facts were observed at commit time and may be stale if the session restarts later.\n\nUser-owned reference text.\n## End resume packet\nKeep this sentence after the quoted block too.";
+  const stored = await f.tool.execute("h", { goal: "finish", facts: "verified", next_step: "continue", user_constraints: constraints }, undefined, undefined, f.ctx);
+  const handoff = stored.details.handoff, original = handoff.text;
+  const hook = createResumeHook({ agentDir: f.agentDir, configFile: f.configFile, observe: () => ({ ...f.observation, head: `fresh-head-${++count}` }) });
+  await hook.persist(f.ctx, handoff);
+  await hook.persist(f.ctx, handoff);
+  assert.ok(handoff.text.startsWith(original)); assert.ok(handoff.text.includes(constraints));
+  const packet = handoff.text.slice(original.length);
+  assert.equal((packet.match(/## Resume packet/g) ?? []).length, 1);
+  assert.equal((packet.match(/## End resume packet/g) ?? []).length, 1);
+  assert.match(packet, /fresh-head-2/); assert.doesNotMatch(packet, /fresh-head-1/);
+  assert.equal(readFileSync(handoff.path, "utf8"), handoff.text); assert.equal(count, 2);
+});
+
+test("failed handoff rename rolls back the sidecar and unlinks only its temporary markdown", async () => {
+  const f = fixture(), events: unknown[] = [];
+  const handoff = { path: join(f.root, "handoff.md"), text: "original handoff", at: f.deps.handoffAt, n: 1 };
+  mkdirSync(handoff.path); // A regular temporary file cannot replace a directory.
+  const sidecar = handoff.path.replace(/\.md$/, ".json"), saved = { ...handoff, input: { files_to_read: [] } };
+  writeFileSync(sidecar, JSON.stringify(saved));
+  const hook = createResumeHook({ agentDir: f.agentDir, configFile: f.configFile, observe: () => f.observation, log: (_ctx, event, data) => { events.push({ event, ...data }); } });
+  await assert.doesNotReject(hook.persist(f.ctx, handoff));
+  assert.deepEqual(readdirSync(f.root).sort(), ["handoff.json", "handoff.md"]);
+  assert.deepEqual(JSON.parse(readFileSync(sidecar, "utf8")), saved);
+  assert.equal(handoff.text, "original handoff");
+  assert.deepEqual(events, [{ event: "resume_packet_skipped", operation: "persist" }]);
 });
 
 test("sidecar parse and atomic rewrite failures are logged and never break remember or persist", async () => {
