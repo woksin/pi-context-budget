@@ -84,15 +84,9 @@ export function requireVisibleItems(ctx: LaneContext, store: MemoryStoreCore, id
   const items = store.readFolded().items, visible = visibility(ctx);
   for (const id of ids) if (items[id]) requireValid(visible(items[id].scope), "no_source");
 }
-/** Keep store cursors opaque and scan until a visible page is full or the store is exhausted. */
+/** Fold once, then use the store's paging and cursors over visible items only. */
 export function listVisibleItems(ctx: LaneContext, store: MemoryStoreCore, query: ItemQuery) {
   requireValid(Number.isInteger(query.limit) && query.limit > 0 && query.limit <= 1000, "invalid_limit");
   const visible = visibility(ctx);
-  let page = store.list({ ...query, limit: 1 });
-  const items = page.items.filter(item => visible(item.scope));
-  while (page.cursor !== undefined && items.length < query.limit) {
-    page = store.list({ ...query, limit: 1, cursor: page.cursor });
-    items.push(...page.items.filter(item => visible(item.scope)));
-  }
-  return { items, ...(page.cursor !== undefined ? { cursor: page.cursor } : {}) };
+  return store.list(query, item => visible(item.scope));
 }

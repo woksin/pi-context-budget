@@ -190,6 +190,24 @@ test("supersede by id refuses a foreign lane", async () => {
   assert.equal(result.details.reason, "no_source");
   assert.equal(f.store.changesSince().cursor, before);
 });
+test("both list entry points fold exactly once per call before filtering and pagination", async t => {
+  const f = toolFixture(), own: string[] = [];
+  for (let i = 0; i < 25; i++) {
+    f.add({ kind: "lane", key: "orch:foreign" });
+    own.push(f.add({ kind: "lane", key: laneKey(f.ctx) }));
+  }
+  const folded = t.mock.method(FileMemoryStore.prototype, "readFolded");
+  const first = (await f.call("memory_list", { limit: 10 })).details;
+  assert.equal(folded.mock.callCount(), 1);
+  assert.deepEqual(first.items.map((item: any) => item.id), own.slice(0, 10));
+  const second = (await f.call("memory_list", { limit: 20, cursor: first.cursor })).details;
+  assert.equal(folded.mock.callCount(), 2);
+  assert.deepEqual(second.items.map((item: any) => item.id), own.slice(10));
+  assert.equal(second.cursor, undefined);
+  await f.commands.get("memory").handler("list", f.ctx);
+  assert.equal(folded.mock.callCount(), 3);
+  assert.deepEqual(JSON.parse(f.notices.at(-1).content).items.map((item: any) => item.id), own);
+});
 test("memory_list fills visible pages past foreign items, retaining cursors without duplicates", async () => {
   const f = toolFixture();
   for (let i = 0; i < 51; i++) f.add({ kind: "lane", key: "orch:foreign" });
