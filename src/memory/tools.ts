@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { flagOn, MEMORY_DISABLED, readMemoryConfig } from "./config.ts";
@@ -7,7 +8,7 @@ import { loadScanner, redact } from "./redact.ts";
 import { requireValid, ValidationError } from "./validate.ts";
 import { newId } from "./types.ts";
 import { normaliseRepoScope, selectedHandoffScopes } from "./handoff-scopes.ts";
-import { laneVisible, resolveLaneScope } from "./scope.ts";
+import { listVisibleItems, requireVisibleItems, resolveLaneScope } from "./scope.ts";
 import type { Actor, ClassifyEvent, Item, ItemQuery, RetireEvent, Source, Span } from "./types.ts";
 import type { MemoryStoreCore } from "./store.ts";
 
@@ -32,6 +33,7 @@ const schemas = {
 };
 type AddInput = Pick<Item, "kind" | "scope" | "text" | "gloss" | "supersedes"> & { source?: { ref?: string; span?: Span } };
 async function add(runtime: IntentServices, store: MemoryStoreCore, ctx: ExtensionContext, input: AddInput) {
+  requireVisibleItems(ctx, store, input.supersedes ?? []);
   const source = itemSource(input), actor = runtime.actor(ctx);
   const selected = selectedHandoffScopes(ctx, store);
   const item: Item = { id: newId(), kind: input.kind, scope: normaliseRepoScope(resolveLaneScope(ctx, input.scope), selected.repo), text: input.text, source,
@@ -62,20 +64,22 @@ async function operation(runtime: IntentServices, name: keyof typeof schemas, in
     case "memory_add": return add(runtime, store, ctx, input);
     case "memory_retire": {
       requireValid(["done", "superseded", "withdrawn"].includes(input.status), "invalid_retirement");
+      requireVisibleItems(ctx, store, [input.itemId]);
       const source: Source = input.source?.ref
         ? { type: "user_message", ref: input.source.ref } : { type: "agent_decision" };
       const result = store.retireItem(input.itemId, input.status as RetireEvent["status"], await safeText(runtime, input.reason), source, actor);
       return reply(result, result.ok ? undefined : result.reason);
     }
     case "memory_classify": {
+      const spans = Array.isArray(input.spans) ? input.spans : [];
+      requireVisibleItems(ctx, store, spans.flatMap((span: any) => Array.isArray(span?.itemIds) ? span.itemIds : []));
       const result = store.classify({ messageId: input.messageId, spans: input.spans, whole: input.whole ?? null,
         reason: input.reason === undefined ? undefined : await safeText(runtime, input.reason) } as Omit<ClassifyEvent, "schema" | "id" | "at" | "actor" | "type">, actor);
       return reply(result, result.ok ? undefined : result.reason);
     }
     case "memory_list": {
-      const page = store.list({ scopes: input.scopes, status: input.status, kind: input.kind,
-        cursor: input.cursor, limit: input.limit ?? 50 } as ItemQuery);
-      return reply({ ...page, items: page.items.filter(item => laneVisible(ctx, item.scope)) });
+      return reply(listVisibleItems(ctx, store, { scopes: input.scopes, status: input.status, kind: input.kind,
+        cursor: input.cursor, limit: input.limit ?? 50 } as ItemQuery));
     }
   }
 }
@@ -115,6 +119,11 @@ class IntentRuntime implements IntentServices {
     const { FileMemoryStore } = await import("./store.ts");
     return new FileMemoryStore({ home: process.env.PI_MEMORY_HOME || join(this.agentDir, "memory"), eligibilityCheck,
       coordinators: readMemoryConfig(this.deps.configFile).config.coordinators });
+  }
+  async readStore(ctx: ExtensionContext): Promise<MemoryStoreCore | undefined> {
+    const home = process.env.PI_MEMORY_HOME || join(this.agentDir, "memory");
+    if (![home, ...["journal", "answers", "blobs"].map(name => join(home, name))].every(path => existsSync(path))) return undefined;
+    return this.store(ctx);
   }
   start(ctx: ExtensionContext): void {
     if (this.registered || !this.enabled(ctx)) return;

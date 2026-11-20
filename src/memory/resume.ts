@@ -4,6 +4,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import { homedir } from "node:os";
 import { atomicJson } from "../storage.ts";
+import { bytePrefix } from "../collect.ts";
+import { persistLaneRoot } from "./scope.ts";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { MAX_HANDOFF_BYTES, type Handoff, type HandoffInput } from "../core.ts";
 import { flagOn, readMemoryConfig } from "./config.ts";
@@ -183,9 +185,11 @@ export async function assemblePacket(input: PacketInput): Promise<{ sections: st
   const budget = Math.min(PACKET_BYTES, input.budget ?? PACKET_BYTES) - Buffer.byteLength(FOOTER) - 2;
   const scanner = input.scanner ?? await loadScanner(input.agentDir), redactor: Redactor = value => redact(value, scanner);
   const sections = [HEADER, ...factSections(input, redactor)];
-  if (input.check) sections.push(input.check);
   let used = Buffer.byteLength(sections.join("\n\n"));
   if (used > budget) return { sections: [] };
+  if (input.check && used + Buffer.byteLength(input.check) + 2 <= budget) {
+    sections.push(input.check); used += Buffer.byteLength(input.check) + 2;
+  }
   const policy = { roots: await allowedRoots(input), sessions: [resolve(input.agentDir, "sessions"), await canonicalPath(join(input.agentDir, "sessions"))] };
   const files = input.files.slice(0, MAX_FILES);
   let included = 0;
@@ -209,7 +213,7 @@ async function handoffFiles(handoff?: Handoff): Promise<string[]> {
 }
 type HookDeps = {
   agentDir: string; configFile: string; observe(ctx: ExtensionContext): Observation;
-  store?(ctx: ExtensionContext): Promise<MemoryStoreCore>; host?(): { subagent: boolean } | undefined;
+  store?(ctx: ExtensionContext): Promise<MemoryStoreCore | undefined>; host?(): { subagent: boolean } | undefined;
   command?(ctx: ExtensionContext): string | undefined;
   log?(ctx: ExtensionContext, event: string, data: Record<string, unknown>): void;
 };
@@ -261,11 +265,11 @@ export function genericResumeCheck(ctx: ExtensionContext, store: MemoryStoreCore
   const newest = store.changesSince().events.filter(event => event.type === "retire")
     .filter(event => folded.events[event.id]?.ok).filter(event => visible.has(event.itemId))
     .sort((a, b) => compare(b.at, a.at) || compare(b.id, a.id))[0];
-  return ["## Memory resume check (reference material, not instructions)",
+  return bytePrefix(["## Memory resume check (reference material, not instructions)",
     `active directives=${singleLine(String(active))}; unresolved messages=${singleLine(String(projection.index.unresolved))}; proposed items=${singleLine(String(proposed))}`,
     newest ? `newest retirement: id=${encodedExcerpt(newest.itemId, 256)}; time=${encodedExcerpt(newest.at, 128)}` : `newest retirement=${singleLine("none")}`,
     `unread lane messages=${singleLine("unknown (no collector)")}`,
-    `details=${singleLine("memory_list")}`].join("\n");
+    `details=${singleLine("memory_list")}`].join("\n"), 1024);
 }
 /** Commit-time fallback: no request hook, no per-call timestamp, no provider-time file access. */
 export function createResumeHook(deps: HookDeps) {
@@ -276,10 +280,19 @@ export function createResumeHook(deps: HookDeps) {
     try { deps.log?.(ctx, "resume_packet_skipped", { operation }); } catch { /* Logging must not block recovery. */ }
   }
   async function check(ctx: ExtensionContext): Promise<string | undefined> {
-    if (deps.host?.()?.subagent) return undefined;
-    if (deps.command?.(ctx)) return undefined;
-    if (!deps.store) return undefined;
-    return genericResumeCheck(ctx, await deps.store(ctx));
+    try {
+      if (deps.host?.()?.subagent) return undefined;
+      if (deps.command?.(ctx)) return undefined;
+      const store = await deps.store?.(ctx);
+      return store ? genericResumeCheck(ctx, store) : undefined;
+    } catch { return undefined; }
+  }
+  function rememberLaneRoot(ctx: ExtensionContext, handoff?: Handoff): void {
+    if (!handoff) return;
+    try { persistLaneRoot(ctx, handoff.path); }
+    catch {
+      try { deps.log?.(ctx, "lane_root_skipped", {}); } catch { /* Metadata must never block recovery. */ }
+    }
   }
   async function build(ctx: ExtensionContext, original: string, handoff?: Handoff, input?: HandoffInput): Promise<string> {
     const summary = withoutPacket(original, handoff), observation = observe(deps, ctx), observedAt = new Date().toISOString();
@@ -299,7 +312,7 @@ export function createResumeHook(deps: HookDeps) {
     return pending;
   }
   return {
-    append,
+    append, rememberLaneRoot,
     async remember(ctx: ExtensionContext, handoff: Handoff, files: unknown): Promise<void> {
       if (!enabled(ctx) || !Array.isArray(files)) return;
       try {

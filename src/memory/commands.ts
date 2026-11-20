@@ -5,7 +5,7 @@ import { newId } from "./types.ts";
 import { loadScanner, redact } from "./redact.ts";
 import { singleLine } from "./render.ts";
 import { MEMORY_DISABLED } from "./config.ts";
-import { laneVisible } from "./scope.ts";
+import { laneVisible, listVisibleItems, requireVisibleItems } from "./scope.ts";
 import { requireValid, ValidationError } from "./validate.ts";
 
 function tell(pi: ExtensionAPI, ctx: ExtensionCommandContext, text: string): void {
@@ -42,6 +42,7 @@ async function direct(runtime: IntentServices, text: string, ctx: ExtensionComma
 }
 async function proposed(runtime: IntentServices, ctx: ExtensionCommandContext, id: string): Promise<FoldedItem> {
   const store = await runtime.store(ctx), item = store.readFolded().items[id];
+  requireVisibleItems(ctx, store, [id]);
   requireValid(item, "no_source"); requireValid(item.status === "proposed", "not_proposed");
   return item;
 }
@@ -78,8 +79,7 @@ export function registerIntentCommands(pi: ExtensionAPI, runtime: IntentServices
           const item = store.readFolded().items[id];
           return item && laneVisible(ctx, item.scope) ? item : undefined;
         }
-        const page = store.list({ limit: 50 });
-        return { ...page, items: page.items.filter(item => laneVisible(ctx, item.scope)) };
+        return listVisibleItems(ctx, store, { limit: 50 });
       }
       requireValid(["confirm", "reject"].includes(verb) && id, "Use /memory confirm|reject <id> or /memory list");
       return authorise(runtime, ctx, verb, id);

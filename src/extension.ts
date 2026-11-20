@@ -59,7 +59,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
     const memoryDeps = { agentDir, configFile, log, host: () => host };
     const intent = createIntentHook(pi, memoryDeps), recall = createRecallHook(pi, memoryDeps);
     const resume = createResumeHook({ ...memoryDeps, observe: autoState,
-      store: ctx => intent.store(ctx), command: checkCommand });
+      store: ctx => intent.readStore(ctx), command: checkCommand });
     const requests = createRequestsHook({ ...memoryDeps, hasTools: () => hasActiveTools(pi) });
     const journal = wire(requests, { ...memoryDeps, launchFacts });
     function reload(ctx: ExtensionContext): void {
@@ -207,6 +207,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
               ? "Pending background work remains and context is large. Call context_handoff now while the cache is warm, then end this turn. The context resets at the end of this turn."
               : "Context recovery is required. Call context_handoff with goal, next_step, verified facts and verbatim user_constraints, then end this turn without further tools.", effect.idleOnly) }], continue: true }; break;
           case "commit":
+            resume.rememberLaneRoot(ctx, effect.handoff);
             await requests.commit(ctx, effect.handoff.path, effect.source === "idle");
             log(ctx, "handoff_committed", { path: effect.handoff.path, n: effect.handoff.n, count: state.count, source: effect.source });
             result = { entries: [{ type: "compaction", summary: await resume.append(ctx, effect.handoff.text, effect.handoff), firstKeptEntryId: null,
@@ -215,6 +216,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
           case "backstop": {
             // Mechanical recovery must fit and work even if handoff storage/metadata is unavailable.
             const h = effect.handoff, emergency = h ? undefined : emergencyInput(ctx);
+            resume.rememberLaneRoot(ctx, h);
             const lint = emergency ? validateObserved(ctx, emergency, runningState([...knownIds], { cwd: ctx.cwd, sessionId: ctx.sessionManager.getSessionId() }), false).lint : [];
             const summary = `${h?.text ?? emergencySummary(emergency!, await requests.render(ctx, true), await handoffMemory(intent, ctx, state.lastHandoff))}${lint.length ? `\n## Handoff lint\n${bytePrefix(lint.join("\n"), 1024)}` : ""}\nCompaction instance: ${randomUUID()}\n`;
             log(ctx, "backstop", { path: h?.path, reason: "machine-authorized" });
@@ -225,6 +227,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
           case "relaunch": {
             if (!frame(ctx).wrapped) break;
             const h = effect.handoff ?? await createHandoff(ctx, emergencyInput(ctx));
+            resume.rememberLaneRoot(ctx, h);
             await resume.persist(ctx, h);
             writeMarker(process.env.PI_RELAUNCH_MARKER!, { cwd: resolve(ctx.cwd), launchPrompt: h.launchPrompt ?? null,
               handoff: h.path, sessionFile: ctx.sessionManager.getSessionFile() ?? null });
