@@ -200,7 +200,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
             log(ctx, effect.idleOnly ? "idle_handoff_requested" : "settle_handoff_requested");
             result = { entries: [{ type: "custom_message", customType: "context-budget", display: true, content: intent.steer(ctx, effect.idleOnly
               ? "Pending background work remains and context is large. Call context_handoff now while the cache is warm, then end this turn. The context resets at the end of this turn."
-              : "Context recovery is required. Call context_handoff with goal, next_step, verified facts and verbatim user_constraints, then end this turn without further tools.") }], continue: true }; break;
+              : "Context recovery is required. Call context_handoff with goal, next_step, verified facts and verbatim user_constraints, then end this turn without further tools.", effect.idleOnly) }], continue: true }; break;
           case "commit":
             await requests.commit(ctx, effect.handoff.path, effect.source === "idle");
             log(ctx, "handoff_committed", { path: effect.handoff.path, n: effect.handoff.n, count: state.count, source: effect.source });

@@ -19,16 +19,17 @@ type Line = { text: string; start: number; end: number; fenced: boolean };
 function lines(text: string): Line[] {
   let offset = 0, fence: string | undefined;
   return text.split("\n").map(line => {
-    const marker = /^ {0,3}(`{3,}|~{3,})/u.exec(line)?.[1];
-    const fenced = fence !== undefined || marker !== undefined;
-    if (marker) fence = fence === undefined ? marker : closeFence(fence, marker);
+    const marker = /^ {0,3}(`{3,}|~{3,})([\s\S]*)$/u.exec(line);
+    const fenced = fence !== undefined || marker !== null;
+    if (marker) fence = fence === undefined ? marker[1] : closeFence(fence, marker);
     const result = { text: line, start: offset, end: offset + line.length + 1, fenced };
     offset = result.end;
     return result;
   });
 }
-function closeFence(open: string, marker: string): string | undefined {
-  return marker[0] === open[0] && marker.length >= open.length ? undefined : open;
+function closeFence(open: string, marker: RegExpExecArray): string | undefined {
+  if (!/^[\t \r]*$/u.test(marker[2])) return open;
+  return marker[1][0] === open[0] && marker[1].length >= open.length ? undefined : open;
 }
 function unsafeLine(rows: Line[], index: number): boolean {
   const row = rows[index];
@@ -80,6 +81,6 @@ export function memoryRecovery(state: MachineState, event: MachineEvent, frame: 
   if (state.pending || required) return recoveryCall(state, event.id);
   delete state.memoryRecovery;
 }
-export function recoverySteer(input: { text: string; enabled: boolean }): string {
-  return input.enabled ? `${input.text} Before context_handoff, classify unresolved messages with memory_classify (up to 12 memory recovery calls).` : input.text;
+export function recoverySteer(input: { text: string; enabled: boolean; idleOnly?: boolean }): string {
+  return input.enabled && !input.idleOnly ? `${input.text} Before context_handoff, classify unresolved messages with memory_classify (up to 12 memory recovery calls).` : input.text;
 }

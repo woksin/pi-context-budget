@@ -362,8 +362,12 @@ function softNotices(s: MachineState, continues: boolean | undefined, f: Frame):
   }
   return effects;
 }
+function recoveryPolicy(s: MachineState, e: MachineEvent, f: Frame): Effect[] | undefined {
+  if (f.handoffAvailable === false || degradedFor(s, f)) return memoryRecovery(s, e, { ...f, memoryIntent: false }, false);
+  return memoryRecovery(s, e, f, Boolean(forced(s, f)));
+}
 function active(s: MachineState, e: MachineEvent, f: Frame): Effect[] {
-  return memoryRecovery(s, e, f, Boolean(forced(s, f))) ?? activePolicy(s, e, f);
+  return recoveryPolicy(s, e, f) ?? activePolicy(s, e, f);
 }
 function activePolicy(s: MachineState, e: MachineEvent, f: Frame): Effect[] {
   const notice = notices(s, e, f);

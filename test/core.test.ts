@@ -12,6 +12,21 @@ mkdirSync(root, { recursive: true });
 const dir = () => mkdtempSync(join(root, "case-"));
 const config = parseConfig({});
 const t = config.main;
+test("intent recovery does not change unavailable or degraded handoff behavior", () => {
+  for (const handoffAvailable of [false, true]) {
+    const frame: Frame = { mode: "enforce", tokens: t.hard, thresholds: t, config, wrapped: false, handoffAvailable };
+    const state = { ...initialState("enforce"), floor: 0,
+      handoffTurns: Array(config.loop.maxHandoffsWithoutProgress + 1).fill(0) } as ReturnType<typeof initialState>;
+    for (let i = 0; i < 13; i++) {
+      const event: MachineEvent = { type: "tool_call", tool: "memory_list", id: String(i) };
+      const expected = transition(state, event, frame);
+      const actual = transition(state, event, { ...frame, memoryIntent: true });
+      assert.deepEqual(actual, expected);
+      const end: MachineEvent = { type: "tool_end", tool: "memory_list", id: String(i), error: false };
+      assert.deepEqual(transition(actual.state, end, { ...frame, memoryIntent: true }), transition(expected.state, end, frame));
+    }
+  }
+});
 test("intent recovery tools preserve pending/stored state and grace; call thirteen is blocked", () => {
   const frame: Frame = { mode: "enforce", tokens: t.handoff, thresholds: t, config, wrapped: true, memoryIntent: true };
   const marker = { path: "/tmp/handoff" } as any;

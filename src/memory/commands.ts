@@ -16,7 +16,7 @@ async function confirmed(ctx: ExtensionCommandContext, text: string, source: str
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     const timeout = new Promise<false>(resolve => { timer = setTimeout(() => resolve(false), 30_000); });
-    const answer = await Promise.race([ctx.ui.confirm("Authorise directive", `${singleLine(text)}\nsource: ${source}`, { timeout: 30_000 }), timeout]);
+    const answer = await Promise.race([ctx.ui.confirm("Authorise memory item", `${singleLine(text)}\nsource: ${source}`, { timeout: 30_000 }), timeout]);
     return answer === true && ctx.mode === "tui";
   } catch { return false; }
   finally { clearTimeout(timer); }
@@ -46,12 +46,12 @@ async function proposed(runtime: IntentServices, ctx: ExtensionCommandContext, i
 }
 async function authorise(runtime: IntentServices, ctx: ExtensionCommandContext, verb: string, id: string): Promise<WriteResult> {
   const item = await proposed(runtime, ctx, id), store = await runtime.store(ctx);
-  if (verb === "confirm") requireValid(store.getMessage(item.source.ref!)?.origin === "human", "not_human");
+  if (verb === "confirm" && item.kind === "directive") requireValid(store.getMessage(item.source.ref!)?.origin === "human", "not_human");
   requireValid(await confirmed(ctx, item.text, item.source.ref ?? id), "refused: interactive TUI confirmation required, cancelled or unavailable");
   requireValid(runtime.enabled(ctx), MEMORY_DISABLED);
   const actor = runtime.actor(ctx, true);
   if (verb === "confirm") return store.confirm(id, actor);
-  const entry = journal(ctx, `/memory reject ${id}\n${item.text}`, newId(), Date.parse(item.at));
+  const entry = journal(ctx, `/memory reject ${id}`, newId(), Date.parse(item.at));
   store.appendMessage(entry);
   return store.retireItem(id, "rejected", "Rejected by user", { type: "user_message", ref: entry.id }, actor);
 }

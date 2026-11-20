@@ -284,7 +284,7 @@ An explicitly constructed store uses `<agentDir>/memory/` (default `~/.pi/agent/
 
 Records carry CRC32 of their JSON body without `crc`. Each append is one write of `"\n" + json + "\n"`, followed by `fsync` before reporting success, so a torn tail cannot consume the next record. Readers ignore blank, incomplete, unparsable and CRC-bad lines without rewriting; `health()` reports blank, torn-tail, corrupt and rejected-event counts. Events are folded by byte position, not UUID order. Writes pre-validate, append, re-fold and report `applied`, `rejected`, or `conflict` with the winning event id.
 
-Directive authority is checked again at fold time against journal provenance. Without an injected `EligibilityCheck`, automatic directives remain proposed; a valid human `/directive ` source or human UI confirmation can activate them. Orders require an explicit coordinator allowlist. `readFolded()`, paging and the capability-labelled core conformance suite provide the seam for later projections and alternative backends.
+Directive authority is checked again at fold time against journal provenance. Without an injected `EligibilityCheck`, automatic directives remain proposed; a valid human `/directive ` source or human UI confirmation can activate them. Orders remain proposed until a human TUI confirmation; sender labels are descriptive, not authenticated. `readFolded()`, paging and the capability-labelled core conformance suite provide the seam for later projections and alternative backends.
 
 ## Intent-memory projection (inert)
 
@@ -374,18 +374,18 @@ The origin gate runs inside the extension's `input` handler, so it sees the text
 
 `memory.intent: true` registers `memory_add`, `memory_retire`, `memory_classify` and `memory_list` for an in-scope main session. Set `memory.journal: true` to capture source messages for citation. No intent tools or commands register when disabled or in subagents; enabling after load requires a restart. Disabling live makes every registered intent tool return `memory disabled`. Defaults are unchanged.
 
-Directive additions cite a journal id and exact character span. Rule version 1 auto-authorises only human spans of at most 600 characters outside fenced/quoted/indented code, JSON/log-looking regions and the middle of a paste over 4 KiB (only the first/last 1 KiB can qualify). Log detection conservatively checks five neighboring lines for timestamps, stack frames, JSON keys/braces or lines with two `key=value` fields; at least half looking structured makes the span ineligible. Other readable human or unattended/launch spans stay **proposed, not binding**; injected messages cannot become user directives. Orders must cite an injected coordinator message from a configured `memory.coordinators` sender. The store rechecks provenance, quotes and authority on fold; model-supplied actor/origin/authority fields are ignored.
+Directive additions cite a journal id and exact character span. Rule version 1 auto-authorises only human spans of at most 600 characters outside fenced/quoted/indented code, JSON/log-looking regions and the middle of a paste over 4 KiB (only the first/last 1 KiB can qualify). Log detection conservatively checks five neighboring lines for timestamps, stack frames, JSON keys/braces or lines with two `key=value` fields; at least half looking structured makes the span ineligible. Other readable human or unattended/launch spans stay **proposed, not binding**; injected messages cannot become user directives. Orders cite injected messages but always remain proposed until a human confirms them through `/memory confirm <id>` in the TUI. `memory.coordinators` is parsed but reserved until an authenticated transport exists; sender labels never grant authority. `memory.trustRpc` is also reserved and does not affect origin classification or authority. The store rechecks provenance, quotes and authority on fold; model-supplied actor/origin/authority fields are ignored. Command-generated journal entries are not automatic directive sources except for the complete `/directive` text; rejection journals only the command and item id.
 
 Human commands:
 
 - `/directive <text>` journals and records a session-scoped directive.
-- `/memory confirm <id>` activates a proposed directive from a human source.
+- `/memory confirm <id>` activates a proposed order, or a proposed directive from a human source.
 - `/memory reject <id>` rejects only a proposed directive (never an active item).
 - `/memory list [id]` reads items without raising authority; `memory_list` supports filters and cursor paging.
 
 Directives, confirmation and rejection **require an affirmative interactive TUI dialog showing the directive and source id**, even if command text came from an extension. RPC/print modes, cancellation, a missing UI, exceptions and a 30-second timeout refuse without authorising anything. No model tool can confirm or reject. An unattended/launch source cannot be promoted by confirmation; use `/directive` to make a new, explicitly human-authorised instruction instead.
 
-At mandatory handoff, intent-enabled main sessions may make at most 12 recovery calls per window across these four tools and `recall`. Those calls preserve stored/pending handoffs and do not consume `.ai-work` grace; call 13 blocks and instructs `context_handoff`. Other tools retain the existing handoff policy. The budget resets after compaction; settle steering reminds the agent to classify unresolved messages before handing off.
+At mandatory handoff, intent-enabled main sessions may make at most 12 recovery calls per window across these four tools and `recall`. Those calls preserve stored/pending handoffs and do not consume `.ai-work` grace; call 13 blocks and instructs `context_handoff`. Other tools retain the existing handoff policy. The budget resets after compaction; non-idle recovery steering reminds the agent to classify unresolved messages before handing off. Unavailable or degraded handoff paths retain their prior behavior without a memory recovery limit.
 
 ## Related projects
 

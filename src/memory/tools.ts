@@ -36,11 +36,6 @@ async function add(runtime: IntentServices, store: MemoryStoreCore, ctx: Extensi
   if (input.gloss !== undefined) item.gloss = await safeText(runtime, input.gloss);
   if (input.kind === "directive") item.authority = { mode: "auto", ruleVersion: 1 };
   if (input.kind === "decision") item.text = await safeText(runtime, input.text);
-  if (input.kind === "order") {
-    const entry = store.getMessage(source.ref!);
-    requireValid(entry?.origin === "injected", "not_authorised");
-    actor.kind = "coordinator"; actor.id = entry.injectedFrom ?? "unknown";
-  }
   const result = store.addItem(item, actor);
   if (!result.ok) return reply(result, result.reason);
   const folded = store.readFolded().items[item.id]!;
@@ -49,6 +44,7 @@ async function add(runtime: IntentServices, store: MemoryStoreCore, ctx: Extensi
 }
 function itemSource(input: AddInput): Source {
   if (input.kind === "decision") return { type: "agent_decision" };
+  requireValid(input.source?.ref, "no_source");
   return { type: input.kind === "order" ? "coordinator_order" : "user_message", ref: input.source?.ref, span: input.source?.span };
 }
 async function safeText(runtime: IntentServices, text: string): Promise<string> {
@@ -119,6 +115,6 @@ class IntentRuntime implements IntentServices {
     registerTools(this.pi, this); registerIntentCommands(this.pi, this);
     this.registered = true;
   }
-  steer(ctx: ExtensionContext, text: string): string { return recoverySteer({ text, enabled: this.enabled(ctx) }); }
+  steer(ctx: ExtensionContext, text: string, idleOnly = false): string { return recoverySteer({ text, enabled: this.enabled(ctx), idleOnly }); }
 }
 export function createIntentHook(pi: ExtensionAPI, deps: IntentDeps) { return new IntentRuntime(pi, deps); }
