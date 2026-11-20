@@ -1,3 +1,5 @@
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { classifyOrigin, type OriginContext } from "./origin.ts";
 import { flagOn, memoryOff, readMemoryConfig, type MemoryConfig } from "./config.ts";
 import { loadScanner, redact, type Scanner } from "./redact.ts";
@@ -20,7 +22,9 @@ export type JournalHookDeps = {
   onJournaled?: (entry: JournalEntry, ctx: HookContext) => Promise<void>;
   log: (ctx: ExtensionContext, event: string, data?: Record<string, unknown>) => void;
 };
-export type JournalHook = { reload(ctx: HookContext): void; onInput(event: InputEvent, ctx: HookContext): Promise<void>; reset(): void };
+export type JournalHook = { reload(ctx: HookContext): void; onInput(event: InputEvent, ctx: HookContext): Promise<void>; reset(): void;
+  /** Daily bounded journal prune; inert unless the journal is on for this session. Never throws. */
+  retention(ctx: HookContext): Promise<void> };
 
 /** Metadata is attacker-influenced text too: redact it, and omit it when redaction fails. */
 function injectedFrom(value: string | undefined, scanner: Scanner | undefined): { injectedFrom?: string } {
@@ -69,8 +73,28 @@ export function createJournalHook(deps: JournalHookDeps): JournalHook {
     reasons = joined;
     if (joined) deps.log(ctx as ExtensionContext, "memory_config_invalid", { reasons: parsed.reasons, memory: "off" });
   }
+  /** Same fold options as the intent store, so liveness is judged exactly as the product sees it. */
+  async function prune(ctx: HookContext): Promise<void> {
+    const name = ctx.sessionManager.getSessionName?.();
+    if (!flagOn(memory, name, "journal")) return;
+    const [{ FileMemoryStore, memoryHome }, { eligibilityCheck }, { retentionPass }] =
+      await Promise.all([import("./store.ts"), import("./authorize.ts"), import("./retention.ts")]);
+    const home = memoryHome({ agentDir: deps.agentDir });
+    if (!existsSync(join(home, "journal"))) return; // Nothing to prune; never create the store just for this.
+    const store = new FileMemoryStore({ home, eligibilityCheck, coordinators: memory.coordinators });
+    const result = retentionPass({ home, state: () => store.readFolded(), requestsOn: flagOn(memory, name, "requests"),
+      days: memory.retentionDays, currentSessionId: ctx.sessionManager.getSessionId() });
+    if (result) deps.log(ctx as ExtensionContext, "journal_pruned", { examined: result.examined, removed: result.removed,
+      kept: result.kept, protected: result.protectedCount, errors: result.errors, capped: result.capped });
+  }
   return {
     reload,
+    async retention(ctx) {
+      try { reload(ctx); await prune(ctx); }
+      catch (error) {
+        try { deps.log(ctx as ExtensionContext, "journal_error", { error: brief(error) }); } catch { /* Logging must not escape either. */ }
+      }
+    },
     reset: () => { firstInput = true; },
     async onInput(event, ctx) {
       const position = firstInput;

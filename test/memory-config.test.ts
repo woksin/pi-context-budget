@@ -6,12 +6,12 @@ import { join } from "node:path";
 import { anyToolFlag, flagOn, inScope, memoryOff, parseMemoryConfig, readMemoryConfig, registerMemoryTool, MEMORY_DISABLED } from "../src/memory/config.ts";
 
 const ALL = { journal: true, requests: true, answers: "final", answerPolicy: "carry", intent: true, resume: true, recall: true,
-  scope: { mode: "all" }, coordinators: ["L0"], trustRpc: true };
+  scope: { mode: "all" }, coordinators: ["L0"], trustRpc: true, retentionDays: 30 };
 
 test("shipped defaults: every memory flag is false; missing and non-object blocks are all off", () => {
   const defaults = { journal: false, requests: false, answers: false, answerPolicy: false,
     intent: false, resume: false, recall: false, trustRpc: false,
-    scope: { mode: "only", names: [] }, coordinators: [] };
+    scope: { mode: "only", names: [] }, coordinators: [], retentionDays: 30 };
   assert.deepEqual(parseMemoryConfig({}).config, defaults);
   assert.deepEqual(parseMemoryConfig({ memory: {} }).config, defaults);
   for (const root of [{}, undefined, null, [], "memory", 7, { memory: null }, { memory: [] }, { memory: "on" }, { memory: true }]) {

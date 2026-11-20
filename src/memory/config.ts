@@ -5,14 +5,17 @@ export type MemoryConfig = {
   journal: boolean; requests: boolean; answers: "final" | "all" | false; answerPolicy: "carry" | "defer" | false;
   intent: boolean; resume: boolean; recall: boolean;
   scope: { mode: "only" | "all"; names: string[] }; coordinators: string[]; trustRpc: boolean;
+  /** Journal files older than this many days (by mtime) are pruned unless a live item needs them. */
+  retentionDays: number;
 };
+export const DEFAULT_RETENTION_DAYS = 30;
 export type MemoryFlag = "journal" | "requests" | "intent" | "resume" | "recall";
 export type ParsedMemoryConfig = { config: MemoryConfig; reasons: string[] };
 /** Flags that register model-visible tools; only these decide whether the tool list changes at load. */
 export const TOOL_FLAGS = ["intent", "recall"] as const satisfies readonly MemoryFlag[];
 
 export const memoryOff = (): MemoryConfig => ({ journal: false, requests: false, answers: false, answerPolicy: false,
-  intent: false, resume: false, recall: false, scope: { mode: "only", names: [] }, coordinators: [], trustRpc: false });
+  intent: false, resume: false, recall: false, scope: { mode: "only", names: [] }, coordinators: [], trustRpc: false, retentionDays: DEFAULT_RETENTION_DAYS });
 
 const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
 const strings = (value: unknown): value is string[] => Array.isArray(value) && value.every(item => typeof item === "string" && item.length > 0);
@@ -40,6 +43,22 @@ function scope(raw: unknown, reasons: string[]): MemoryConfig["scope"] {
   return { mode: "only", names: [] };
 }
 
+const isDays = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 1 && (value as number) <= 3650;
+function retentionDays(raw: Record<string, unknown>, reasons: string[]): number {
+  const value = raw.retentionDays;
+  if (value === undefined) return DEFAULT_RETENTION_DAYS;
+  if (isDays(value)) return value;
+  reasons.push("memory.retentionDays must be an integer from 1 to 3650");
+  return DEFAULT_RETENTION_DAYS;
+}
+
+function coordinators(raw: Record<string, unknown>, reasons: string[]): string[] {
+  if (raw.coordinators === undefined) return [];
+  if (strings(raw.coordinators)) return [...raw.coordinators];
+  reasons.push("memory.coordinators must be an array of non-empty strings");
+  return [];
+}
+
 /** Pure and total: never throws, never grants anything the input did not spell out. */
 export function parseMemoryConfig(root: unknown): ParsedMemoryConfig {
   const reasons: string[] = [];
@@ -54,11 +73,9 @@ export function parseMemoryConfig(root: unknown): ParsedMemoryConfig {
   config.answerPolicy = literal(raw, "answerPolicy", ["carry", "defer"], reasons);
   for (const key of ["intent", "resume", "recall"] as const) config[key] = flag(raw, key, reasons);
   config.scope = scope(raw.scope, reasons);
-  if (raw.coordinators !== undefined) {
-    if (strings(raw.coordinators)) config.coordinators = [...raw.coordinators];
-    else reasons.push("memory.coordinators must be an array of non-empty strings");
-  }
+  config.coordinators = coordinators(raw, reasons);
   config.trustRpc = flag(raw, "trustRpc", reasons);
+  config.retentionDays = retentionDays(raw, reasons);
   // One invalid value anywhere distrusts the whole block: nothing stays on.
   return { config: reasons.length ? memoryOff() : config, reasons };
 }

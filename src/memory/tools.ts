@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { flagOn, MEMORY_DISABLED, readMemoryConfig } from "./config.ts";
+import { flagOn, MEMORY_DISABLED, readMemoryConfig, type MemoryConfig } from "./config.ts";
 import { eligibilityCheck, recoverySteer } from "./authorize.ts";
 import { registerIntentCommands } from "./commands.ts";
 import { loadScanner, redact } from "./redact.ts";
@@ -18,6 +18,8 @@ export interface IntentServices {
   store(ctx: ExtensionContext): Promise<MemoryStoreCore>;
   actor(ctx: ExtensionContext, human?: boolean): Actor;
   agentDir: string;
+  /** Optional so narrow fakes keep working; absent means memory off. */
+  memoryConfig?(): MemoryConfig;
 }
 const reply = (details: unknown, text = JSON.stringify(details)) => ({ content: [{ type: "text" as const, text }], details });
 const scopeSchema = { type: "object", properties: { kind: { type: "string", enum: ["global", "repo", "lane", "session", "task"] }, key: { type: "string" } }, required: ["kind", "key"] };
@@ -112,6 +114,7 @@ class IntentRuntime implements IntentServices {
     if (!this.loaded || this.deps.host()?.subagent !== false) return false;
     return flagOn(readMemoryConfig(this.deps.configFile).config, ctx.sessionManager.getSessionName?.(), "intent");
   }
+  memoryConfig(): MemoryConfig { return readMemoryConfig(this.deps.configFile).config; }
   actor(ctx: ExtensionContext, human = false): Actor {
     return { kind: human ? "human" : "agent", id: ctx.sessionManager.getSessionId(), harness: "pi" };
   }

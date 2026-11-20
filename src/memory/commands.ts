@@ -4,7 +4,7 @@ import type { FoldedItem, MessageInput, WriteResult } from "./types.ts";
 import { newId } from "./types.ts";
 import { loadScanner, redact } from "./redact.ts";
 import { singleLine } from "./render.ts";
-import { MEMORY_DISABLED } from "./config.ts";
+import { flagOn, memoryOff, MEMORY_DISABLED } from "./config.ts";
 import { laneVisible, listVisibleItems, requireVisibleItems } from "./scope.ts";
 import { requireValid, ValidationError } from "./validate.ts";
 
@@ -57,11 +57,37 @@ async function authorise(runtime: IntentServices, ctx: ExtensionCommandContext, 
   store.appendMessage(entry);
   return store.retireItem(id, "rejected", "Rejected by user", { type: "user_message", ref: entry.id }, actor);
 }
+const PURGE_USAGE = "Use /memory purge [--days N] [--dry-run]";
+const parseDays = (raw: string | undefined): number => {
+  requireValid(raw !== undefined && /^\d{1,4}$/u.test(raw) && Number(raw) >= 1 && Number(raw) <= 3650, PURGE_USAGE);
+  return Number(raw);
+};
+/** Strict: only `--days N` (integer 1..3650) and `--dry-run`, each at most once. */
+export function parsePurgeArgs(args: string[]): { days?: number; dryRun: boolean } {
+  const parsed: { days?: number; dryRun: boolean } = { dryRun: false };
+  for (let index = 0; index < args.length; index++) {
+    const flag = args[index];
+    requireValid((flag === "--dry-run" && !parsed.dryRun) || (flag === "--days" && parsed.days === undefined), PURGE_USAGE);
+    if (flag === "--dry-run") parsed.dryRun = true;
+    else parsed.days = parseDays(args[++index]);
+  }
+  return parsed;
+}
+async function purge(runtime: IntentServices, ctx: ExtensionCommandContext, args: string[]): Promise<string> {
+  const options = parsePurgeArgs(args), config = runtime.memoryConfig?.() ?? memoryOff(), name = ctx.sessionManager.getSessionName?.();
+  requireValid(flagOn(config, name, "journal"), MEMORY_DISABLED);
+  const [{ pruneJournals }, { memoryHome }] = await Promise.all([import("./retention.ts"), import("./store.ts")]);
+  const store = await runtime.store(ctx);
+  const result = pruneJournals({ home: memoryHome({ agentDir: runtime.agentDir }), state: store.readFolded(), requestsOn: flagOn(config, name, "requests"),
+    days: options.days ?? config.retentionDays, currentSessionId: ctx.sessionManager.getSessionId(), dryRun: options.dryRun });
+  const count = options.dryRun ? `would remove ${result.wouldRemove}` : `removed ${result.removed}`;
+  return `purge: ${count}, kept ${result.kept} (protected ${result.protectedCount}), errors ${result.errors}${result.capped ? ", capped: run again to continue" : ""}`;
+}
 function handler(pi: ExtensionAPI, runtime: IntentServices, action: (text: string, ctx: ExtensionCommandContext) => Promise<unknown>) {
   return async (text: string, ctx: ExtensionCommandContext) => {
     try {
       requireValid(runtime.enabled(ctx), MEMORY_DISABLED);
-      const result = await action(text, ctx); tell(pi, ctx, JSON.stringify(result));
+      const result = await action(text, ctx); tell(pi, ctx, typeof result === "string" ? result : JSON.stringify(result));
     } catch (error) {
       tell(pi, ctx, error instanceof ValidationError ? error.message : "memory unavailable");
     }
@@ -70,9 +96,10 @@ function handler(pi: ExtensionAPI, runtime: IntentServices, action: (text: strin
 export function registerIntentCommands(pi: ExtensionAPI, runtime: IntentServices): void {
   pi.registerCommand("directive", { description: "Record a directive after interactive confirmation",
     handler: handler(pi, runtime, (text, ctx) => direct(runtime, text, ctx)) });
-  pi.registerCommand("memory", { description: "confirm|reject <id>, list [id]",
+  pi.registerCommand("memory", { description: "confirm|reject <id>, list [id], purge [--days N] [--dry-run]",
     handler: handler(pi, runtime, async (text, ctx) => {
-      const [verb, id] = text.trim().split(/\s+/u);
+      const [verb, id, ...rest] = text.trim().split(/\s+/u);
+      if (verb === "purge") return purge(runtime, ctx, [...(id ? [id] : []), ...rest]);
       if (verb === "list") {
         const store = await runtime.store(ctx);
         if (id) {

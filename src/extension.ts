@@ -270,7 +270,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
       sequence = Math.max(sequence, state.lastHandoff?.n ?? 0);
       status(ctx);
     }
-    pi.on("session_start", safe((_e, ctx) => { reset(ctx); pruneStatus(stateDir, { currentSessionId: ctx.sessionManager.getSessionId() }); log(ctx, "session_start", { mode: frame(ctx).mode, model: ref(ctx) }); }));
+    pi.on("session_start", safe((_e, ctx) => { reset(ctx); void journal.retention(ctx); pruneStatus(stateDir, { currentSessionId: ctx.sessionManager.getSessionId() }); log(ctx, "session_start", { mode: frame(ctx).mode, model: ref(ctx) }); }));
     pi.on("session_tree", safe((_e, ctx) => reset(ctx)));
     // Context runs after Pi has installed the boundary and before the resumed
     // provider call, including retain-none commits returned from turn_end.

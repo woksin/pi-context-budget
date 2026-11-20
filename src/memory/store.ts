@@ -25,6 +25,9 @@ export interface MemoryStoreCore {
   readFolded(): FoldedState;
 }
 export type StoreOptions = FoldOptions & { agentDir?: string; home?: string; redactor?: Redactor };
+/** Where the store keeps its files; resolving it never touches the disk. */
+export const memoryHome = (options: { home?: string; agentDir?: string }): string =>
+  options.home ?? process.env.PI_MEMORY_HOME ?? join(options.agentDir ?? join(homedir(), ".pi", "agent"), "memory");
 const digest = (text: string) => createHash("sha256").update(text).digest("hex");
 function privateDirectory(directory: string): void {
   mkdirSync(directory, { recursive: true, mode: 0o700 });
@@ -138,7 +141,7 @@ export class FileMemoryStore implements MemoryStoreCore {
   private readonly options: StoreOptions;
   constructor(options: StoreOptions = {}) {
     this.options = options;
-    this.home = options.home ?? process.env.PI_MEMORY_HOME ?? join(options.agentDir ?? join(homedir(), ".pi", "agent"), "memory");
+    this.home = memoryHome(options);
     for (const directory of [this.home, ...["journal", "answers", "blobs"].map(name => join(this.home, name))]) privateDirectory(directory);
   }
   private journalFiles(): string[] {
