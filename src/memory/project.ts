@@ -7,7 +7,7 @@ import { compare, MESSAGE_SECTION, pointerExcerpt, projectionBudgets, renderMemo
 import type { Budgets, IndexRow, MemoryIndex, MessageRow, Projection, RenderRecord } from "./render.ts";
 
 export type { Budgets, Projection } from "./render.ts";
-export type ProjectQuery = { scopes: Scope[]; session: string; sessions?: string[]; taskItemIds?: readonly string[]; reportOtherScopes?: boolean; budgets?: Partial<Budgets> };
+export type ProjectQuery = { scopes: Scope[]; session: string; sessions?: string[]; taskItemIds?: readonly string[]; reportOtherScopes?: boolean; projectedItems?: readonly FoldedItem[]; budgets?: Partial<Budgets> };
 export type ProjectionMessageQuery = MessageQuery & { unresolvedOnly?: boolean };
 export interface MemoryStore extends MemoryStoreCore {
   project(query: ProjectQuery): Projection;
@@ -28,7 +28,8 @@ function scopeMatches(item: FoldedItem, scopes: Scope[]): boolean {
 }
 function sourcePointer(item: FoldedItem): string {
   const source = item.source, span = source.span ? `[${source.span.start}:${source.span.end}]` : "";
-  return source.ref ? `journal:${singleLine(source.ref)}${span}` : `source:${singleLine(source.type)}`;
+  const prefix = source.type === "question_item" ? "question_item" : "journal";
+  return source.ref ? `${prefix}:${singleLine(source.ref)}${span}` : `source:${singleLine(source.type)}`;
 }
 function itemRecord(item: FoldedItem): RenderRecord {
   const scope = `${singleLine(item.scope.kind)}:${singleLine(item.scope.key)}`, pointer = sourcePointer(item);
@@ -78,11 +79,26 @@ function hygieneScopes(items: FoldedItem[]): string[] {
   return [...counts].filter(([, count]) => count > 50).map(([scope]) => scope).sort(compare);
 }
 
+function sourceKey(item: FoldedItem): string | undefined {
+  return item.source.ref ? JSON.stringify([item.source.type, item.source.ref]) : undefined;
+}
+function mergedItems(stored: FoldedItem[], projected: readonly FoldedItem[] = []): FoldedItem[] {
+  const refs = new Set(stored.map(sourceKey).filter(Boolean));
+  const additions = projected.filter(item => {
+    const ref = sourceKey(item);
+    if (ref && refs.has(ref)) return false;
+    if (ref) refs.add(ref);
+    return true;
+  });
+  return [...stored, ...additions];
+}
+
 /** Pure read-side projection; no boundary cursor, writes, extension hooks or pi dependencies. */
 export function project(store: MemoryStoreCore, query: ProjectQuery): Projection {
   const budgets = projectionBudgets(query.budgets), state = store.readFolded(), resolve = spanResolver(state);
   const taskItemIds = new Set(query.taskItemIds);
-  const items = Object.values(state.items).filter(item => scopeMatches(item, query.scopes) || taskItemIds.has(item.id)).sort((a, b) => compare(a.id, b.id));
+  const allItems = mergedItems(Object.values(state.items), query.projectedItems);
+  const items = allItems.filter(item => scopeMatches(item, query.scopes) || taskItemIds.has(item.id)).sort((a, b) => compare(a.id, b.id));
   const sessions = [...new Set(query.sessions ?? [query.session])];
   const messages = sessions.flatMap(sessionId => allMessages(store, { sessionId, origin: "human" })
     .filter(entry => entry.session.id === sessionId && entry.origin === "human")).sort((a, b) => compare(a.id, b.id));
@@ -94,7 +110,7 @@ export function project(store: MemoryStoreCore, query: ProjectQuery): Projection
     dispositions: dispositions.filter(row => row.disposition.wholeNone).map(row => ({ messageId: row.entry.id, reason: row.disposition.wholeNone!.reason! })),
     hygiene: hygieneScopes(items) };
   const records = [...items.map(itemRecord), ...dispositions.map(({ entry, disposition }) => messageRecord(entry, disposition))];
-  const otherScopes = query.reportOtherScopes ? Object.keys(state.items).length - items.length : 0;
+  const otherScopes = query.reportOtherScopes ? allItems.length - items.length : 0;
   return renderProjection(records, index, budgets, otherScopes);
 }
 
