@@ -21,13 +21,14 @@ export function closeEvent(requestId: string, answerId: string): RequestCloseEve
 }
 
 /** An agent may abandon only by citing a later human journal entry, never a launch or model decision. */
-function authorisedAbandonment(event: RequestCloseEvent, request: JournalEntry, messages: Map<string, JournalEntry>): boolean {
+type Abandonment = { event: RequestCloseEvent; request: JournalEntry; messages: Map<string, JournalEntry> };
+function authorisedAbandonment({ event, request, messages }: Abandonment): boolean {
   if (event.status !== "abandoned") return false;
   if (event.actor.kind === "human") return true;
   if (event.actor.kind !== "agent" || event.source?.type !== "user_message") return false;
-  return laterHuman(messages.get(event.source.ref ?? ""), request, event);
+  return laterHuman({ source: messages.get(event.source.ref ?? ""), request, event });
 }
-function laterHuman(source: JournalEntry | undefined, request: JournalEntry, event: RequestCloseEvent): boolean {
+function laterHuman({ source, request, event }: { source: JournalEntry | undefined; request: JournalEntry; event: RequestCloseEvent }): boolean {
   if (source?.origin !== "human") return false;
   return Date.parse(source.at) > Date.parse(request.at) && Date.parse(source.at) <= Date.parse(event.at);
 }
@@ -54,10 +55,11 @@ export function validateRequestEvent(event: BoundaryEvent | RequestCloseEvent, m
   }
   const request = messages.get(event.requestId);
   requireValid(request && isRequest(request), "no_source");
-  requireValid(isHarnessAnswer(event) || authorisedAbandonment(event, request, messages), "not_authorised");
+  requireValid(isHarnessAnswer(event) || authorisedAbandonment({ event, request, messages }), "not_authorised");
 }
 
-function readJournal(home: string, sessionId: string): JournalEntry[] {
+type Session = { home: string; sessionId: string };
+function readJournal({ home, sessionId }: Session): JournalEntry[] {
   const seen = new Set<string>(), entries: JournalEntry[] = [];
   for (const { record } of scanLog(join(home, "journal", `${sessionId}.jsonl`), JOURNAL_LINE_BYTES).records) {
     const entry = record as JournalEntry;
@@ -66,7 +68,7 @@ function readJournal(home: string, sessionId: string): JournalEntry[] {
   }
   return entries;
 }
-function validEvents(home: string, messages: Map<string, JournalEntry>): Array<BoundaryEvent | RequestCloseEvent> {
+function validEvents({ home, messages }: { home: string; messages: Map<string, JournalEntry> }): Array<BoundaryEvent | RequestCloseEvent> {
   const events: Array<BoundaryEvent | RequestCloseEvent> = [], seen = new Set<string>();
   for (const { record } of scanLog(eventsFile(home)).records) {
     const event = record as BoundaryEvent | RequestCloseEvent;
@@ -78,8 +80,8 @@ function validEvents(home: string, messages: Map<string, JournalEntry>): Array<B
 }
 function isBoundary(event: BoundaryEvent | RequestCloseEvent): event is BoundaryEvent { return event.type === "boundary"; }
 function isClosure(event: BoundaryEvent | RequestCloseEvent): event is RequestCloseEvent { return event.type === "request_close"; }
-function readEvents(home: string, sessionId: string, messages: Map<string, JournalEntry>) {
-  const events = validEvents(home, messages);
+function readEvents({ home, sessionId, messages }: Session & { messages: Map<string, JournalEntry> }) {
+  const events = validEvents({ home, messages });
   const boundaries = events.filter(isBoundary).filter(event => event.session.id === sessionId);
   const closed = new Map<string, RequestCloseEvent>();
   for (const event of events.filter(isClosure)) {
@@ -87,7 +89,7 @@ function readEvents(home: string, sessionId: string, messages: Map<string, Journ
   }
   return { boundaries, closed };
 }
-function answered(home: string, answers: AnswerRecord[]): Map<string, string[]> {
+function answered({ home, answers }: { home: string; answers: AnswerRecord[] }): Map<string, string[]> {
   const byRequest = new Map<string, string[]>();
   for (const answer of answers) {
     const ids = answerRequestIds(home, answer);
@@ -98,9 +100,9 @@ function answered(home: string, answers: AnswerRecord[]): Map<string, string[]> 
 
 /** Everything derives from the files: a restarted process or a console tailing them sees the same state. Never writes. */
 export function readSessionState(home: string, sessionId: string): SessionState {
-  const entries = readJournal(home, sessionId), messages = new Map(entries.map(entry => [entry.id, entry]));
-  const { boundaries, closed } = readEvents(home, sessionId, messages), answers = readAnswers(home, sessionId);
-  const resolved = boundaries.map(event => resolveBoundary(home, event)), answerIds = answered(home, answers);
+  const entries = readJournal({ home, sessionId }), messages = new Map(entries.map(entry => [entry.id, entry]));
+  const { boundaries, closed } = readEvents({ home, sessionId, messages }), answers = readAnswers(home, sessionId);
+  const resolved = boundaries.map(event => resolveBoundary(home, event)), answerIds = answered({ home, answers });
   const requests = entries.filter(isRequest).map((entry): RequestInfo => {
     const interruptions = resolved.filter(b => "ids" in b.open && b.open.ids.includes(entry.id));
     return { id: entry.id, at: entry.at, origin: entry.origin, text: entry.text, withheld: entry.withheld,
