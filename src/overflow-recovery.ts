@@ -32,6 +32,7 @@ export class OverflowRecovery {
   private attempted = false;
   private native = false;
   private mechanical = false;
+  private inFlight = false;
   private episode = 0;
   private sessionId = "";
   private shutDown = false;
@@ -99,13 +100,16 @@ export class OverflowRecovery {
     this.adapter.log(ctx, "overflow_compact_start", { mode: this.adapter.frame(ctx).mode });
     await this.compact(ctx, episode);
   }
+  /** True while a package-initiated overflow compaction runs (its session_compact hook fires before the callback). */
+  get packageCompacting(): boolean { return this.inFlight; }
   private compact(ctx: ExtensionContext, episode: OverflowEpisode): Promise<void> {
-    return new Promise(done => {
+    this.inFlight = true;
+    return new Promise<void>(done => {
       const onComplete = () => { this.complete(ctx, episode); done(); };
       const onError = (error: Error) => { void this.failed(ctx, episode, error).finally(done); };
       try { ctx.compact({ onComplete, onError }); }
       catch (error) { onError(error instanceof Error ? error : new Error(String(error))); }
-    });
+    }).finally(() => { this.inFlight = false; });
   }
   private complete(ctx: ExtensionContext, episode: OverflowEpisode): void {
     if (!this.current(ctx, episode)) return;

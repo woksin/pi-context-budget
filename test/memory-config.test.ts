@@ -17,7 +17,7 @@ test("missing block, non-object roots and non-object blocks are all off", () => 
 });
 
 test("a missing flag is false; an invalid value is false with a reason", () => {
-  const { config, reasons } = parseMemoryConfig({ memory: { journal: true, recall: "yes", intent: 1, resume: null, answers: "all", answerPolicy: 1, trustRpc: "true",
+  const { config, reasons } = parseMemoryConfig({ memory: { journal: true, recall: "yes", intent: 1, resume: null, answers: "bogus", answerPolicy: 1, trustRpc: "true",
     coordinators: "L0", scope: { mode: "everyone" } } });
   assert.deepEqual(config, memoryOff()); // one bad value turns everything off, including the valid journal flag
   assert.deepEqual([config.recall, config.intent, config.resume, config.answers, config.answerPolicy, config.trustRpc], [false, false, false, false, false, false]);
@@ -118,7 +118,7 @@ test("enabling a flag after load does not add the tool (restart required); a thr
 });
 
 test("one invalid value anywhere turns the whole block off, even with journal on and scope all", () => {
-  for (const bad of [{ recall: "bad" }, { intent: 1 }, { answers: "all" }, { coordinators: [""] }, { scope: { mode: "x" } }, { requests: true, journal: false }]) {
+  for (const bad of [{ recall: "bad" }, { intent: 1 }, { answers: "bogus" }, { coordinators: [""] }, { scope: { mode: "x" } }, { requests: true, journal: false }]) {
     const { config, reasons } = parseMemoryConfig({ memory: { journal: true, scope: { mode: "all" }, ...bad } });
     assert.deepEqual(config, memoryOff(), JSON.stringify(bad));
     assert.ok(reasons.length > 0);
@@ -135,4 +135,10 @@ test("reasons are fixed codes: file contents and exception text never appear", (
     const odd = parseMemoryConfig({ memory: { recall: secret, scope: { mode: secret }, coordinators: [secret, 1] } });
     assert.ok(!JSON.stringify(odd.reasons).includes(secret));
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("memory.answers accepts final and all only", () => {
+  assert.equal(parseMemoryConfig({ memory: { answers: "all" } }).config.answers, "all");
+  assert.equal(parseMemoryConfig({ memory: { answers: "final" } }).config.answers, "final");
+  assert.ok(parseMemoryConfig({ memory: { answers: "none" } }).reasons.some(reason => reason.includes("answers")));
 });

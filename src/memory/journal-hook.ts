@@ -14,6 +14,10 @@ export type JournalHookDeps = {
   agentDir: string;
   configFile: string;
   host: () => HostFacts | undefined;
+  /** Verified launch facts from argv/TTY (launch.ts); trusted host facts win. */
+  launchFacts?: () => HostFacts["launch"];
+  /** Called after a journal entry is durable; must not throw. */
+  onJournaled?: (entry: JournalEntry, ctx: HookContext) => Promise<void>;
   log: (ctx: ExtensionContext, event: string, data?: Record<string, unknown>) => void;
 };
 export type JournalHook = { reload(ctx: HookContext): void; onInput(event: InputEvent, ctx: HookContext): Promise<void>; reset(): void };
@@ -31,13 +35,14 @@ export function createJournalHook(deps: JournalHookDeps): JournalHook {
   let memory: MemoryConfig = memoryOff(), reasons = "";
   let firstInput = true, scanner: Promise<Scanner | undefined> | undefined, store: Promise<FileMemoryStore> | undefined;
   const scanners = () => scanner ??= loadScanner(deps.agentDir);
+  const onJournaled = deps.onJournaled ?? (async () => {});
   const stores = () => store ??= import("./store.ts").then(({ FileMemoryStore }) => new FileMemoryStore({ agentDir: deps.agentDir }));
 
   function originContext(ctx: HookContext, position: boolean): OriginContext {
-    const facts = deps.host(), id = ctx.sessionManager.getSessionId();
+    const facts = deps.host(), id = ctx.sessionManager.getSessionId(), launch = facts?.launch ?? deps.launchFacts?.();
     return { hasUI: ctx.hasUI, hostSubagent: facts?.subagent, firstInput: position,
       identity: facts?.primarySessionId ? { sessionId: id, primarySessionId: facts.primarySessionId } : undefined,
-      initialPrompt: facts?.launch?.initialPrompt, relaunchPrompt: facts?.launch?.relaunchPrompt };
+      initialPrompt: launch?.initialPrompt, relaunchPrompt: launch?.relaunchPrompt };
   }
   async function journal(event: InputEvent, ctx: HookContext, position: boolean): Promise<void> {
     const name = ctx.sessionManager.getSessionName?.();
@@ -52,7 +57,8 @@ export function createJournalHook(deps: JournalHookDeps): JournalHook {
       ...(decision.injectedKind ? { injectedKind: decision.injectedKind } : {}),
       ...injectedFrom(decision.injectedFrom, scanner), ...body,
     };
-    (await stores()).appendMessage(entry);
+    const stored = (await stores()).appendMessage(entry);
+    await onJournaled(stored, ctx);
   }
   /** Fixed reason codes only; config excerpts and exception text never reach the log. */
   function reload(ctx: HookContext): void {

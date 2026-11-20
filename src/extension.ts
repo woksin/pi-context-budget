@@ -12,7 +12,8 @@ import { OverflowRecovery } from "./overflow-recovery.ts";
 import { graceEligible } from "./grace.ts";
 import { resumeCommand, runResumeCheck } from "./resume-check.ts";
 import { appendEvent, atomicJson, collectRepos, handoffHead, issueClaims, runningState, writeHandoff, writeLaunchPrompt, writeMarker, processSessionHosts, pendingQuestions, watchCheck, pruneStatus, type SessionHosts } from "./storage.ts";
-import { createJournalHook } from "./memory/journal-hook.ts";
+import { bindRequests, createRequestsHook, wire } from "./memory/requests-hook.ts";
+import { processLaunchFacts, type LaunchFacts } from "./memory/launch.ts";
 import { bytePrefix, chainIdentity, emergencyHandoff, emergencySummary, previousHandoff, primaryHead, userMessagesSince } from "./collect.ts";
 
 type ActionResult = BoundaryResult & ToolCallEventResult & SessionBeforeCompactResult;
@@ -20,11 +21,16 @@ type StatusState = "active" | "ended";
 function statusIdentity(host: ReturnType<SessionHosts["acquire"]> | undefined, state: StatusState = "active") {
   return { primarySessionId: host?.primarySessionId, state };
 }
+function discardUncommittedHandoff(ctx: ExtensionContext, snapshot: { state: ReturnType<typeof initialState>; enforced: boolean }, log: (ctx: ExtensionContext, event: string, data: Record<string, unknown>) => void): void {
+  const held = snapshot.state.pending ?? snapshot.state.stored;
+  if (!snapshot.enforced || !held) return;
+  if (held.path !== snapshot.state.committedPath) log(ctx, "handoff_discarded", { path: held.path, reason: "session shutdown before commit" });
+}
 export default async function (pi: ExtensionAPI) {
   const { getAgentDir } = await import("@earendil-works/pi-coding-agent");
   return createContextBudgetExtension({ agentDir: getAgentDir() })(pi);
 }
-export function createContextBudgetExtension({ agentDir, hosts = processSessionHosts() }: { agentDir: string; hosts?: SessionHosts }) {
+export function createContextBudgetExtension({ agentDir, hosts = processSessionHosts(), launchFacts = processLaunchFacts }: { agentDir: string; hosts?: SessionHosts; launchFacts?: () => LaunchFacts }) {
   return async function contextBudgetExtension(pi: ExtensionAPI) {
     const stateDir = resolve(process.env.PI_CONTEXT_BUDGET_STATE_DIR || join(agentDir, "context-budget"));
     const configFile = resolve(process.env.PI_CONTEXT_BUDGET_CONFIG || join(agentDir, "context-budget.json"));
@@ -44,9 +50,11 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
       try { appendEvent(stateDir, { at: new Date().toISOString(), pid: process.pid, sessionId: ctx.sessionManager.getSessionId(), event, ...data }); }
       catch (error) { console.error(`context-budget: event log unavailable: ${String(error)}`); }
     }
-    const journal = createJournalHook({ agentDir, configFile, log, host: () => host });
+    const memoryDeps = { agentDir, configFile, log, host: () => host };
+    const requests = createRequestsHook(memoryDeps);
+    const journal = wire(requests, { ...memoryDeps, launchFacts });
     function reload(ctx: ExtensionContext): void {
-      journal.reload(ctx);
+      journal.reload(ctx); requests.reload();
       try { config = parseConfig(existsSync(configFile) ? JSON.parse(readFileSync(configFile, "utf8")) : {}); }
       catch (error) { config = parseConfig({}); log(ctx, "config_error", { error: error instanceof SyntaxError ? "invalid_json" : "unreadable", mode: "observe" }); }
     }
@@ -190,6 +198,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
               ? "Pending background work remains and context is large. Call context_handoff now while the cache is warm, then end this turn. The context resets at the end of this turn."
               : "Context recovery is required. Call context_handoff with goal, next_step, verified facts and verbatim user_constraints, then end this turn without further tools." }], continue: true }; break;
           case "commit":
+            await requests.commit(ctx, effect.handoff.path, effect.source === "idle");
             log(ctx, "handoff_committed", { path: effect.handoff.path, n: effect.handoff.n, count: state.count, source: effect.source });
             result = { entries: [{ type: "compaction", summary: effect.handoff.text, firstKeptEntryId: null,
               details: { kind: "handoff", path: effect.handoff.path, n: effect.handoff.n, source: effect.source } }], continue: true }; break;
@@ -200,6 +209,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
             const lint = emergency ? validateObserved(ctx, emergency, runningState([...knownIds], { cwd: ctx.cwd, sessionId: ctx.sessionManager.getSessionId() }), false).lint : [];
             const summary = `${h?.text ?? emergencySummary(emergency!)}${lint.length ? `\n## Handoff lint\n${bytePrefix(lint.join("\n"), 1024)}` : ""}\nCompaction instance: ${randomUUID()}\n`;
             log(ctx, "backstop", { path: h?.path, reason: "machine-authorized" });
+            requests.expectBackstop({ kind: backstopKind(effect.source, !!h, ctx), handoffPath: h?.path });
             result = { compaction: { summary, firstKeptEntryId: null as unknown as string, tokensBefore: effect.tokensBefore,
               details: { kind: "handoff", path: h?.path, n: h?.n, source: effect.source } } }; break;
           }
@@ -216,6 +226,8 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
       }
       return result;
     }
+    const backstopKind = (source: string, handoff: boolean, ctx: ExtensionContext) => source === "idle" ? "idle" as const : handoff ? "handoff" as const
+      : state.tokens !== null && state.tokens >= frame(ctx).thresholds.hard ? "hard" as const : "emergency" as const;
     async function run(event: MachineEvent, ctx: ExtensionContext) {
       const result = await execute(step(event, ctx), ctx);
       // Mode feedback stays live without publishing native-compaction previews
@@ -228,7 +240,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
     };
     function reset(ctx: ExtensionContext): void {
       host?.release(); host = hosts.acquire(ctx.sessionManager.getSessionId());
-      reload(ctx); journal.reset(); overflow.reset(ctx); knownIds.clear(); handoffRejections = 0; resumeBoundary = resumeMessage = mismatchLogged = undefined;
+      reload(ctx); journal.reset(); requests.reset(); overflow.reset(ctx); knownIds.clear(); handoffRejections = 0; resumeBoundary = resumeMessage = mismatchLogged = undefined;
       const history: HistoryItem[] = ctx.sessionManager.getBranch().flatMap((e): HistoryItem[] => {
         if (e.type === "compaction") {
           const details = e.details as { kind?: string; source?: string } | undefined;
@@ -270,7 +282,8 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
       const message = [resumeMessage, watchMessage].filter(Boolean).join("\n\n");
       if (message) return { messages: [...event.messages, { role: "custom" as const, customType: "context-budget-resume-check", content: message, display: false, timestamp: Date.now() }] };
     }));
-    pi.on("agent_start", safe(async (_e, ctx) => { await run({ type: "agent_start" }, ctx); }));
+    const pendingWork = (ctx: ExtensionContext) => { const r = runningState([...knownIds], { cwd: ctx.cwd, sessionId: ctx.sessionManager.getSessionId() }); return !!(r.jobs.length || r.subagents.length); };
+    bindRequests(pi, requests, { safe, run, overflow, pendingWork, status, compactionOwned: () => !!state.compaction });
     pi.on("before_agent_start", safe(async (_e, ctx) => { await run({ type: "before_agent_start" }, ctx); }));
     pi.registerTool({
       name: "context_handoff", label: "Context handoff",
@@ -336,9 +349,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
       const result = await overflow.turn(e, ctx);
       log(ctx, "turn", { tokens: state.tokens, floor: state.floor, phase: state.phase }); status(ctx); return result;
     }));
-    const pendingWork = (ctx: ExtensionContext) => { const r = runningState([...knownIds], { cwd: ctx.cwd, sessionId: ctx.sessionManager.getSessionId() }); return !!(r.jobs.length || r.subagents.length); };
     pi.on("agent_before_settle", safe((_e, ctx) => run({ type: "agent_before_settle", pendingWork: pendingWork(ctx) }, ctx)));
-    pi.on("agent_settled", safe(async (e, ctx) => { await run({ type: "agent_settled", now: Date.now(), aborted: e.aborted, pendingWork: pendingWork(ctx) }, ctx); await overflow.settled(ctx, e.aborted); }));
     pi.on("input", safe(async (e, ctx) => {
       reload(ctx); await journal.onInput(e, ctx); overflow.input(e.source);
       await run({ type: "input", now: Date.now(), streaming: !!e.streamingBehavior, alreadyCompacted: ctx.sessionManager.getBranch().at(-1)?.type === "compaction" }, ctx);
@@ -354,13 +365,8 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
         } catch { return undefined; } // A torn-down runtime cannot execute any policy output.
       }
     }));
-    pi.on("session_compact", safe(async (e, ctx) => {
-      overflow.nativeCompaction(ctx, e.reason); await run({ type: "session_compact", owned: !!state.compaction && e.fromExtension }, ctx); status(ctx);
-    }));
-    pi.on("session_compact_failed", safe(async (e, ctx) => { overflow.nativeCompaction(ctx, e.reason); await run(e, ctx); }));
     pi.on("session_shutdown", safe((_e, ctx) => {
-      const held = state.pending ?? state.stored;
-      if (mode(ctx) === "enforce" && held && held.path !== state.committedPath) log(ctx, "handoff_discarded", { path: held.path, reason: "session shutdown before commit" });
+      discardUncommittedHandoff(ctx, { state, enforced: mode(ctx) === "enforce" }, log);
       overflow.shutdown(); status(ctx, "ended"); host?.release(); host = undefined; log(ctx, "session_shutdown"); }));
   };
 }

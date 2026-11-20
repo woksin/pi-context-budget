@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 
 /** Every flag defaults to false: a missing block, missing flag, invalid value or parse error is off. */
 export type MemoryConfig = {
-  journal: boolean; requests: boolean; answers: "final" | false; answerPolicy: "carry" | false;
+  journal: boolean; requests: boolean; answers: "final" | "all" | false; answerPolicy: "carry" | false;
   intent: boolean; resume: boolean; recall: boolean;
   scope: { mode: "only" | "all"; names: string[] }; coordinators: string[]; trustRpc: boolean;
 };
@@ -23,10 +23,12 @@ function flag(raw: Record<string, unknown>, key: MemoryFlag | "trustRpc", reason
   reasons.push(`memory.${key} must be a boolean`);
   return false;
 }
-function literal<T extends string>(raw: Record<string, unknown>, key: string, allowed: T, reasons: string[]): T | false {
-  if (raw[key] === undefined) return false;
-  if (raw[key] === allowed) return allowed;
-  reasons.push(`memory.${key} must be "${allowed}"`);
+function literal<T extends string>(raw: Record<string, unknown>, key: string, allowed: readonly T[], reasons: string[]): T | false {
+  const value = raw[key];
+  if (value === undefined) return false;
+  const match = allowed.find(candidate => candidate === value);
+  if (match) return match;
+  reasons.push(`memory.${key} must be ${allowed.map(candidate => `"${candidate}"`).join(" or ")}`);
   return false;
 }
 function scope(raw: unknown, reasons: string[]): MemoryConfig["scope"] {
@@ -48,8 +50,8 @@ export function parseMemoryConfig(root: unknown): ParsedMemoryConfig {
   config.journal = flag(raw, "journal", reasons);
   config.requests = flag(raw, "requests", reasons);
   if (config.requests && !config.journal) { config.requests = false; reasons.push("memory.requests requires memory.journal"); }
-  config.answers = literal(raw, "answers", "final", reasons);
-  config.answerPolicy = literal(raw, "answerPolicy", "carry", reasons);
+  config.answers = literal(raw, "answers", ["final", "all"], reasons);
+  config.answerPolicy = literal(raw, "answerPolicy", ["carry"], reasons);
   for (const key of ["intent", "resume", "recall"] as const) config[key] = flag(raw, key, reasons);
   config.scope = scope(raw.scope, reasons);
   if (raw.coordinators !== undefined) {
