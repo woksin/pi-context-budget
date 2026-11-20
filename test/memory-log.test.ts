@@ -127,10 +127,14 @@ test("an appended line missing from readback returns an explicit rejection", () 
   assert.ok(result.eventId);
 });
 
+// S3b wires exactly two memory modules into the extension: the pure flag parser and the flag-gated journal hook,
+// which loads the store lazily. Nothing else may import src/memory.
+const WIRED = new Set(["./memory/config.ts", "./memory/journal-hook.ts"]);
 test("inert: no runtime file outside src/memory imports the memory store", () => {
   const root = join(import.meta.dirname, "..");
   const runtime = ["context-budget.ts", ...readdirSync(join(root, "src")).filter(name => name.endsWith(".ts")).map(name => join("src", name))];
   for (const file of runtime) {
-    assert.doesNotMatch(readFileSync(join(root, file), "utf8"), /from\s+["'][^"']*memory\//, file);
+    const imports = [...readFileSync(join(root, file), "utf8").matchAll(/from\s+["']([^"']*memory\/[^"']*)["']/g)].map(match => match[1]);
+    assert.deepEqual(imports.filter(path => !WIRED.has(path)), [], file);
   }
 });
