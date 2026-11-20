@@ -31,12 +31,17 @@ class ScanBudget {
   private files = 0;
   private entries = 0;
   private bytes = 0;
+  private withheld = 0;
   private halted = false;
   private readonly signal?: AbortSignal;
   private readonly notices = new Set<string>();
   constructor(signal?: AbortSignal) { this.signal = signal; }
   note(message: string): void { this.notices.add(`[${message}]\n`); }
-  notes(): string { return [...this.notices].join(""); }
+  withhold(): void { this.withheld++; }
+  notes(): string {
+    if (this.withheld) this.note(`withheld: ${this.withheld} records (redaction failed or too large)`);
+    return [...this.notices].join("");
+  }
   stopped(): boolean {
     if (this.signal?.aborted) this.stop("recall aborted");
     return this.halted;
@@ -273,14 +278,14 @@ function renderField(key: string, value: string, query: string): string {
   const bounded = boundedField(value, key, query);
   return `${key}=${singleLine(bounded)}${bounded === value ? "" : " [truncated]"}`;
 }
-function renderHit(hit: Hit, redactor: (value: string) => Redaction, query: string): string {
+function renderHit(hit: Hit, redactor: (value: string) => Redaction, query: string): string | null {
   try {
     const safeText = redactedField(hit.text, redactor);
     // Matching raw text leaks masked secrets through prefix probes, even if the returned body is safe.
     if (!safeText.toLowerCase().includes(query.toLowerCase())) return "";
     const fields = Object.entries(hit).map(([key, value]) => renderField(key, key === "text" ? safeText : redactedField(value, redactor), query));
     return fields.join(" ") + "\n";
-  } catch { return "[withheld: redactor failed]\n"; }
+  } catch { return null; }
 }
 
 async function* excerpts(search: Search): AsyncGenerator<string> {
@@ -291,7 +296,8 @@ async function* excerpts(search: Search): AsyncGenerator<string> {
     if (candidate.kind === "transcript" && (input.origin ?? "human") !== "any") continue;
     for await (const hit of hits(candidate, search)) {
       const rendered = renderHit(hit, redactor, input.query);
-      if (rendered) yield rendered;
+      if (rendered === null) budget.withhold();
+      else if (rendered) yield rendered;
     }
   }
 }

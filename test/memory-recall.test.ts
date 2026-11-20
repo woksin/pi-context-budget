@@ -4,7 +4,7 @@ import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, 
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { recallHistory, createRecallHook, RECALL_BANNER, FILE_CAP_BYTES, SCAN_FILE_CAP, TOTAL_READ_CAP_BYTES } from "../src/memory/recall.ts";
-import { redact } from "../src/memory/redact.ts";
+import { redact, SCAN_CAP_BYTES } from "../src/memory/redact.ts";
 import { createContextBudgetExtension } from "../src/extension.ts";
 import { SessionHosts } from "../src/storage.ts";
 import { appendRecord } from "../src/memory/log.ts";
@@ -59,6 +59,17 @@ test("secret prefixes cannot probe either redaction pass; safe words on the same
   assert.match(safe, /secret-line/); assert.match(safe, /REDACTED:github-token/); assert.match(safe, /REDACTED:external/);
 });
 
+test("oversized records do not consume hit limits and produce one withheld summary", async () => {
+  const f = fixture();
+  f.transcript(f.sessionFile, "main", [f.entry("oversized", "toolResult", "x".repeat(SCAN_CAP_BYTES + 1)), f.entry("real-match", "toolResult", "needle safe")]);
+  const output = await f.search("needle", { limit: 1 });
+  assert.match(output, /real-match/); assert.match(output, /needle safe/);
+  assert.match(output, /\[withheld: 1 records \(redaction failed or too large\)\]/);
+  assert.equal((output.match(/withheld:/g) ?? []).length, 1);
+  assert.equal((output.match(/id=/g) ?? []).length, 1);
+  assert.doesNotMatch(output, /id="oversized"|recall output\/limit cap/);
+});
+
 test("both scanner passes run, failures withhold only that hit, including its metadata", async () => {
   const f = fixture();
   f.journal("bad", "needle external-value " + canary(), { injectedFrom: canary() }); f.journal("good", "needle safe");
@@ -66,9 +77,10 @@ test("both scanner passes run, failures withhold only that hit, including its me
   const output = await f.search("needle", {}, { scanner });
   assert.match(output, /REDACTED:external/); assert.match(output, /REDACTED:github-token/); assert.ok(!output.includes(canary()));
   const failed = await f.search("needle", {}, { redactor: (text: string) => { if (text.includes("external-value")) throw Error("failure"); return redact(text); } });
-  assert.match(failed, /\[withheld: redactor failed\]/); assert.match(failed, /needle safe/); assert.ok(!failed.includes(canary()));
+  assert.match(failed, /\[withheld: 1 records \(redaction failed or too large\)\]/); assert.match(failed, /needle safe/); assert.ok(!failed.includes(canary()));
   const broken = await f.search("needle", {}, { scanner: () => { throw Error("scanner failure"); } });
-  assert.match(broken, /withheld: redactor failed/); assert.doesNotMatch(broken, /external-value|needle safe/);
+  assert.match(broken, /\[withheld: 2 records \(redaction failed or too large\)\]/); assert.doesNotMatch(broken, /external-value|needle safe/);
+  assert.equal((broken.match(/withheld:/g) ?? []).length, 1);
 });
 
 test("output is bounded in UTF-8 and encoded without forged headers, including all metadata", async () => {
