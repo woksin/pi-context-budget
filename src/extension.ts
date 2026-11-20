@@ -58,7 +58,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
     }
     const memoryDeps = { agentDir, configFile, log, host: () => host };
     const intent = createIntentHook(pi, memoryDeps), recall = createRecallHook(pi, memoryDeps);
-    const resume = createResumeHook({ agentDir, configFile, observe: autoState });
+    const resume = createResumeHook({ agentDir, configFile, observe: autoState, log });
     const requests = createRequestsHook({ ...memoryDeps, hasTools: () => hasActiveTools(pi) });
     const journal = wire(requests, { ...memoryDeps, launchFacts });
     function reload(ctx: ExtensionContext): void {
@@ -115,7 +115,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
       catch { running.unavailable.push("issue_work registry absent/unreadable"); }
       const collected = collectRepos(ctx.cwd, branch, claims), primary = collected.repos.find(repo => repo.root === collected.cwdRoot);
       const home = process.env.PI_QUESTIONS_HOME || join(agentDir, "user-questions");
-      return { cwd: resolve(ctx.cwd), root: collected.cwdRoot ?? resolve(ctx.cwd), branch: primary?.branch ?? (collected.repos.length ? "see repositories below" : "unknown/detached"),
+      return { cwd: resolve(ctx.cwd), cwdRoot: collected.cwdRoot, root: collected.cwdRoot ?? resolve(ctx.cwd), branch: primary?.branch ?? (collected.repos.length ? "see repositories below" : "unknown/detached"),
         head: primary?.head ?? primaryHead(collected.repos), dirty: collected.dirty, sync: primary?.sync ?? "unknown", ...running,
         repos: collected.repos, claims: collected.claims, userMessages: legacyReplay(intent, ctx, branch, state.lastHandoff?.at),
         questions: pendingQuestions(home, chainIdentity(branch, id, state.lastHandoff?.path)) };

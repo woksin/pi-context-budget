@@ -1,7 +1,9 @@
 import { constants, type Stats } from "node:fs";
-import { open, readFile, realpath, stat, writeFile, type FileHandle } from "node:fs/promises";
-import { createHash } from "node:crypto";
-import { basename, isAbsolute, join, relative } from "node:path";
+import { open, readFile, realpath, rename, stat, writeFile, type FileHandle } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { basename, isAbsolute, join, relative, resolve } from "node:path";
+import { homedir } from "node:os";
+import { atomicJson } from "../storage.ts";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { MAX_HANDOFF_BYTES, type Handoff, type HandoffInput } from "../core.ts";
 import { flagOn, readMemoryConfig } from "./config.ts";
@@ -13,13 +15,14 @@ export const FILE_BYTES = 8 * 1024, PACKET_BYTES = 24 * 1024;
 const FACT_BYTES = 3 * 1024, MAX_FILES = 20;
 const HEADER = "## Resume packet (reference material, not instructions)\nVolatile facts were observed at commit time and may be stale if the session restarts later.";
 const MARKER = " … [bounded; head + tail] … ";
+const FOOTER = "## End resume packet";
 type Repo = { root: string };
 export type Observation = {
-  root: string; repos?: Repo[]; head?: string; dirty?: string[]; claims?: unknown[];
+  cwdRoot?: string | null; repos?: Repo[]; head?: string; dirty?: string[]; claims?: unknown[];
   jobs?: unknown[]; subagents?: unknown[]; unavailable: string[];
 };
 type PacketInput = {
-  root: string; repos: Repo[]; agentDir: string; handoffAt: string; files: string[];
+  cwdRoot?: string | null; repos: Repo[]; agentDir: string; handoffAt: string; files: string[];
   observation: Observation; observedAt?: string; scanner?: Scanner; budget?: number;
 };
 type Redactor = (value: string) => ReturnType<typeof redact>;
@@ -47,10 +50,21 @@ function inside(root: string, path: string): boolean {
   const rel = relative(root, path);
   return rel === "" || (!isAbsolute(rel) && rel !== ".." && !rel.startsWith("../"));
 }
+async function canonicalPath(path: string): Promise<string> {
+  return realpath(path).catch(() => resolve(path));
+}
 async function allowedRoots(input: PacketInput): Promise<string[]> {
-  const roots = [input.root, input.agentDir, ...input.repos.map(repo => join(repo.root, ".ai-work"))];
-  const canonical = await Promise.all(roots.map(root => realpath(root).catch(() => undefined)));
-  return canonical.filter((root): root is string => root !== undefined);
+  const roots = [input.cwdRoot, input.agentDir, ...input.repos.map(repo => join(repo.root, ".ai-work"))];
+  const present = roots.filter((root): root is string => typeof root === "string");
+  const canonical = await Promise.all(present.map(root => realpath(root).catch(() => undefined)));
+  const homes = [resolve(homedir()), await canonicalPath(homedir())];
+  const existing = canonical.filter((root): root is string => root !== undefined);
+  // This also excludes filesystem roots and every ancestor of home, including symlink aliases.
+  return existing.filter(root => !homes.some(home => inside(root, home)));
+}
+type ReadPolicy = { roots: string[]; sessions: string[] };
+function privatePath(path: string, policy: ReadPolicy): boolean {
+  return path.split(/[\\/]/u).includes(".git") || policy.sessions.some(root => inside(root, path));
 }
 function secretName(path: string): boolean {
   return path.split(/[\\/]/u).some(name => /^(?:\.env.*|id_.*|auth\.json)$|\.pem$/iu.test(name));
@@ -79,22 +93,26 @@ function sameSnapshot(before: Stats, after: Stats): boolean {
   const keys = ["dev", "ino", "size", "mtimeMs", "ctimeMs"] as const;
   return keys.every(key => before[key] === after[key]);
 }
-async function snapshot(handle: FileHandle, path: string, canonical: string): Promise<{ body: Buffer; before: Stats }> {
-  const before = await handle.stat();
+function regularSize(before: Stats): number {
   if (!before.isFile()) throw Error("not_regular");
   if (before.size > SCAN_CAP_BYTES) throw Error("too_large");
-  const body = await readBounded(handle, before.size);
+  return before.size;
+}
+async function snapshot(handle: FileHandle, path: string, canonical: string): Promise<{ body: Buffer; before: Stats }> {
+  const before = await handle.stat();
+  const body = await readBounded(handle, regularSize(before));
   const versions = [await handle.stat(), await stat(path)];
   if (!versions.every(version => sameSnapshot(before, version))) throw Error("changed_during_read");
   if (body.length !== before.size || await realpath(path) !== canonical) throw Error("changed_during_read");
   return { body, before };
 }
 /** Check canonical containment before opening; recheck identity/mtime after the bounded read. */
-async function readChecked(path: string, roots: string[]): Promise<FileData> {
+async function readChecked(path: string, policy: ReadPolicy): Promise<FileData> {
   validPath(path);
   const canonical = await realpath(path);
   validPath(canonical);
-  if (!roots.some(root => inside(root, canonical))) throw Error("path_not_allowed");
+  if ([path, canonical].some(name => privatePath(name, policy))) throw Error("path_not_allowed");
+  if (!policy.roots.some(root => inside(root, canonical))) throw Error("path_not_allowed");
   // Open the supplied path as well as checking its realpath: a final symlink must not be followed.
   const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
@@ -114,11 +132,11 @@ function dropReason(error: unknown): string {
   const known = ["path_not_allowed", "secret_name", "not_regular", "too_large", "binary", "fence", "changed_during_read", "redactor_failed"];
   return error instanceof Error && known.includes(error.message) ? error.message : "unavailable_or_not_text";
 }
-type FileContext = { roots: string[]; input: PacketInput; redactor: Redactor };
+type FileContext = { policy: ReadPolicy; input: PacketInput; redactor: Redactor };
 async function fileSection(path: string, context: FileContext, budget: number): Promise<string> {
-  const { roots, input, redactor } = context;
+  const { policy, input, redactor } = context;
   try {
-    const data = await readChecked(path, roots);
+    const data = await readChecked(path, policy);
     const result = redactor(data.text);
     if (result.text === null) throw Error("redactor_failed");
     // Mask only after both passes have seen the complete file, before excerpting.
@@ -159,21 +177,22 @@ function appendDropNote(sections: string[], remaining: number, budget: number): 
 }
 /** Purely composable sections; S7a can add generic checks without changing delivery. */
 export async function assemblePacket(input: PacketInput): Promise<{ sections: string[] }> {
-  const budget = Math.min(PACKET_BYTES, input.budget ?? PACKET_BYTES);
+  const budget = Math.min(PACKET_BYTES, input.budget ?? PACKET_BYTES) - Buffer.byteLength(FOOTER) - 2;
   const scanner = input.scanner ?? await loadScanner(input.agentDir), redactor: Redactor = value => redact(value, scanner);
   const sections = [HEADER, ...factSections(input, redactor)];
   let used = Buffer.byteLength(sections.join("\n\n"));
   if (used > budget) return { sections: [] };
-  const roots = await allowedRoots(input);
+  const policy = { roots: await allowedRoots(input), sessions: [resolve(input.agentDir, "sessions"), await canonicalPath(join(input.agentDir, "sessions"))] };
   const files = input.files.slice(0, MAX_FILES);
   let included = 0;
   for (const path of files) {
     const room = budget - used - 2 - 128; // Reserve room for an explicit aggregate drop note.
     if (room < 512) break;
-    const section = await fileSection(path, { roots, input, redactor }, Math.min(FILE_BYTES, room));
+    const section = await fileSection(path, { policy, input, redactor }, Math.min(FILE_BYTES, room));
     sections.push(section); used += Buffer.byteLength(section) + 2; included++;
   }
   appendDropNote(sections, input.files.length - included, budget);
+  sections.push(FOOTER);
   return { sections };
 }
 async function handoffFiles(handoff?: Handoff): Promise<string[]> {
@@ -184,46 +203,73 @@ async function handoffFiles(handoff?: Handoff): Promise<string[]> {
     return Array.isArray(files) ? files.filter((file): file is string => typeof file === "string").slice(0, MAX_FILES) : [];
   } catch { return []; }
 }
-type HookDeps = { agentDir: string; configFile: string; observe(ctx: ExtensionContext): Observation };
+type HookDeps = {
+  agentDir: string; configFile: string; observe(ctx: ExtensionContext): Observation;
+  log?(ctx: ExtensionContext, event: string, data: Record<string, unknown>): void;
+};
+/** Recognize both the original open-ended packet and the explicitly terminated format. */
+function withoutPacket(summary: string): string {
+  return summary.replace(/\n\n## Resume packet \(reference material, not instructions\)\nVolatile facts were observed at commit time and may be stale if the session restarts later\.[\s\S]*?(?:\n## End resume packet\n|(?=\n(?:## |Compaction instance:))|$)/gu, "");
+}
+function sidecarPath(handoff: Handoff): string { return handoff.path.replace(/\.md$/u, ".json"); }
+async function savedHandoff(handoff: Handoff): Promise<Record<string, unknown>> {
+  const saved = JSON.parse(await readFile(sidecarPath(handoff), "utf8"));
+  if (!saved || typeof saved !== "object" || Array.isArray(saved)) throw Error("invalid_sidecar");
+  return saved;
+}
+async function persistHandoff(handoff: Handoff, text: string): Promise<void> {
+  const saved = await savedHandoff(handoff), temp = `${handoff.path}.${randomUUID()}.tmp`;
+  await writeFile(temp, text, { mode: 0o600, flag: "wx" });
+  atomicJson(sidecarPath(handoff), { ...saved, text });
+  try { await rename(temp, handoff.path); }
+  catch (error) { atomicJson(sidecarPath(handoff), saved); throw error; }
+  handoff.text = text;
+}
+function observe(deps: HookDeps, ctx: ExtensionContext): Observation {
+  try { return deps.observe(ctx); }
+  catch { return { unavailable: ["issue_work collector failed", "pi-jobs collector failed", "pi-subagents collector failed"] }; }
+}
 /** Commit-time fallback: no request hook, no per-call timestamp, no provider-time file access. */
 export function createResumeHook(deps: HookDeps) {
-  const committed = new WeakMap<Handoff, Promise<string>>();
-  async function build(ctx: ExtensionContext, summary: string, handoff?: Handoff, input?: HandoffInput): Promise<string> {
-    let observation: Observation;
-    try { observation = deps.observe(ctx); }
-    catch { observation = { root: ctx.cwd, unavailable: ["issue_work collector failed", "pi-jobs collector failed", "pi-subagents collector failed"] }; }
-    const observedAt = new Date().toISOString();
-    const packet = await assemblePacket({ root: observation.root, repos: observation.repos ?? [], agentDir: deps.agentDir,
+  const committed = new WeakMap<Handoff, Map<string, Promise<string>>>(), blocked = new WeakSet<Handoff>();
+  const enabled = (ctx: ExtensionContext) => flagOn(readMemoryConfig(deps.configFile).config, ctx.sessionManager.getSessionName?.(), "resume");
+  function failed(ctx: ExtensionContext, handoff: Handoff, operation: string): void {
+    blocked.add(handoff); committed.delete(handoff);
+    try { deps.log?.(ctx, "resume_packet_skipped", { operation }); } catch { /* Logging must not block recovery. */ }
+  }
+  async function build(ctx: ExtensionContext, original: string, handoff?: Handoff, input?: HandoffInput): Promise<string> {
+    const summary = withoutPacket(original), observation = observe(deps, ctx), observedAt = new Date().toISOString();
+    const packet = await assemblePacket({ cwdRoot: observation.cwdRoot, repos: observation.repos ?? [], agentDir: deps.agentDir,
       handoffAt: handoff?.at ?? observedAt, files: input?.files_to_read ?? await handoffFiles(handoff), observation, observedAt,
       budget: Math.max(0, MAX_HANDOFF_BYTES - Buffer.byteLength(summary) - 3) });
     return packet.sections.length ? summary + "\n\n" + packet.sections.join("\n\n") + "\n" : summary;
   }
   async function append(ctx: ExtensionContext, summary: string, handoff?: Handoff, input?: HandoffInput): Promise<string> {
-    if (!flagOn(readMemoryConfig(deps.configFile).config, ctx.sessionManager.getSessionName?.(), "resume")) return summary;
+    if (!enabled(ctx)) return summary;
     if (!handoff) return build(ctx, summary, handoff, input);
-    let pending = committed.get(handoff);
-    if (!pending) { pending = build(ctx, summary, handoff, input); committed.set(handoff, pending); }
+    if (blocked.has(handoff)) return withoutPacket(summary);
+    let summaries = committed.get(handoff);
+    if (!summaries) { summaries = new Map(); committed.set(handoff, summaries); }
+    let pending = summaries.get(summary);
+    if (!pending) { pending = build(ctx, summary, handoff, input); summaries.set(summary, pending); }
     return pending;
   }
   return {
     append,
     async remember(ctx: ExtensionContext, handoff: Handoff, files: unknown): Promise<void> {
-      if (!flagOn(readMemoryConfig(deps.configFile).config, ctx.sessionManager.getSessionName?.(), "resume")) return;
-      if (!Array.isArray(files)) return;
-      const sidecar = handoff.path.replace(/\.md$/u, ".json");
-      const saved = JSON.parse(await readFile(sidecar, "utf8"));
-      // Preserve spelling before the legacy handoff normalizer erases traversal/relative paths.
-      const resumeFiles = files.filter((file): file is string => typeof file === "string").slice(0, MAX_FILES);
-      await writeFile(sidecar, JSON.stringify({ ...saved, resumeFiles }) + "\n", { mode: 0o600 });
+      if (!enabled(ctx) || !Array.isArray(files)) return;
+      try {
+        const saved = await savedHandoff(handoff);
+        // Keep spelling before the legacy normalizer erases traversal/relative paths.
+        const resumeFiles = files.filter((file): file is string => typeof file === "string").slice(0, MAX_FILES);
+        atomicJson(sidecarPath(handoff), { ...saved, resumeFiles });
+      } catch { failed(ctx, handoff, "remember"); }
     },
     async persist(ctx: ExtensionContext, handoff: Handoff): Promise<void> {
-      const text = await append(ctx, handoff.text, handoff);
-      if (text === handoff.text) return;
-      const sidecar = handoff.path.replace(/\.md$/u, ".json");
-      const saved = JSON.parse(await readFile(sidecar, "utf8"));
-      await writeFile(handoff.path, text, { mode: 0o600 });
-      await writeFile(sidecar, JSON.stringify({ ...saved, text }) + "\n", { mode: 0o600 });
-      handoff.text = text;
+      try {
+        const text = await append(ctx, handoff.text, handoff);
+        if (text !== handoff.text) await persistHandoff(handoff, text);
+      } catch { failed(ctx, handoff, "persist"); }
     },
   };
 }

@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import fs, { mkdirSync, mkdtempSync, readFileSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { join } from "node:path";
 import { buildSessionContext, convertToLlm, SessionManager } from "@earendil-works/pi-coding-agent";
 import { assemblePacket, createResumeHook, FILE_BYTES, PACKET_BYTES } from "../src/memory/resume.ts";
@@ -20,11 +21,11 @@ function fixture() {
   const file = (name: string, text: string | Buffer = "reference body", where = root) => {
     const path = join(where, name); writeFileSync(path, text); return path;
   };
-  const observation = { root, repos: [], head: "observed-head", dirty: [], claims: [], jobs: [], subagents: [], unavailable: [] };
+  const observation = { cwdRoot: root, repos: [], head: "observed-head", dirty: [], claims: [], jobs: [], subagents: [], unavailable: [] };
   const configFile = join(dir, "config.json");
   writeFileSync(configFile, JSON.stringify({ memory: { resume: true, scope: { mode: "all" } } }));
   const ctx: any = { cwd: root, sessionManager: { getSessionName: () => "lane" } };
-  const deps = { root, repos: [], agentDir, handoffAt: "2026-01-01T00:00:00Z", observation };
+  const deps = { cwdRoot: root, repos: [], agentDir, handoffAt: "2026-01-01T00:00:00Z", observation };
   return { dir, root, agentDir, file, observation, configFile, ctx, deps };
 }
 
@@ -36,6 +37,50 @@ test("path boundary: absolute, existing regular files only; traversal and symlin
   const text = packet.sections.join("\n");
   assert.match(text, /reference body/); assert.doesNotMatch(text, /outside-only/);
   assert.equal((text.match(/dropped/g) ?? []).length, 7);
+});
+
+test("non-git cwd under home grants no excerpt root, including when observation fails", async t => {
+  const f = await extensionFixture(true), oldHome = process.env.HOME;
+  process.env.HOME = f.dir;
+  t.after(() => { if (oldHome === undefined) delete process.env.HOME; else process.env.HOME = oldHome; });
+  mkdirSync(join(f.root, ".ssh"));
+  const privateFile = f.file("config", "private-home-configuration", join(f.root, ".ssh"));
+  await f.tool.execute("h", { goal: "finish", facts: "verified", next_step: "continue", files_to_read: [privateFile] }, undefined, undefined, f.ctx);
+  const result = await f.emit("turn_end", { message: { role: "assistant", usage: { input: 300, output: 0, cacheRead: 0, cacheWrite: 0 } } });
+  assert.match(result.entries[0].summary, /dropped="path_not_allowed"/);
+  assert.doesNotMatch(result.entries[0].summary, /private-home-configuration/);
+  const hook = createResumeHook({ agentDir: f.agentDir, configFile: f.configFile, observe: () => { throw Error("collector failed"); } });
+  const summary = await hook.append(f.ctx, "base", undefined, { goal: "g", facts: "f", next_step: "n", files_to_read: [privateFile] });
+  assert.match(summary, /dropped="path_not_allowed"/); assert.doesNotMatch(summary, /private-home-configuration/);
+});
+
+test("home, its ancestors, filesystem root and symlink aliases are refused as allowed roots", async t => {
+  const f = fixture(), oldHome = process.env.HOME;
+  process.env.HOME = f.dir;
+  t.after(() => { if (oldHome === undefined) delete process.env.HOME; else process.env.HOME = oldHome; });
+  const file = f.file("private.txt", "private-home-body", f.dir), alias = join(f.root, "home-alias");
+  symlinkSync(f.dir, alias);
+  for (const root of [f.dir, base, "/", alias]) {
+    const packet = await assemblePacket({ ...f.deps, cwdRoot: root, agentDir: root, files: [file] });
+    assert.match(packet.sections.join("\n"), /dropped="path_not_allowed"/);
+    assert.doesNotMatch(packet.sections.join("\n"), /private-home-body/);
+  }
+});
+
+test("git internals and agent sessions are excluded even through parent-directory aliases", async () => {
+  const f = fixture(), git = join(f.root, ".git"), nested = join(f.root, "nested", ".git"), sessions = join(f.agentDir, "sessions");
+  for (const dir of [git, nested, sessions]) mkdirSync(dir, { recursive: true });
+  const files = [f.file("config", "git-private-body", git), f.file("config", "nested-git-private-body", nested), f.file("history.jsonl", "session-private-body", sessions)];
+  symlinkSync(git, join(f.root, "git-alias")); symlinkSync(sessions, join(f.root, "session-alias"));
+  files.push(join(f.root, "git-alias/config"), join(f.root, "session-alias/history.jsonl"));
+  const text = (await assemblePacket({ ...f.deps, files })).sections.join("\n");
+  assert.equal((text.match(/dropped="path_not_allowed"/g) ?? []).length, files.length);
+  assert.doesNotMatch(text, /git-private-body|session-private-body/);
+  const redirectedAgent = join(f.dir, "redirected-agent"), storage = join(f.root, "transcripts");
+  mkdirSync(redirectedAgent); mkdirSync(storage); symlinkSync(storage, join(redirectedAgent, "sessions"));
+  const redirected = f.file("history.jsonl", "redirected-session-private-body", storage);
+  const target = (await assemblePacket({ ...f.deps, agentDir: redirectedAgent, files: [redirected] })).sections.join("\n");
+  assert.match(target, /dropped="path_not_allowed"/); assert.doesNotMatch(target, /redirected-session-private-body/);
 });
 
 test("known repositories allow only their work directory; agent files are allowed", async () => {
@@ -108,17 +153,67 @@ test("hook computes once per commit, never per context; disabled returns origina
   assert.equal(await hook.append(f.ctx, handoff.text, handoff), handoff.text); assert.equal(count, 1);
 });
 
-test("relaunch persists one packet in both handoff files, including across reload", async () => {
+test("re-commit after relaunch replaces the packet in both handoff files with fresh observations", async () => {
   const f = fixture(), file = f.file("relaunch.txt", "first-version"); let count = 0;
   const hook = createResumeHook({ agentDir: f.agentDir, configFile: f.configFile, observe: () => { count++; return f.observation; } });
   const handoff = { path: join(f.root, "handoff.md"), text: "handoff body", at: f.deps.handoffAt, n: 1 };
   writeFileSync(handoff.path, handoff.text);
   writeFileSync(handoff.path.replace(/\.md$/, ".json"), JSON.stringify({ ...handoff, input: { files_to_read: [file] } }));
   await hook.persist(f.ctx, handoff); writeFileSync(file, "later-version"); await hook.persist(f.ctx, handoff);
-  assert.equal(count, 1);
+  assert.equal(count, 2);
   const markdown = readFileSync(handoff.path, "utf8"), saved = JSON.parse(readFileSync(handoff.path.replace(/\.md$/, ".json"), "utf8"));
-  assert.equal(saved.text, markdown); assert.match(markdown, /first-version/); assert.doesNotMatch(markdown, /later-version/);
+  assert.equal(saved.text, markdown); assert.match(markdown, /later-version/); assert.doesNotMatch(markdown, /first-version/);
   assert.equal((markdown.match(/## Resume packet/g) ?? []).length, 1);
+});
+
+test("backstop after commit retains its unique instance id and refreshes the packet", async () => {
+  const f = await extensionFixture(true), file = f.file("backstop.txt", "commit-reference", f.agentDir);
+  await f.tool.execute("h", { goal: "finish", facts: "verified", next_step: "continue", files_to_read: [file] }, undefined, undefined, f.ctx);
+  const first = await f.emit("turn_end", { message: { role: "assistant", usage: { input: 300, output: 0, cacheRead: 0, cacheWrite: 0 } } });
+  assert.match(first.entries[0].summary, /commit-reference/);
+  unlinkSync(file);
+  const backstop = await f.emit("session_before_compact", { preparation: { tokensBefore: 300 }, reason: "overflow" });
+  assert.match(backstop.compaction.summary, /Compaction instance: [a-f0-9-]{36}/);
+  assert.match(backstop.compaction.summary, /file="backstop.txt" dropped=/);
+  assert.doesNotMatch(backstop.compaction.summary, /commit-reference/);
+  const again = await f.emit("session_before_compact", { preparation: { tokensBefore: 300 }, reason: "overflow" });
+  assert.notEqual(again.compaction.summary.match(/Compaction instance: ([^\n]+)/)[1], backstop.compaction.summary.match(/Compaction instance: ([^\n]+)/)[1]);
+});
+
+test("legacy open-ended packet is replaced while keeping trailing backstop metadata and fresh facts", async () => {
+  const f = fixture(); let count = 0;
+  const hook = createResumeHook({ agentDir: f.agentDir, configFile: f.configFile, observe: () => ({ ...f.observation, head: `head-${++count}` }) });
+  const handoff = { path: join(f.root, "handoff.md"), text: "base", at: f.deps.handoffAt, n: 1 };
+  const first = await hook.append(f.ctx, handoff.text, handoff);
+  const legacy = first.replace("\n## End resume packet", "");
+  const backstop = legacy + "\n## Handoff lint\nwarning\nCompaction instance: specific-id\n";
+  const updated = await hook.append(f.ctx, backstop, handoff);
+  assert.match(updated, /## Handoff lint\nwarning\nCompaction instance: specific-id/);
+  assert.match(updated, /head-2/); assert.doesNotMatch(updated, /head-1/);
+  assert.equal((updated.match(/## Resume packet/g) ?? []).length, 1);
+  assert.equal(await hook.append(f.ctx, backstop, handoff), updated); assert.equal(count, 2);
+});
+
+test("sidecar parse and atomic rewrite failures are logged and never break remember or persist", async () => {
+  for (const operation of ["remember", "persist"] as const) for (const failure of ["parse", "rewrite"]) {
+    const f = fixture(), events: unknown[] = [], originalRename = fs.renameSync;
+    const handoff = { path: join(f.root, "handoff.md"), text: "original handoff", at: f.deps.handoffAt, n: 1 };
+    const sidecar = handoff.path.replace(/\.md$/, ".json");
+    writeFileSync(handoff.path, handoff.text);
+    writeFileSync(sidecar, failure === "parse" ? "{" : JSON.stringify({ ...handoff, input: { files_to_read: [] } }));
+    const hook = createResumeHook({ agentDir: f.agentDir, configFile: f.configFile, observe: () => f.observation, log: (_ctx, event, data) => { events.push({ event, ...data }); } });
+    try {
+      if (failure === "rewrite") {
+        fs.renameSync = (from, to) => { if (String(to) === sidecar) throw Error("simulated atomic write failure"); originalRename(from, to); };
+        syncBuiltinESMExports();
+      }
+      if (operation === "remember") await assert.doesNotReject(hook.remember(f.ctx, handoff, [f.file("file.txt")]));
+      else await assert.doesNotReject(hook.persist(f.ctx, handoff));
+    } finally { fs.renameSync = originalRename; syncBuiltinESMExports(); }
+    assert.equal(handoff.text, "original handoff"); assert.equal(readFileSync(handoff.path, "utf8"), handoff.text);
+    assert.deepEqual(events, [{ event: "resume_packet_skipped", operation }]);
+    assert.equal(await hook.append(f.ctx, handoff.text, handoff), handoff.text);
+  }
 });
 
 test("packet yields to the existing handoff byte limit, including encoding overhead", async () => {
@@ -147,7 +242,7 @@ async function extensionFixture(enabled: boolean) {
 }
 
 test("commit wiring persists the packet, reload rebuilds it, and five converted provider payloads are byte-identical", async () => {
-  const f = await extensionFixture(true), file = f.file("reference.txt", "persisted-reference");
+  const f = await extensionFixture(true), file = f.file("reference.txt", "persisted-reference", f.agentDir);
   const stored = await f.tool.execute("h", { goal: "finish", facts: "verified", next_step: "continue", files_to_read: [file] }, undefined, undefined, f.ctx);
   assert.doesNotMatch(stored.details.handoff.text, /## Resume packet/);
   writeFileSync(file, "commit-time-reference");
