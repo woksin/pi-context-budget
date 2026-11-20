@@ -128,6 +128,7 @@ test("an aged file with a corrupt line or torn tail is kept even when its readab
     const w = world();
     w.say("damaged"); w.say("clean");
     writeFileSync(w.file("damaged"), damage, { flag: "a" });
+    if (damage.endsWith("\n")) w.say("damaged"); // a mid-file corrupt line, not a torn tail
     ageAll(w);
     pruneJournals(w.options());
     assert.deepEqual([w.exists("damaged"), w.exists("clean")], [true, false], JSON.stringify(damage));
