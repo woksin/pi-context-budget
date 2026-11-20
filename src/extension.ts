@@ -70,7 +70,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
     function frame(ctx: ExtensionContext, observedTokens?: number | null): Frame {
       return { mode: mode(ctx), tokens: observedTokens === undefined ? ctx.getContextUsage()?.tokens ?? null : observedTokens,
         thresholds: modelThresholds(config, ref(ctx), host?.subagent ?? false), config,
-        handoffAvailable: canHandoff(pi, host),
+        handoffAvailable: canHandoff(pi, host), deferAnswered: requests.deferAnswered(ctx),
         wrapped: !!host && ownsWrapper(process.pid, process.env, host.subagent) };
     }
     function step(event: MachineEvent, ctx: ExtensionContext, observed = frame(ctx)): Effect[] {
@@ -143,7 +143,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
         writeLaunchPrompt(promptPath, input.launch_prompt);
         input = { ...input, launch_prompt: promptPath };
       }
-      const h = renderHandoff(input, auto, id, sequence, path, new Date().toISOString());
+      const h = renderHandoff(input, { ...auto, requests: await requests.render(ctx) }, id, sequence, path, new Date().toISOString());
       writeHandoff(h, auto, input);
       handoffRejections = 0;
       log(ctx, "handoff_written", { path, n: h.n, bytes: Buffer.byteLength(h.text) });
@@ -207,7 +207,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
             // Mechanical recovery must fit and work even if handoff storage/metadata is unavailable.
             const h = effect.handoff, emergency = h ? undefined : emergencyInput(ctx);
             const lint = emergency ? validateObserved(ctx, emergency, runningState([...knownIds], { cwd: ctx.cwd, sessionId: ctx.sessionManager.getSessionId() }), false).lint : [];
-            const summary = `${h?.text ?? emergencySummary(emergency!)}${lint.length ? `\n## Handoff lint\n${bytePrefix(lint.join("\n"), 1024)}` : ""}\nCompaction instance: ${randomUUID()}\n`;
+            const summary = `${h?.text ?? emergencySummary(emergency!, await requests.render(ctx, true))}${lint.length ? `\n## Handoff lint\n${bytePrefix(lint.join("\n"), 1024)}` : ""}\nCompaction instance: ${randomUUID()}\n`;
             log(ctx, "backstop", { path: h?.path, reason: "machine-authorized" });
             requests.expectBackstop({ kind: backstopKind(effect.source, !!h, ctx), handoffPath: h?.path });
             result = { compaction: { summary, firstKeptEntryId: null as unknown as string, tokensBefore: effect.tokensBefore,
@@ -284,7 +284,11 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
     }));
     const pendingWork = (ctx: ExtensionContext) => { const r = runningState([...knownIds], { cwd: ctx.cwd, sessionId: ctx.sessionManager.getSessionId() }); return !!(r.jobs.length || r.subagents.length); };
     bindRequests(pi, requests, { safe, run, overflow, pendingWork, status, compactionOwned: () => !!state.compaction });
-    pi.on("before_agent_start", safe(async (_e, ctx) => { await run({ type: "before_agent_start" }, ctx); }));
+    pi.on("before_agent_start", safe(async (_e, ctx) => {
+      const result = await run({ type: "before_agent_start" }, ctx);
+      const entry = result?.entries?.[0];
+      if (entry?.type === "custom_message") return { message: { customType: entry.customType, content: entry.content, display: false } };
+    }));
     pi.registerTool({
       name: "context_handoff", label: "Context handoff",
       description: "Write a concise structured handoff, then END THIS TURN without more tools. Recovery continues automatically; an idle request resets the context at the end of this turn. Separate facts from hypotheses and preserve user constraints verbatim.",
@@ -356,7 +360,10 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
       return { action: "continue" as const };
     }));
     pi.on("session_before_compact", (e, ctx) => overflow.beforeCompact(e, ctx, async () => {
-      try { return await run({ type: "session_before_compact", reason: e.reason, tokensBefore: e.preparation?.tokensBefore }, ctx); }
+      try {
+        const result = await run({ type: "session_before_compact", reason: e.reason, tokensBefore: e.preparation?.tokensBefore }, ctx);
+        return await requests.beforeCompact(e, ctx, result);
+      }
       catch (error) {
         log(ctx, "backstop_error", { error: String(error) });
         try {

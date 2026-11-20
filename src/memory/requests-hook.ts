@@ -1,3 +1,5 @@
+import { renderRequests, type DeliveryAnswer } from "./render-requests.ts";
+import { createCarrier } from "./carrier.ts";
 import { flagOn, memoryOff, readMemoryConfig, type MemoryConfig } from "./config.ts";
 import { appendAnswer, newAnswerId, pickLastAnswer, redactAnswer, type AnswerBody, type AnswerKind, type AnswerParts, type AnswerRecord } from "./answers.ts";
 import { appendEvent, buildBoundary, type BoundaryKind } from "./boundary.ts";
@@ -35,7 +37,7 @@ export function createRequestsHook(deps: RequestsHookDeps) {
   let memory: MemoryConfig = memoryOff(), store: Promise<FileMemoryStore> | undefined, scanner: Promise<Scanner | undefined> | undefined;
   let loadedFor: string | undefined, open = new Set<string>(), compactions = new Set<string>();
   let answers: RunAnswer[] = [], capture: string[] | undefined, expected: CompactionHint | undefined;
-  let runId = newId(), turn = 0, humanSeq = 0, degraded: string | undefined, interimsDropped = 0;
+  let runId = newId(), turn = 0, humanSeq = 0, captureSeq = 0, degraded: string | undefined, interimsDropped = 0;
   const reported = new Set<string>();
   const home = async () => (await (store ??= import("./store.ts").then(({ FileMemoryStore }) => new FileMemoryStore({ agentDir: deps.agentDir })))).home;
   const scanners = () => scanner ??= loadScanner(deps.agentDir);
@@ -94,7 +96,7 @@ export function createRequestsHook(deps: RequestsHookDeps) {
     const model = typeof message.model === "string" ? redactAnswer(message.model, scanner).text ?? undefined : undefined;
     const reason = stopReason(message.stopReason);
     const answer: RunAnswer = { id: newAnswerId(), kind, textBytes: Buffer.byteLength(body.text ?? ""), stopReason: reason, ids, body,
-      parts: { session: session(ctx), runId, kind, model, stopReason: reason, turn }, humanSeq, written: false, dropped: false };
+      parts: { session: session(ctx), runId, kind, model, stopReason: reason, turn }, humanSeq: captureSeq, written: false, dropped: false };
     answers.push(answer);
     if (kind === "interim" && memory.answers !== "all") { keep(); return; }
     if (await persist(ctx, answer)) await closeAnswered(ctx, answer);
@@ -117,13 +119,32 @@ export function createRequestsHook(deps: RequestsHookDeps) {
   const guarded = async (ctx: HookContext, what: string, action: () => Promise<void>): Promise<void> => {
     try { if (enabled(ctx)) await action(); } catch (error) { degrade(ctx, what, error); }
   };
+  async function render(ctx: HookContext, emergency = false, boundaryOnly = false): Promise<string> {
+    if (!enabled(ctx)) return "";
+    try {
+      await load(ctx);
+      const state = readSessionState(await home(), session(ctx).id);
+      const last = pickLastAnswer(answers.filter(a => !a.dropped)), stored = pickLastAnswer(state.answers);
+      let lastAnswer: DeliveryAnswer | undefined;
+      if (stored) lastAnswer = { id: stored.id, text: stored.text, withheld: stored.withheld,
+        sameRunAsAnswer: state.possiblyUnseen.has(stored.id) };
+      if (last) lastAnswer = { id: last.id, text: last.body.text, withheld: last.body.withheld, sameRunAsAnswer: last.humanSeq === humanSeq };
+      if (boundaryOnly && !open.size && !lastAnswer?.sameRunAsAnswer) return "";
+      return renderRequests({ sessionId: session(ctx).id, requests: state.requests.filter(r => open.has(r.id)), lastAnswer, degraded }, emergency);
+    } catch (error) { degrade(ctx, "render", error); return renderRequests({ sessionId: session(ctx).id, requests: [], degraded }, emergency); }
+  }
+  const carrier = createCarrier({ render: ctx => render(ctx, false, true) });
   const compactionKind = (reason: string | undefined, packageInFlight: boolean): BoundaryKind => {
     if (reason === "overflow") return packageInFlight ? "overflow_package" : "overflow_native";
     return reason === "manual" ? (packageInFlight ? "overflow_package" : "manual") : "emergency";
   };
   return {
+    render,
+    beforeCompact: carrier.beforeCompact,
+    deliver: carrier.compacted,
+    deferAnswered: (ctx: HookContext): boolean => enabled(ctx) && memory.answerPolicy === "defer" && answers.some(isClosingAnswer),
     reload(): void { memory = readMemoryConfig(deps.configFile).config; },
-    reset(): void { loadedFor = undefined; open = new Set(); compactions = new Set(); answers = []; capture = undefined; expected = undefined; humanSeq = 0; degraded = undefined; interimsDropped = 0; reported.clear(); },
+    reset(): void { carrier.reset(); loadedFor = undefined; open = new Set(); compactions = new Set(); answers = []; capture = undefined; expected = undefined; humanSeq = 0; degraded = undefined; interimsDropped = 0; reported.clear(); },
     onJournaled: (entry: JournalEntry, ctx: HookContext) => guarded(ctx, "request_open", async () => {
       if (!isRequest(entry)) return;
       await load(ctx);
@@ -133,7 +154,7 @@ export function createRequestsHook(deps: RequestsHookDeps) {
     messageStart: (message: AssistantMessage, ctx: HookContext) => guarded(ctx, "answer_capture", async () => {
       if (message?.role !== "assistant") return;
       await load(ctx);
-      capture = [...open];
+      capture = [...open]; captureSeq = humanSeq;
     }),
     /** Awaited by the runtime before the message is persisted and before turn_end, so no boundary effect can run first. */
     messageEnd: (message: AssistantMessage, ctx: HookContext) => guarded(ctx, "answer_capture", async () => {
@@ -184,7 +205,7 @@ export function bindRequests(pi: ExtensionAPI, requests: RequestsHook, deps: Bin
   }));
   pi.on("session_compact", safe(async (e, ctx) => {
     overflow.nativeCompaction(ctx, e.reason); await run({ type: "session_compact", owned: compactionOwned() && e.fromExtension }, ctx); status(ctx);
-    await requests.compacted(e, ctx, overflow.packageCompacting);
+    await requests.compacted(e, ctx, overflow.packageCompacting); await requests.deliver(pi, e, ctx);
   }));
   pi.on("session_compact_failed", safe(async (e, ctx) => { requests.compactionFailed(); overflow.nativeCompaction(ctx, e.reason); await run(e, ctx); }));
 }

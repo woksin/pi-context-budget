@@ -1,6 +1,7 @@
 import { matchesGlob, isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { bytePrefix, type PreviousHandoff } from "./collect.ts";
+export const REQUEST_TASK = "The open user requests above are the task. Deliver an answer to each before you stop. Do not treat this handoff as the task.";
 
 export type Mode = "off" | "observe" | "enforce";
 export interface Thresholds { soft: number; handoff: number; hard: number; minProgress: number }
@@ -146,9 +147,10 @@ export interface MachineState {
   advisoryNoticeTurn?: number;
   /** Counterfactual policy state only; never mixed into actual history or action execution. */
   observation?: MachineState;
+  deferredHandoff?: boolean;
 }
 /** handoffAvailable is false for subagents or when the model cannot call the handoff tool. */
-export interface Frame { mode: Mode; tokens: number | null; thresholds: Thresholds; config: Config; wrapped: boolean; handoffAvailable?: boolean }
+export interface Frame { mode: Mode; tokens: number | null; thresholds: Thresholds; config: Config; wrapped: boolean; handoffAvailable?: boolean; deferAnswered?: boolean }
 export type MachineEvent =
   | { type: "turn_end"; usage?: number; failure?: MachineState["providerFailure"]; continues?: boolean }
   | { type: "tool_call"; tool: string; id: string; graceEligible?: boolean }
@@ -418,9 +420,13 @@ function decide(s: MachineState, e: MachineEvent, f: Frame): Effect[] {
       }
       return softNotices(s, e.continues, f);
     }
+    case "before_agent_start":
+      if (s.deferredHandoff) { s.deferredHandoff = false; return [{ type: "notice_required", content: REQUIRED }]; }
+      return [];
     case "agent_before_settle":
       if (f.handoffAvailable === false) return [];
       if (s.providerFailure !== "none" || s.settleRequest !== "none" || s.pending || (fallback && s.stored)) return [];
+      if (!fallback && f.deferAnswered) { s.deferredHandoff = handoffRequired(s, f); return []; }
       if (fallback || handoffRequired(s, f)) { s.settleRequest = "budget"; return [{ type: "steer", idleOnly: false }]; }
       if (!s.stored && e.pendingWork && (s.tokens ?? 0) >= f.config.idleMinTokens) {
         s.settleRequest = "idle"; return [{ type: "steer", idleOnly: true }];
@@ -526,7 +532,7 @@ export interface AutoState {
   jobs: unknown[]; subagents: unknown[]; claims: unknown[]; unavailable: string[];
   resumeCheck?: string;
   questions?: string[];
-  repos?: RepoState[]; userMessages?: string; scheduled?: string[]; finishedJobs?: string[];
+  repos?: RepoState[]; userMessages?: string; requests?: string; scheduled?: string[]; finishedJobs?: string[];
   previous?: PreviousHandoff;
   lint?: string[]; discarded?: { path: string; reason: string }[];
   /** `git status --short` lines and upstream ahead/behind; collected only for handoffs. */
@@ -655,7 +661,7 @@ export function boundedAutoState(auto: AutoState): AutoState {
     dirty: auto.dirty && boundedLines(auto.dirty.slice(0, 31), String, (expanded ? 1 : 6) * 1024).map(chars),
     sync: auto.sync === undefined ? undefined : short(auto.sync),
     repos: auto.repos?.slice(0, 8).map(r => ({ root: bytePrefix(r.root, 120), branch: bytePrefix(r.branch, 40), head: bytePrefix(r.head, 64), dirty: r.dirty, sync: bytePrefix(r.sync, 50) })),
-    userMessages: auto.userMessages === undefined ? undefined : bytePrefix(auto.userMessages, 4096),
+    userMessages: auto.userMessages === undefined ? undefined : bytePrefix(auto.userMessages, 4096), requests: auto.requests,
     scheduled: auto.scheduled && boundedLines(auto.scheduled.slice(0, 10), r => chars(String(r)), 1024),
     finishedJobs: auto.finishedJobs && boundedLines(auto.finishedJobs.slice(0, 10), r => chars(String(r)), 2 * 1024),
     lint: auto.lint && boundedLines(auto.lint.slice(0, 8), line => bytePrefix(String(line), 300), 1024),
@@ -697,6 +703,7 @@ export function renderHandoff(p: HandoffInput, auto: AutoState, id: string, n: n
     p.open_items && `## Open items\n${p.open_items}`, p.hypotheses && `## Hypotheses (unverified)\n${p.hypotheses}`,
     `## Next step\n${p.next_step}`, p.files_to_read?.length && `## Read first\n${p.files_to_read.join("\n")}`,
     actions.length && `## Watch actions\n${actions.join("\n")}`,
+    auto.requests,
     `## Automatically collected state\nCwd: ${auto.cwd}\nRepository root: ${auto.root}\nBranch: ${auto.branch}\nHEAD: ${auto.head}\n` +
       (auto.dirty ? `Working tree:\n${auto.dirty.join("\n") || "clean"}\nSync: ${auto.sync ?? "unknown"}\n` : "") + `Launch prompt: ${p.launch_prompt ?? "not supplied"}\n` +
       (auto.repos ? `Repositories touched:\n${auto.repos.map(r => `${r.root} | ${r.branch} | ${r.head.slice(0, 12)} | dirty ${r.dirty} | ${r.sync}`).join("\n") || "none"}\n` : "") +
@@ -705,14 +712,14 @@ export function renderHandoff(p: HandoffInput, auto: AutoState, id: string, n: n
       (auto.finishedJobs ? `Finished jobs — Finished since last handoff (results not yet acted on):\n${auto.finishedJobs.join("\n") || "none"}\n` : "") +
       `Issue claims: ${JSON.stringify(auto.claims)}\nUnavailable: ${auto.unavailable.join(", ") || "none"}`,
     auto.questions?.length && `## Pending questions\n${auto.questions.join("\n")}`,
-    auto.userMessages && `## User messages since previous handoff (verbatim)\n${auto.userMessages}`,
+    !auto.requests && auto.userMessages && `## User messages since previous handoff (verbatim)\n${auto.userMessages}`,
     auto.resumeCheck && `## Resume check\n${auto.resumeCheck}`,
     discarded.length && `## Discarded earlier handoffs\nStored, never committed; re-read if you rely on them:\n${discarded.join("\n")}`,
     auto.lint?.length && `## Handoff lint\n${bytePrefix(auto.lint.join("\n"), 1024)}`,
-    "Resume now from Next step without asking the user. Verify current git HEAD and re-establish external state before trusting prior review/CI/issue facts.",
+    auto.requests?.includes(REQUEST_TASK) ? REQUEST_TASK : "Resume now from Next step without asking the user. Verify current git HEAD and re-establish external state before trusting prior review/CI/issue facts.",
   ];
   const text = sections.filter(Boolean).join("\n\n") + "\n";
-  const bytes = Buffer.byteLength(text);
+  const bytes = Buffer.byteLength(text) - Buffer.byteLength(auto.requests ?? "");
   if (bytes > MAX_HANDOFF_BYTES) throw new Error(`Handoff is ${bytes} bytes; limit is ${MAX_HANDOFF_BYTES}. Shorten narrative and reference absolute files; do not omit user constraints.`);
   return { text, path, n, at, launchPrompt: p.launch_prompt, narrativeTokens: narrativeTokens(p), head: auto.head, recordedJobs, recordedSubagents, watchActions: p.watch_actions, repos };
 }
