@@ -4,6 +4,7 @@ import type { IntentServices } from "./tools.ts";
 import type { HandoffMemory } from "./handoff-block.ts";
 import { selectedHandoffScopes } from "./handoff-scopes.ts";
 import { project } from "./project.ts";
+import { readQuestionItems } from "./projections.ts";
 import { singleLine } from "./render.ts";
 import { userMessagesSince } from "../collect.ts";
 
@@ -26,9 +27,10 @@ export async function handoffMemory(runtime: IntentServices, ctx: ExtensionConte
   if (!runtime.enabled(ctx)) return undefined;
   try {
     const store = await runtime.store(ctx), selected = selectedHandoffScopes(ctx, store, previous?.path);
+    const questions = readQuestionItems({ agentDir: runtime.agentDir, repo: selected.repo });
     // Reserve the inter-block separator inside the combined 32 KiB requests/memory cap.
     return project(store, { scopes: selected.scopes, taskItemIds: selected.taskItemIds, session: ctx.sessionManager.getSessionId(), sessions: selected.sessionIds,
-      reportOtherScopes: true, budgets: { total: 20 * 1024 - 2, index: 4094 } });
+      projectedItems: questions.items, reportOtherScopes: true, budgets: { total: 20 * 1024 - 2, index: 4094 } });
   } catch {
     return degradedMemory(ctx, previous);
   }
