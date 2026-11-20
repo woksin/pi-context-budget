@@ -1,4 +1,6 @@
 import { test, afterEach } from "node:test";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, writeFileSync, truncateSync, statSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -89,10 +91,40 @@ test("layout: agentDir default and PI_MEMORY_HOME override", () => {
     assert.equal(new FileMemoryStore({ agentDir: root }).home, join(root, "memory"));
     process.env.PI_MEMORY_HOME = join(root, "override");
     assert.equal(new FileMemoryStore({ agentDir: root }).home, join(root, "override"));
+    assert.equal(new FileMemoryStore({ home: join(root, "explicit") }).home, join(root, "explicit"));
   } finally {
     if (previous === undefined) delete process.env.PI_MEMORY_HOME;
     else process.env.PI_MEMORY_HOME = previous;
   }
+});
+
+test("event append is fsynced before applied, and an fsync failure cannot report applied", t => {
+  const store = fixture(), file = join(store.home, "events.jsonl");
+  const fsync = fs.fsyncSync;
+  let synced = false, failSync = false;
+  t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+  t.mock.method(fs, "fsyncSync", (fd: number) => {
+    if (failSync) throw Error("fsync unavailable");
+    assert.equal(scanLog(file).records.length, 1);
+    synced = true;
+    fsync(fd);
+  });
+  syncBuiltinESMExports();
+  assert.equal(store.addItem(decision(), agent).status, "applied");
+  assert.equal(synced, true);
+  failSync = true;
+  assert.throws(() => store.addItem(decision(), agent), /fsync unavailable/);
+});
+
+test("an appended line missing from readback returns an explicit rejection", () => {
+  const store = fixture(), file = join(store.home, "events.jsonl");
+  const readFolded = store.readFolded.bind(store);
+  store.readFolded = () => { truncateSync(file, 0); return readFolded(); };
+  const result = store.addItem(decision(), agent);
+  assert.equal(result.status, "rejected");
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "append_not_read_back");
+  assert.ok(result.eventId);
 });
 
 test("flags-off: all pre-existing runtime and package files remain byte-identical to 0.10.1", () => {

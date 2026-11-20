@@ -29,7 +29,8 @@ function privateDirectory(directory: string): void {
   mkdirSync(directory, { recursive: true, mode: 0o700 });
   chmodSync(directory, 0o700);
 }
-function page<T>(items: T[], limit: number, cursor?: string): Page<T> {
+function page<T>(items: T[], query: Pick<ItemQuery, "limit" | "cursor">): Page<T> {
+  const { limit, cursor } = query;
   requireValid(Number.isInteger(limit) && limit > 0 && limit <= 1000, "invalid_limit");
   const offset = Number(cursor ?? 0);
   requireValid(Number.isSafeInteger(offset) && offset >= 0, "invalid_cursor");
@@ -107,13 +108,28 @@ function searchHit(entry: JournalEntry, query: SearchQuery, redactor?: Redactor)
   } catch { return; }
 }
 
+function knownResult(state: FoldedState, event: MemoryEvent): WriteResult | undefined {
+  if (state.events[event.id]) return state.events[event.id];
+  if (event.type !== "add") return;
+  const existing = state.items[event.item.id];
+  return existing ? state.events[existing.eventId] : undefined;
+}
+function countActivePerScope(state: FoldedState): Health["activePerScope"] {
+  const counts: Health["activePerScope"] = Object.create(null);
+  for (const item of Object.values(state.items).filter(item => item.status === "active")) {
+    const key = `${item.scope.kind}:${item.scope.key}`;
+    counts[key] = (counts[key] ?? 0) + 1;
+  }
+  return counts;
+}
+
 /** Inert until explicitly constructed; no pi imports, extension hooks or flag changes. */
 export class FileMemoryStore implements MemoryStoreCore {
   readonly home: string;
   private readonly options: StoreOptions;
   constructor(options: StoreOptions = {}) {
     this.options = options;
-    this.home = process.env.PI_MEMORY_HOME ?? options.home ?? join(options.agentDir ?? join(homedir(), ".pi", "agent"), "memory");
+    this.home = options.home ?? process.env.PI_MEMORY_HOME ?? join(options.agentDir ?? join(homedir(), ".pi", "agent"), "memory");
     for (const directory of [this.home, ...["journal", "answers", "blobs"].map(name => join(this.home, name))]) privateDirectory(directory);
   }
   private journalFiles(): string[] {
@@ -135,12 +151,18 @@ export class FileMemoryStore implements MemoryStoreCore {
   listMessages(query: MessageQuery): Page<JournalEntry> {
     const entries = this.messages().filter(entry => (!query.sessionId || entry.session.id === query.sessionId) &&
       (!query.origin || entry.origin === query.origin) && (!query.since || entry.at >= query.since));
-    return page(entries, query.limit, query.cursor);
+    return page(entries, query);
   }
   search(query: SearchQuery): SearchHit[] {
     requireValid(typeof query.query === "string" && query.query.length > 0, "invalid_query");
     requireValid(Number.isInteger(query.limit) && query.limit > 0 && query.limit <= 1000, "invalid_limit");
-    const items = query.scopes ? Object.values(this.readFolded().items).filter(item => matchesScope(item, query.scopes)) : undefined;
+    return this.collectHits(query, this.scopedItems(query));
+  }
+  private scopedItems(query: SearchQuery): FoldedItem[] | undefined {
+    if (!query.scopes) return;
+    return Object.values(this.readFolded().items).filter(item => matchesScope(item, query.scopes));
+  }
+  private collectHits(query: SearchQuery, items?: FoldedItem[]): SearchHit[] {
     const hits: SearchHit[] = [];
     for (const entry of this.messages()) {
       if (!searchMatches(entry, query, items)) continue;
@@ -153,19 +175,22 @@ export class FileMemoryStore implements MemoryStoreCore {
   readFolded(): FoldedState {
     return foldEvents(scanLog(join(this.home, "events.jsonl")).records, this.messages(), this.options);
   }
-  private write(event: MemoryEvent): WriteResult {
-    const entries = this.messages(), records = scanLog(join(this.home, "events.jsonl")).records;
-    const state = foldEvents(records, entries, this.options);
-    if (state.events[event.id]) return state.events[event.id];
-    if (event.type === "add" && state.items[event.item.id]) return state.events[state.items[event.item.id].eventId];
-    try { validateEvent(event, state, new Map(entries.map(entry => [entry.id, entry])), this.options); }
-    catch (error) { return rejection(event.id, error); }
+  private appendEvent(event: MemoryEvent): WriteResult {
     try { appendRecord(join(this.home, "events.jsonl"), event); }
     catch (error) {
       if (error instanceof Error && error.message === "too_large") return rejection(event.id, new ValidationError("too_large"));
       throw error;
     }
-    return this.readFolded().events[event.id];
+    return this.readFolded().events[event.id] ?? rejection(event.id, new ValidationError("append_not_read_back"));
+  }
+  private write(event: MemoryEvent): WriteResult {
+    const entries = this.messages(), records = scanLog(join(this.home, "events.jsonl")).records;
+    const state = foldEvents(records, entries, this.options);
+    const existing = knownResult(state, event);
+    if (existing) return existing;
+    try { validateEvent(event, state, new Map(entries.map(entry => [entry.id, entry])), this.options); }
+    catch (error) { return rejection(event.id, error); }
+    return this.appendEvent(event);
   }
   private base(actor: Actor) { return { schema: "memory.event/2" as const, id: newId(), at: new Date().toISOString(), actor }; }
   addItem(item: Item, actor: Actor): WriteResult {
@@ -183,7 +208,7 @@ export class FileMemoryStore implements MemoryStoreCore {
   list(query: ItemQuery): Page<FoldedItem> {
     const items = Object.values(this.readFolded().items).filter(item => matchesScope(item, query.scopes) &&
       (!query.kind || item.kind === query.kind) && (!query.status || item.status === query.status));
-    return page(items, query.limit, query.cursor);
+    return page(items, query);
   }
   changesSince(cursor = "0"): { events: MemoryEvent[]; cursor: string } {
     const offset = Number(cursor);
@@ -191,20 +216,19 @@ export class FileMemoryStore implements MemoryStoreCore {
     const records = scanLog(join(this.home, "events.jsonl")).records.filter(record => record.position >= offset);
     return { events: records.map(record => record.record as MemoryEvent), cursor: records.length ? String(records[records.length - 1].position + 1) : cursor };
   }
+  private memoryFiles(): string[] {
+    return [join(this.home, "events.jsonl"), ...this.journalFiles(),
+      ...readdirSync(join(this.home, "answers")).filter(name => name.endsWith(".jsonl") && safeName(name.slice(0, -6))).map(name => join(this.home, "answers", name))];
+  }
   health(): Health {
     const health: Health = { tornTail: 0, corrupt: 0, blank: 0, rejectedEvents: 0, activePerScope: Object.create(null) };
-    const files = [join(this.home, "events.jsonl"), ...this.journalFiles(),
-      ...readdirSync(join(this.home, "answers")).filter(name => name.endsWith(".jsonl") && safeName(name.slice(0, -6))).map(name => join(this.home, "answers", name))];
-    for (const file of files) {
+    for (const file of this.memoryFiles()) {
       const scan = scanLog(file, file.includes(`${join(this.home, "journal")}/`) ? JOURNAL_LINE_BYTES : undefined);
       health.tornTail += scan.tornTail; health.corrupt += scan.corrupt; health.blank += scan.blank;
     }
     const state = this.readFolded();
     health.rejectedEvents = state.rejectedEvents.length;
-    for (const item of Object.values(state.items).filter(item => item.status === "active")) {
-      const key = `${item.scope.kind}:${item.scope.key}`;
-      health.activePerScope[key] = (health.activePerScope[key] ?? 0) + 1;
-    }
+    health.activePerScope = countActivePerScope(state);
     return health;
   }
 }

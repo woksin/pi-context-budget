@@ -1,4 +1,4 @@
-import { appendFileSync, readFileSync, chmodSync } from "node:fs";
+import { appendFileSync, readFileSync, openSync, fchmodSync, fsyncSync, closeSync } from "node:fs";
 import type { LocatedRecord } from "./types.ts";
 
 export const EVENT_LINE_BYTES = 8 * 1024;
@@ -30,8 +30,12 @@ export function appendRecord(file: string, record: object, maxBytes = EVENT_LINE
     if (bytes.length && bytes[bytes.length - 1] !== 10) console.warn(`memory torn tail: ${file}`);
     checkedFiles.add(file);
   }
-  appendFileSync(file, `\n${json}\n`, { flag: "a", mode: 0o600 });
-  chmodSync(file, 0o600);
+  const fd = openSync(file, "a", 0o600);
+  try {
+    fchmodSync(fd, 0o600);
+    appendFileSync(fd, `\n${json}\n`, "utf8");
+    fsyncSync(fd);
+  } finally { closeSync(fd); }
 }
 export type LogScan = { records: LocatedRecord[]; tornTail: number; corrupt: number; blank: number };
 function decodeLine(line: string, position: number, scan: LogScan): void {
