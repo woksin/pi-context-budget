@@ -14,6 +14,7 @@ import { resumeCommand, runResumeCheck } from "./resume-check.ts";
 import { appendEvent, atomicJson, collectRepos, handoffHead, issueClaims, runningState, writeHandoff, writeLaunchPrompt, writeMarker, processSessionHosts, pendingQuestions, watchCheck, pruneStatus, type SessionHosts } from "./storage.ts";
 import { bindRequests, createRequestsHook, wire } from "./memory/requests-hook.ts";
 import { processLaunchFacts, type LaunchFacts } from "./memory/launch.ts";
+import { createIntentHook } from "./memory/tools.ts";
 import { bytePrefix, chainIdentity, emergencyHandoff, emergencySummary, previousHandoff, primaryHead, userMessagesSince } from "./collect.ts";
 
 type ActionResult = BoundaryResult & ToolCallEventResult & SessionBeforeCompactResult;
@@ -53,6 +54,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
       catch (error) { console.error(`context-budget: event log unavailable: ${String(error)}`); }
     }
     const memoryDeps = { agentDir, configFile, log, host: () => host };
+    const intent = createIntentHook(pi, memoryDeps);
     const requests = createRequestsHook({ ...memoryDeps, hasTools: () => hasActiveTools(pi) });
     const journal = wire(requests, { ...memoryDeps, launchFacts });
     function reload(ctx: ExtensionContext): void {
@@ -72,7 +74,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
     function frame(ctx: ExtensionContext, observedTokens?: number | null): Frame {
       return { mode: mode(ctx), tokens: observedTokens === undefined ? ctx.getContextUsage()?.tokens ?? null : observedTokens,
         thresholds: modelThresholds(config, ref(ctx), host?.subagent ?? false), config,
-        handoffAvailable: canHandoff(pi, host), deferAnswered: requests.deferAnswered(ctx),
+        handoffAvailable: canHandoff(pi, host), deferAnswered: requests.deferAnswered(ctx), memoryIntent: intent.enabled(ctx),
         wrapped: !!host && ownsWrapper(process.pid, process.env, host.subagent) };
     }
     function step(event: MachineEvent, ctx: ExtensionContext, observed = frame(ctx)): Effect[] {
@@ -196,9 +198,9 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
           case "cancel_compaction": result = { cancel: true }; break;
           case "steer":
             log(ctx, effect.idleOnly ? "idle_handoff_requested" : "settle_handoff_requested");
-            result = { entries: [{ type: "custom_message", customType: "context-budget", display: true, content: effect.idleOnly
+            result = { entries: [{ type: "custom_message", customType: "context-budget", display: true, content: intent.steer(ctx, effect.idleOnly
               ? "Pending background work remains and context is large. Call context_handoff now while the cache is warm, then end this turn. The context resets at the end of this turn."
-              : "Context recovery is required. Call context_handoff with goal, next_step, verified facts and verbatim user_constraints, then end this turn without further tools." }], continue: true }; break;
+              : "Context recovery is required. Call context_handoff with goal, next_step, verified facts and verbatim user_constraints, then end this turn without further tools.") }], continue: true }; break;
           case "commit":
             await requests.commit(ctx, effect.handoff.path, effect.source === "idle");
             log(ctx, "handoff_committed", { path: effect.handoff.path, n: effect.handoff.n, count: state.count, source: effect.source });
@@ -241,7 +243,7 @@ export function createContextBudgetExtension({ agentDir, hosts = processSessionH
       try { return await handler(event, ctx); } catch (error) { log(ctx, "hook_error", { error: String(error) }); }
     };
     function reset(ctx: ExtensionContext): void {
-      host?.release(); host = hosts.acquire(ctx.sessionManager.getSessionId());
+      host?.release(); host = hosts.acquire(ctx.sessionManager.getSessionId()); intent.start(ctx);
       reload(ctx); journal.reset(); requests.reset(); overflow.reset(ctx); knownIds.clear(); handoffRejections = 0; resumeBoundary = resumeMessage = mismatchLogged = undefined;
       const history: HistoryItem[] = ctx.sessionManager.getBranch().flatMap((e): HistoryItem[] => {
         if (e.type === "compaction") {

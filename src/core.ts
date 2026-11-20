@@ -1,6 +1,7 @@
 import { matchesGlob, isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { bytePrefix, type PreviousHandoff } from "./collect.ts";
+import { memoryRecovery, type RecoveryWindow } from "./memory/authorize.ts";
 export const REQUEST_TASK = "The open user requests above are the task. Deliver an answer to each before you stop. Do not treat this handoff as the task.";
 
 export type Mode = "off" | "observe" | "enforce";
@@ -149,9 +150,10 @@ export interface MachineState {
   observation?: MachineState;
   deferredHandoff?: boolean;
   deferredHumanTurn?: boolean;
+  memoryRecovery?: RecoveryWindow;
 }
 /** handoffAvailable is false for subagents or when the model cannot call the handoff tool. */
-export interface Frame { mode: Mode; tokens: number | null; thresholds: Thresholds; config: Config; wrapped: boolean; handoffAvailable?: boolean; deferAnswered?: boolean }
+export interface Frame { mode: Mode; tokens: number | null; thresholds: Thresholds; config: Config; wrapped: boolean; handoffAvailable?: boolean; deferAnswered?: boolean; memoryIntent?: boolean }
 export type MachineEvent =
   | { type: "turn_end"; usage?: number; failure?: MachineState["providerFailure"]; continues?: boolean }
   | { type: "tool_call"; tool: string; id: string; graceEligible?: boolean }
@@ -361,6 +363,9 @@ function softNotices(s: MachineState, continues: boolean | undefined, f: Frame):
   return effects;
 }
 function active(s: MachineState, e: MachineEvent, f: Frame): Effect[] {
+  return memoryRecovery(s, e, f, Boolean(forced(s, f))) ?? activePolicy(s, e, f);
+}
+function activePolicy(s: MachineState, e: MachineEvent, f: Frame): Effect[] {
   const notice = notices(s, e, f);
   return [...notice, ...decide(s, e, f)];
 }

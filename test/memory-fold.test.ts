@@ -16,6 +16,21 @@ function fixture(options = {}) {
   directories.push(home);
   return new FileMemoryStore({ home, ...options });
 }
+test("only a confirmed human rejection can retire a proposed directive", () => {
+  const store = fixture(), entry = message({ text: "Do not run tests" });
+  store.appendMessage(entry);
+  const item = directive(entry); store.addItem(item, agent);
+  const rejection = message({ text: `/memory reject ${item.id}\n${item.text}`, originEvidence: ["tui-confirm"] });
+  store.appendMessage(rejection);
+  const source = { type: "user_message" as const, ref: rejection.id };
+  assert.equal(store.retireItem(item.id, "withdrawn", "No", source, human).reason, "conflict");
+  assert.equal(store.retireItem(item.id, "rejected", "No", source, agent).reason, "not_authorised");
+  assert.equal(store.retireItem(item.id, "rejected", "No", { type: "user_message", ref: entry.id }, human).reason, "not_authorised");
+  assert.equal(store.retireItem(item.id, "rejected", "No", source, human).ok, true);
+  assert.equal(store.readFolded().items[item.id]!.status, "rejected");
+  assert.equal(store.retireItem(item.id, "rejected", "No", source, human).reason, "not_proposed");
+  assert.equal(store.confirm(item.id, human).reason, "not_proposed");
+});
 function forged(store: FileMemoryStore, fields: object) {
   const id = newId();
   appendRecord(join(store.home, "events.jsonl"), { schema: "memory.event/2", id, at: "2026-01-02T00:00:00Z", actor: agent, ...fields });

@@ -158,7 +158,20 @@ function validateHumanRetirement(event: RetireEvent, itemAt: string, messages: M
   requireValid(source.origin === "human", "would_override_user");
   requireValid(Date.parse(source.at) > Date.parse(itemAt), "would_override_user");
 }
+function validateReject(event: RetireEvent, state: FoldedState, messages: Map<string, JournalEntry>): void {
+  const item = state.items[event.itemId];
+  requireValid(item, "no_source");
+  requireValid(item.status === "proposed", "not_proposed");
+  requireValid(event.actor.kind === "human", "not_authorised");
+  requireValid(event.source.type === "user_message", "not_authorised");
+  const source = sourceMessage(event.source, messages);
+  requireValid(source.origin === "human", "not_authorised");
+  requireValid(source.originEvidence.includes("tui-confirm"), "not_authorised");
+  requireValid(source.text?.startsWith(`/memory reject ${event.itemId}\n`), "not_authorised");
+  requireValid(typeof event.reason === "string" && event.reason.trim(), "invalid_retirement");
+}
 function validateRetire(event: RetireEvent, state: FoldedState, messages: Map<string, JournalEntry>): void {
+  if (event.status === "rejected") return validateReject(event, state, messages);
   const item = activeItem(event.itemId, state);
   requireValid(["done", "superseded", "withdrawn"].includes(event.status), "invalid_retirement");
   requireValid(typeof event.reason === "string" && event.reason.trim(), "invalid_retirement");
