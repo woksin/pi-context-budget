@@ -286,6 +286,39 @@ Records carry CRC32 of their JSON body without `crc`. Each append is one write o
 
 Directive authority is checked again at fold time against journal provenance. Without an injected `EligibilityCheck`, automatic directives remain proposed; a valid human `/directive ` source or human UI confirmation can activate them. Orders require an explicit coordinator allowlist. `readFolded()`, paging and the capability-labelled core conformance suite provide the seam for later projections and alternative backends.
 
+## Intent-memory origin gate (inert)
+
+`src/memory/origin.ts` exports the pure `classifyOrigin(input, context)` gate. It is **not registered or imported by the extension** and does not write memory. S3b must check `enabled && journal` before any store or journal access, supply trusted adapter facts, and skip writes when `journal` is false. Input text, tool arguments and model claims must never supply these facts.
+
+The adapter supplies `hasUI`, the host's subagent bit, `{ sessionId, primarySessionId }`, and `firstInput` (count every input, including injected inputs). Either child signal skips journaling, regardless of source/UI. Missing identity, host bit or input position cannot grant human provenance. `originEvidence` records decisions without copying prompt bodies.
+
+For the first input, supply `initialPrompt`/`relaunchPrompt` as the **exact assembled input**, not merely an argv token or the contents of `launchPrompt`. pi combines `@file` text (including its file wrapper) and the positional continuation; `bin/pi-session` supplies both. Compare before skill/template expansion. These optional strings represent known launch inputs, not an instruction to read arbitrary paths. Later identical text is not automatically launch traffic.
+
+Decision precedence: child skip → extension injection → known synthetic text → non-interactive/no-UI unattended → first-input launch match → verified main human. Unknown sources always default to unattended. `source="interactive"` alone is insufficient: installed subagent `runAgent`/`resumeAgent` and structured retries call `session.prompt(text)` with no source option. `source="rpc"` is unattended even when the host exposes a UI bridge. Extension source wins over launch matches. Sender labels are descriptive only, never coordinator authority; forged orchestration headers are injected rather than human.
+
+`src/memory/synthetic.ts` centralizes anchored provider-continue, settle/idle recovery, handoff/structured retry, overflow-continue, task-notification and orchestration-header recognition. Add new user-role synthetic senders here with hostile cases. Custom job/question/subagent completion messages bypass `input`; future journal code must not reinterpret those as human input.
+
+### Offline origin matrix
+
+CI runs `test/memory-origin*.test.ts` against its pinned pi peer. SDK tests use real input/queue/resource-expansion paths with a stub UI, and explicitly open the SDK run boundary for offline streaming queue tests. They do not test terminal rendering, real provider streams, or live worker delivery. Representative installed sender texts and source-less child calls are reproduced, not imported from machine-local plugins.
+
+Run the same matrix plus actual installed CLI probes (print, `@file` plus continuation, RPC), without credentials or paid calls:
+
+```sh
+node eval/origin-matrix.mjs "$HOME/.local/share/pi-runtime/lib/node_modules/@earendil-works/pi-coding-agent"
+```
+
+| Path | Expected provenance |
+| --- | --- |
+| TUI typed / pasted input | human |
+| Streaming steer / followUp | human |
+| Interactive initial CLI argument / wrapper relaunch text | launch |
+| Print/no-UI / RPC / unknown source | unattended |
+| Orchestration `sendUserMessage` / provider fallback / settle or retry text | injected |
+| Child initial prompt / source-less structured retry | skip journal |
+| Job notification / question answer / child completion custom message | no input, no journal call |
+| Skill / prompt-template expansion | retain human provenance |
+
 ## Related projects
 
 - [pi-setup](https://github.com/woksin/pi-setup): my full pi agent setup (rules, agents, extensions, installer) that ties these together
