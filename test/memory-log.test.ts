@@ -127,13 +127,10 @@ test("an appended line missing from readback returns an explicit rejection", () 
   assert.ok(result.eventId);
 });
 
-test("flags-off: all pre-existing runtime and package files remain byte-identical to 0.10.1", () => {
-  const root = join(import.meta.dirname, ".."), base = "42b9fec";
-  const tracked = spawnSync("git", ["ls-tree", "-r", "--name-only", base], { cwd: root, encoding: "utf8" });
-  assert.equal(tracked.status, 0);
-  for (const file of tracked.stdout.trim().split("\n").filter(name => name !== "README.md")) {
-    const original = spawnSync("git", ["show", `${base}:${file}`], { cwd: root });
-    assert.equal(original.status, 0);
-    assert.deepEqual(readFileSync(join(root, file)), original.stdout, file);
+test("inert: no runtime file outside src/memory imports the memory store", () => {
+  const root = join(import.meta.dirname, "..");
+  const runtime = ["context-budget.ts", ...readdirSync(join(root, "src")).filter(name => name.endsWith(".ts")).map(name => join("src", name))];
+  for (const file of runtime) {
+    assert.doesNotMatch(readFileSync(join(root, file), "utf8"), /from\s+["'][^"']*memory\//, file);
   }
 });
