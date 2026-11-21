@@ -3,7 +3,7 @@ import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { flagOn, MEMORY_DISABLED, readMemoryConfig, type MemoryConfig } from "./config.ts";
 import { eligibilityCheck, recoverySteer } from "./authorize.ts";
-import { registerIntentCommands } from "./commands.ts";
+import { registerIntentReview, type ReviewControls } from "./review.ts";
 import { loadScanner, redact } from "./redact.ts";
 import { requireValid, ValidationError } from "./validate.ts";
 import { newId } from "./types.ts";
@@ -12,7 +12,7 @@ import { listVisibleItems, requireVisibleItems, resolveLaneScope } from "./scope
 import type { Actor, ClassifyEvent, Item, ItemQuery, RetireEvent, Source, Span } from "./types.ts";
 import type { MemoryStoreCore } from "./store.ts";
 
-export type IntentDeps = { agentDir: string; configFile: string; host: () => { subagent: boolean } | undefined };
+export type IntentDeps = { agentDir: string; configFile: string; host: () => { subagent: boolean } | undefined } & ReviewControls;
 export interface IntentServices {
   enabled(ctx: ExtensionContext): boolean;
   store(ctx: ExtensionContext): Promise<MemoryStoreCore>;
@@ -105,10 +105,12 @@ class IntentRuntime implements IntentServices {
   private registered = false;
   private pi: ExtensionAPI;
   private deps: IntentDeps;
+  private readonly registerCommands: () => void;
   constructor(pi: ExtensionAPI, deps: IntentDeps) {
     this.pi = pi; this.deps = deps;
     this.agentDir = deps.agentDir;
     this.loaded = readMemoryConfig(deps.configFile).config.intent;
+    this.registerCommands = registerIntentReview(pi, this, deps);
   }
   enabled(ctx: ExtensionContext): boolean {
     if (!this.loaded || this.deps.host()?.subagent !== false) return false;
@@ -131,7 +133,7 @@ class IntentRuntime implements IntentServices {
   start(ctx: ExtensionContext): void {
     if (this.registered || !this.enabled(ctx)) return;
     // Role is authoritative only after the session host has bound; pi 1.2 supports post-bind registration.
-    registerTools(this.pi, this); registerIntentCommands(this.pi, this);
+    registerTools(this.pi, this); this.registerCommands();
     this.registered = true;
   }
   steer(ctx: ExtensionContext, text: string, idleOnly = false): string { return recoverySteer({ text, enabled: this.enabled(ctx), idleOnly }); }
