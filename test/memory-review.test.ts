@@ -20,8 +20,13 @@ function fixture() {
   const commands = new Map<string, any>(), tools: any[] = [], results: any[] = [], readiness: any[] = [], prompts: any[] = [], receipts: any[] = [];
   let subagent = false, handoff = false, sessionId = "session";
   const ctx: any = { mode: "tui", hasUI: true, cwd: home, sessionManager: { getSessionId: () => sessionId, getBranch: () => [] },
-    ui: { confirm: async () => true, select: async (title: string, options: string[], settings: any) => {
-      prompts.push({ title, options, settings }); return options[1];
+    ui: { confirm: async () => true, custom: async (factory: any, settings: any) => {
+      let answer: string | undefined;
+      const component = factory({ terminal: { rows: 24, columns: 80 }, requestRender: () => {} }, {},
+        { matches: (data: string, action: string) => data === action }, (value: string) => { answer = value; });
+      prompts.push({ screen: component.render(80).map((line: string) => line.trimEnd()), settings });
+      component.handleInput("tui.editor.cursorRight"); component.handleInput("tui.select.confirm");
+      return answer;
     }, notify: () => {} } };
   const pi: any = { events, on: (name: string, callback: any) => handlers.set(name, [...(handlers.get(name) ?? []), callback]),
     registerTool: (tool: any) => tools.push(tool), registerCommand: (name: string, command: any) => commands.set(name, command), sendMessage: () => {} };
@@ -55,7 +60,7 @@ async function readyFixture() { const f = fixture(); await f.fire("session_start
 function deferredPrompt(f: ReturnType<typeof fixture>) {
   let answer!: (value: string | undefined) => void, opened!: () => void;
   const ready = new Promise<void>(resolve => { opened = resolve; });
-  f.ctx.ui.select = () => { opened(); return new Promise<string | undefined>(resolve => { answer = resolve; }); };
+  f.ctx.ui.custom = () => { opened(); return new Promise<string | undefined>(resolve => { answer = resolve; }); };
   return { ready, yes: () => answer("Yes, authorise"), no: () => answer(undefined) };
 }
 
@@ -71,14 +76,16 @@ for (const action of ["confirm", "reject"]) test(`review ${action} reports the p
   assert.equal(f.receipts[0].event, "memory_review_result"); assert.equal(f.receipts[0].data.eventId, result.eventId);
   assert.equal(JSON.stringify(f.receipts).includes("canonical"), false);
   const prompt = f.prompts[0];
-  for (const text of [action, f.item.id, "directive", "global", f.entry.id, singleLine(f.item.text)]) assert.ok(prompt.title.includes(text));
-  assert.deepEqual(prompt.options, ["Refuse", "Yes, authorise"]);
+  for (const text of [action, f.item.id, "directive", "global", f.entry.id, singleLine(f.item.text).slice(0, 25)]) assert.ok(prompt.screen.join("\n").includes(text));
+  assert.ok(prompt.screen.includes("> Refuse")); assert.ok(prompt.screen.includes("  Yes, authorise"));
+  assert.equal(prompt.settings.overlay, true);
   assert.equal(f.tools.some(tool => /confirm|review/.test(tool.name)), false);
 });
 
 const failures: [string, string, (f: ReturnType<typeof fixture>, request: any) => void][] = [
   ["RPC", "unavailable", f => { f.ctx.mode = "rpc"; }],
   ["hasUI only", "unavailable", f => { delete f.ctx.mode; }],
+  ["no native custom dialog", "unavailable", f => { delete f.ctx.ui.custom; }],
   ["disabled", "unavailable", f => f.configure(false)],
   ["subagent", "unavailable", f => f.primary(false)],
   ["wrong session", "wrong_target", (_f, request) => { request.sessionId = "other"; }],
@@ -156,7 +163,7 @@ test("expiry invalidates even a late affirmative native response", async t => {
 });
 
 for (const answer of [undefined, "Refuse", "yes", true]) test(`refusal is the default, not ${String(answer)}`, async () => {
-  const f = await readyFixture(); f.ctx.ui.select = async () => answer;
+  const f = await readyFixture(); f.ctx.ui.custom = async () => answer;
   assert.equal((await f.send(f.request())).reason, "refused");
   assert.equal(f.store.readFolded().items[f.item.id].status, "proposed");
 });
@@ -173,7 +180,7 @@ for (const change of ["status", "content", "source", "mode", "session", "generat
   if (change === "content" || change === "source") {
     const original = FileMemoryStore.prototype.readFolded;
     // Simulate a changed canonical fold without rewriting the producer log.
-    f.ctx.ui.select = async () => "Refuse";
+    f.ctx.ui.custom = async () => "Refuse";
     const restore = original;
     FileMemoryStore.prototype.readFolded = function () {
       const state = restore.call(this), item = state.items[f.item.id];
@@ -184,6 +191,73 @@ for (const change of ["status", "content", "source", "mode", "session", "generat
     finally { FileMemoryStore.prototype.readFolded = original; }
   } else { prompt.yes(); assert.notEqual((await running).reason, "applied"); }
   assert.equal(f.store.changesSince().events.filter(event => event.type === "confirm").length, change === "status" ? 1 : 0);
+});
+
+for (const path of ["bridge", "slash"]) test(`${path} rejects an unattended-origin proposed directive after native approval`, async () => {
+  const f = await readyFixture(), entry = message({ origin: "unattended" }), item = directive(entry);
+  f.store.appendMessage(entry); f.store.addItem(item, agent);
+  assert.equal(f.store.readFolded().items[item.id].status, "proposed");
+  if (path === "bridge") assert.equal((await f.send(f.request({ itemId: item.id, action: "reject" }))).reason, "applied");
+  else await f.commands.get("memory").handler(`reject ${item.id}`, f.ctx);
+  assert.equal(f.store.readFolded().items[item.id].status, "rejected");
+});
+
+test("native review escapes bidi and other invisible Unicode format characters", async () => {
+  const f = await readyFixture(), entry = message({ text: "go \u202Edanger\u2066\u200b " + "x".repeat(700) }), item = directive(entry);
+  f.store.appendMessage(entry); f.store.addItem(item, agent);
+  assert.equal((await f.send(f.request({ itemId: item.id }))).reason, "applied");
+  const screen = f.prompts[0].screen.join("\n");
+  assert.doesNotMatch(screen, /\p{Cf}/u);
+  for (const escape of ["\\u{202e}", "\\u{2066}", "\\u{200b}"]) assert.ok(screen.includes(escape));
+});
+
+test("a busy request ID can be retried after the current prompt closes", async () => {
+  const f = await readyFixture(), custom = f.ctx.ui.custom, prompt = deferredPrompt(f), running = f.send(f.request());
+  await prompt.ready;
+  const request = f.request({ requestId: "retry" });
+  assert.equal((await f.send(request)).reason, "busy");
+  prompt.no(); assert.equal((await running).reason, "refused"); await new Promise(setImmediate);
+  f.ctx.ui.custom = custom;
+  assert.equal((await f.send(request)).reason, "applied");
+});
+
+test("cancel tombstones are bounded and expire instead of permanently disabling review", async t => {
+  const f = await readyFixture(), now = Date.now();
+  t.mock.timers.enable({ apis: ["Date"], now });
+  for (let index = 0; index < 1024; index++) f.events.emit(prefix + "cancel", { requestId: `cancel-${index}` });
+  assert.equal((await f.send(f.request())).reason, "unavailable");
+  t.mock.timers.setTime(now + 60_001);
+  assert.equal((await f.send(f.request())).reason, "applied");
+});
+
+test("finished receipts survive the request deadline plus grace, then are pruned", async t => {
+  const f = await readyFixture(), now = Date.now();
+  t.mock.timers.enable({ apis: ["Date"], now });
+  const request = f.request(), applied = await f.send(request);
+  assert.equal(applied.reason, "applied");
+  t.mock.timers.setTime(request.expiresAt + 59_999);
+  assert.deepEqual(await f.send(request), applied);
+  t.mock.timers.setTime(request.expiresAt + 60_001);
+  assert.equal((await f.send(request)).reason, "expired");
+  assert.equal(f.prompts.length, 1);
+});
+
+test("expiry during the final fingerprint refuses before the writer is called", async t => {
+  const f = await readyFixture(), now = Date.now(), request = f.request(), custom = f.ctx.ui.custom;
+  t.mock.timers.enable({ apis: ["Date"], now });
+  let reads = 0;
+  f.ctx.ui.custom = async (...args: any[]) => {
+    const answer = await custom(...args), original = FileMemoryStore.prototype.getMessage;
+    t.mock.method(FileMemoryStore.prototype, "getMessage", function (this: FileMemoryStore, id: string) {
+      const entry = original.call(this, id);
+      if (++reads === 2) t.mock.timers.setTime(request.expiresAt + 1);
+      return entry;
+    });
+    return answer;
+  };
+  assert.equal((await f.send(request)).reason, "expired");
+  assert.equal(reads, 2);
+  assert.equal(f.store.changesSince().events.filter(event => event.type === "confirm").length, 0);
 });
 
 test("reports the writer's actual conflict rather than assuming the human response won", async t => {

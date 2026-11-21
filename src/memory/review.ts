@@ -44,10 +44,13 @@ async function legacyPrompt(ctx: ExtensionCommandContext, item: FoldedItem): Pro
   } catch { return false; }
   finally { clearTimeout(timer); }
 }
+function escaped(value: string): string {
+  return singleLine(value).replace(/\p{Cf}/gu, character => `\\u{${character.codePointAt(0)!.toString(16)}}`);
+}
 function promptText(request: ReviewRequest, item: FoldedItem): string {
-  return [`Memory review: ${request.action}`, `item: ${singleLine(item.id)}`, `kind: ${singleLine(item.kind)}`,
-    `scope: ${singleLine(item.scope.kind)}:${singleLine(item.scope.key)}`, `source: ${singleLine(JSON.stringify(item.source))}`,
-    `canonical text: ${singleLine(item.text)}`].join("\n");
+  return [`Memory review: ${request.action}`, `item: ${escaped(item.id)}`, `kind: ${escaped(item.kind)}`,
+    `scope: ${escaped(item.scope.kind)}:${escaped(item.scope.key)}`, `source: ${escaped(JSON.stringify(item.source))}`,
+    `canonical text: ${escaped(item.text)}`].join("\n");
 }
 function fingerprint(store: MemoryStoreCore, item: FoldedItem): string {
   return JSON.stringify({ item, source: item.source.ref ? store.getMessage(item.source.ref) : null });
@@ -59,7 +62,7 @@ function storeId(runtime: IntentServices): string {
   return createHash("sha256").update(canonical).digest("hex");
 }
 function nativeReviewUI(ctx: ExtensionContext): boolean {
-  return ctx.mode === "tui" && typeof ctx.ui?.select === "function";
+  return ctx.mode === "tui" && typeof ctx.ui?.custom === "function";
 }
 function reviewError(error: unknown): never {
   if (error instanceof ReviewFailure) throw error;
@@ -99,18 +102,20 @@ export function registerIntentReview(pi: ExtensionAPI, runtime: IntentServices, 
     try {
       check(); const ctx = checkTarget(request), identity = storeId(runtime);
       const store = await runtime.store(ctx), item = proposed(store, ctx, request.itemId);
-      humanSource(store, item);
+      if (request.action === "confirm") humanSource(store, item);
       const snapshot = fingerprint(store, item);
+      const { createReviewDialog } = await import("./review-dialog.ts");
       check(); checkTarget(request);
-      const answer = await ctx.ui.select(promptText(request, item), ["Refuse", "Yes, authorise"], { timeout: 30_000, signal });
+      const answer = await ctx.ui.custom(createReviewDialog(promptText(request, item), signal),
+        { overlay: true, overlayOptions: { width: "100%", maxHeight: "100%", margin: 0 } });
       check(); checkTarget(request);
       if (answer !== "Yes, authorise") throw new ReviewFailure("refused");
       const currentStore = await runtime.store(ctx);
       check(); checkTarget(request);
       const current = proposed(currentStore, ctx, request.itemId);
-      humanSource(currentStore, current);
-      check(); checkTarget(request);
+      if (request.action === "confirm") humanSource(currentStore, current);
       if (storeId(runtime) !== identity || fingerprint(currentStore, current) !== snapshot) throw new ReviewFailure("stale");
+      checkTarget(request); check();
       const result = write(runtime, ctx, currentStore, { item: current, action: request.action });
       committed(result); return result;
     } catch (error) { return reviewError(error); }
