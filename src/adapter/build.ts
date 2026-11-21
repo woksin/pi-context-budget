@@ -41,7 +41,10 @@ function createOverflow(pi: ExtensionAPI, log: EventLog, self: () => Runtime): O
 /** Hooks are created in the original registration order; their callbacks read the runtime lazily. */
 function createHooks(pi: ExtensionAPI, base: { agentDir: string; configFile: string; log: EventLog }, launchFacts: () => LaunchFacts, self: () => Runtime) {
   const memoryDeps = { ...base, host: () => self().host };
-  const intent = createIntentHook(pi, memoryDeps), recall = createRecallHook(pi, memoryDeps);
+  const intent = createIntentHook(pi, { ...memoryDeps, reviewBlocked: () => {
+    const state = self().state;
+    return !!(state.pending || state.stored || state.compaction || state.relaunchSent || state.settleRequest !== "none");
+  } }), recall = createRecallHook(pi, memoryDeps);
   const resume = createResumeHook({ ...memoryDeps, observe: ctx => autoState(self(), ctx),
     store: ctx => intent.readStore(ctx), command: ctx => checkCommand(self(), ctx) });
   const requests = createRequestsHook({ ...memoryDeps, hasTools: () => hasActiveTools(pi) });
